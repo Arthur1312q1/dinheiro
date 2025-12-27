@@ -1,0 +1,142 @@
+//@version=3
+strategy(title="Adaptive Zero Lag EMA v2", shorttitle="AZLEMA", overlay = true, initial_capital=1000, currency="USD", commission_type=strategy.commission.cash_per_contract, commission_value=0.00006833, slippage = 5, pyramiding=1, calc_on_every_tick=false)
+
+// ============================================================================
+// PARÂMETROS AJUSTADOS CONFORME SUAS CONFIGURAÇÕES
+// ============================================================================
+src = input(title="Source", type=source, defval=close)
+secType = input(title="Security Type", options=["Forex", "Metal Spot", "Cryptocurrency","Custom"], defval="Metal Spot")
+contracts = input(title="Custom # of Contracts", defval=1, step=1)
+limit = input(title="Max Lots", type=integer, defval=100)
+Period = input(title="Period", type=integer, defval = 20)
+adaptive = input(title="Adaptive Method", options=["Off", "Cos IFM", "I-Q IFM", "Average"], defval="Cos IFM")
+GainLimit = input(title="Gain Limit", type=integer, defval = 900)
+Threshold = input(title="Threshold", type = float, defval=0, step=0.01)
+fixedSL = input(title="SL Points", defval=2000)
+fixedTP = input(title="TP Points", defval=55)
+risk = input(title='Risk', defval=0.01, step=0.01)
+range = 50
+
+// ============================================================================
+// CÓDIGO DA ESTRATÉGIA (MESMO QUE ANTERIOR)
+// ============================================================================
+PI = 3.14159265359
+lenIQ = 0.0
+lenC = 0.0
+
+// I-Q IFM
+if(adaptive=="I-Q IFM" or adaptive=="Average")
+    imult = 0.635
+    qmult = 0.338
+    inphase = 0.0
+    quadrature = 0.0
+    re = 0.0
+    im = 0.0
+    deltaIQ = 0.0
+    instIQ = 0.0
+    V = 0.0
+    
+    P = src - src[7]
+    inphase := 1.25*(P[4] - imult*P[2]) + imult*nz(inphase[3])
+    quadrature := P[2] - qmult*P + qmult*nz(quadrature[2])
+    re := 0.2*(inphase*inphase[1] + quadrature*quadrature[1]) + 0.8*nz(re[1])
+    im := 0.2*(inphase*quadrature[1] - inphase[1]*quadrature) + 0.8*nz(im[1])
+    if (re!= 0.0)
+        deltaIQ := atan(im/re)
+    for i=0 to range
+        V := V + deltaIQ[i]
+        if (V > 2*PI and instIQ == 0.0)
+            instIQ := i
+    if (instIQ == 0.0)
+        instIQ := nz(instIQ[1])
+    lenIQ := 0.25*instIQ + 0.75*nz(lenIQ[1])
+
+// COSINE IFM
+if(adaptive == "Cos IFM" or adaptive == "Average")
+    s2 = 0.0
+    s3 = 0.0
+    deltaC = 0.0
+    instC = 0.0
+    v1 = 0.0
+    v2 = 0.0
+    v4 = 0.0
+    
+    v1 := src - src[7]
+    s2 := 0.2*(v1[1] + v1)*(v1[1] + v1) + 0.8*nz(s2[1])
+    s3 := 0.2*(v1[1] - v1)*(v1[1] - v1) + 0.8*nz(s3[1])
+    if (s2 != 0)
+        v2 := sqrt(s3/s2)
+    if (s3 != 0)
+        deltaC := 2*atan(v2)
+    for i = 0 to range
+        v4 := v4 + deltaC[i]
+        if (v4 > 2*PI and instC == 0.0)
+            instC := i - 1
+    if (instC == 0.0)
+        instC := instC[1]
+    lenC := 0.25*instC + 0.75*nz(lenC[1])
+
+if (adaptive == "Cos IFM")
+    Period := round(lenC)
+if (adaptive == "I-Q IFM")
+    Period := round(lenIQ)
+if (adaptive == "Average")
+    Period := round((lenC + lenIQ)/2)
+
+// ZERO LAG EXPONENTIAL MOVING AVERAGE
+LeastError = 1000000.0
+EC = 0.0
+Gain = 0.0
+EMA = 0.0
+Error = 0.0
+BestGain = 0.0
+
+alpha =2/(Period + 1)
+EMA := alpha*src + (1-alpha)*nz(EMA[1])
+
+for i = -GainLimit to GainLimit
+    Gain := i/10
+    EC := alpha*(EMA + Gain*(src - nz(EC[1]))) + (1 - alpha)*nz(EC[1])
+    Error := src - EC
+    if(abs(Error)<LeastError)
+        LeastError := abs(Error)
+        BestGain := Gain
+
+EC := alpha*(EMA + BestGain*(src - nz(EC[1]))) + (1-alpha)*nz(EC[1])
+
+// ============================================================================
+// LÓGICA DE TRADE
+// ============================================================================
+buy_signal = crossover(EC,EMA) and 100*LeastError/src > Threshold
+sell_signal = crossunder(EC,EMA) and 100*LeastError/src > Threshold
+
+pendingBuy = false
+pendingSell = false
+pendingBuy := nz(pendingBuy[1])
+pendingSell := nz(pendingSell[1])
+
+if (buy_signal[1])
+    pendingBuy := true
+
+if (sell_signal[1])
+    pendingSell := true
+
+secScaler = secType == "Forex" ? 100000 : secType == "Metal Spot" ? 100 : secType == "Cryptocurrency" ? 10000 : secType == "Custom" ? contracts : 0
+balance = strategy.initial_capital + strategy.netprofit
+
+if (time>timestamp(2023, 1, 1, 0, 0) and balance > 0)
+    lots = ((risk * balance)/fixedSL)*secScaler
+    lots := lots > limit * secScaler ? limit * secScaler : lots
+    
+    if (pendingBuy and strategy.position_size <= 0)
+        strategy.entry("BUY", strategy.long, qty=lots, comment="ENTER-LONG_BingX_ETH-USDT_trade_45M")
+        strategy.exit("B.Exit", "BUY", qty_percent = 100, loss=fixedSL, trail_offset=15, trail_points=fixedTP, comment="EXIT-LONG_BingX_ETH-USDT_trade_45M")
+        pendingBuy := false
+    
+    if (pendingSell and strategy.position_size >= 0)
+        strategy.entry("SELL", strategy.short, qty=lots, comment="ENTER-SHORT_BingX_ETH-USDT_trade_45M")
+        strategy.exit("S.Exit", "SELL", qty_percent = 100, loss=fixedSL, trail_offset=15, trail_points=fixedTP, comment="EXIT-SHORT_BingX_ETH-USDT_trade_45M")
+        pendingSell := false
+
+plot(EC, title="EC", color=orange, linewidth=2)
+plot(EMA, title="EMA", color=red, linewidth=2)
