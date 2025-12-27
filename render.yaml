@@ -1,37 +1,19 @@
-# Configuração para Render.com
 services:
   - type: web
-    name: okx-trading-bot
-    env: python
-    region: singapore  # Mais próximo da OKX (Hong Kong)
-    plan: free
-    branch: main
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: gunicorn src.main:app --bind 0.0.0.0:$PORT
+    name: okx-eth-trading-bot
+    runtime: python
+    region: singapore # Boa opção para proximidade com a OKX
+    plan: free # Define explicitamente o plano gratuito[citation:2]
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn src.main:app --bind 0.0.0.0:$PORT --workers=1 --threads=8 --timeout=120
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.4
       - key: PORT
         value: 10000
-      - key: OKX_API_KEY
-        sync: false
-      - key: OKX_SECRET_KEY
-        sync: false
-      - key: OKX_PASSPHRASE
-        sync: false
-      - key: UPTIMEROBOT_URL
-        sync: false
-    disk:
-      name: logs
-      mountPath: /var/log
-      sizeGB: 1
-    headers:
-      - path: /*
-        name: X-Frame-Options
-        value: DENY
-      - path: /*
-        name: X-Content-Type-Options
-        value: nosniff
+      - key: TRADING_ENABLED
+        value: "true" # Use strings para variáveis booleanas
+      - key: LOG_LEVEL
+        value: INFO
+      # As chaves da API (OKX_API_KEY, etc.) devem ser adicionadas manualmente no dashboard do Render
