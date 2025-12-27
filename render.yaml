@@ -1,83 +1,37 @@
-# Render Blueprint Specification
-# Documentação: https://render.com/docs/blueprint-spec
-
+# Configuração para Render.com
 services:
-  # Serviço principal - Bot de Trading
   - type: web
-    name: okx-eth-trading-bot
-    runtime: python
-    region: ohio  # ou singapore para menor latência com OKX
-    plan: free  # ou starter/pro para mais recursos
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn src.main:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    name: okx-trading-bot
+    env: python
+    region: singapore  # Mais próximo da OKX (Hong Kong)
+    plan: free
+    branch: main
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn src.main:app --bind 0.0.0.0:$PORT
     healthCheckPath: /health
-    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.4
       - key: PORT
         value: 10000
-      - key: TZ
-        value: UTC
-      - key: LOG_LEVEL
-        value: INFO
       - key: OKX_API_KEY
-        sync: false  # Definir manualmente no dashboard
+        sync: false
       - key: OKX_SECRET_KEY
         sync: false
       - key: OKX_PASSPHRASE
         sync: false
       - key: UPTIMEROBOT_URL
         sync: false
-      - key: RENDER_EXTERNAL_URL
-        fromService:
-          type: web
-          name: okx-eth-trading-bot
-          property: url
     disk:
-      name: data
-      mountPath: /data
+      name: logs
+      mountPath: /var/log
       sizeGB: 1
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-      targetMemoryPercent: 70
-      targetCPUPercent: 70
-
-# Cron Jobs para manter o serviço ativo
-jobs:
-  # Job de manutenção diária - Limpeza de logs
-  - type: cron
-    name: cleanup-logs
-    schedule: "0 0 * * *"  # Meia-noite UTC
-    runtime: python
-    region: ohio
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import os; [os.remove(f) for f in os.listdir('.') if f.endswith('.log') and os.path.getsize(f) > 1000000]"
-    envVars:
-      - key: TZ
-        value: UTC
-
-  # Job de monitoramento de saúde - Verifica se o bot está respondendo
-  - type: cron
-    name: health-check
-    schedule: "*/5 * * * *"  # A cada 5 minutos
-    runtime: python
-    region: ohio
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import requests; r = requests.get('${RENDER_EXTERNAL_URL}/health', timeout=10); print(f'Health Check: {r.status_code} - {r.json()}')"
-    envVars:
-      - key: RENDER_EXTERNAL_URL
-        fromService:
-          type: web
-          name: okx-eth-trading-bot
-          property: url
-
-# Banco de dados opcional para armazenar histórico de trades (se necessário)
-# databases:
-#   - name: trading-db
-#     databaseName: trading
-#     plan: free
-#     region: ohio
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
