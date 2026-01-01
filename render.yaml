@@ -2,18 +2,11 @@ services:
   - type: web
     name: okx-eth-trading-bot
     runtime: python
-    region: singapore # Boa opção para proximidade com a OKX
-    plan: free # Define explicitamente o plano gratuito[citation:2]
+    region: singapore
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn src.main:app --bind 0.0.0.0:$PORT --workers=1 --threads=8 --timeout=120
+    startCommand: gunicorn src.main:app --bind 0.0.0.0:$PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.4
-      - key: PORT
-        value: 10000
-      - key: TRADING_ENABLED
-        value: "true" # Use strings para variáveis booleanas
-      - key: LOG_LEVEL
-        value: INFO
-      # As chaves da API (OKX_API_KEY, etc.) devem ser adicionadas manualmente no dashboard do Render
