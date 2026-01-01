@@ -3,7 +3,9 @@ import time
 import requests
 import logging
 from datetime import datetime
+import os  # <-- LINHA CRÍTICA ADICIONADA
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class KeepAliveSystem:
