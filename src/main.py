@@ -1,92 +1,167 @@
+from flask import Flask, request, jsonify
+import threading
 import time
-from datetime import datetime, timedelta
+import os
+import logging
+from datetime import datetime
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Inicializar componentes (ajuste os imports conforme sua estrutura)
+try:
+    from src.okx_client import OKXClient
+    from src.trading_logic import AdaptiveZeroLagEMA
+    from src.keep_alive import KeepAliveSystem
+except ImportError:
+    # Se falhar, tenta importar diretamente (caso o diretório src não seja pacote)
+    from okx_client import OKXClient
+    from trading_logic import AdaptiveZeroLagEMA
+    from keep_alive import KeepAliveSystem
+
+okx_client = OKXClient()
+strategy = AdaptiveZeroLagEMA()
+keep_alive = KeepAliveSystem()
+
+# Variáveis globais
+trading_active = False
+trade_thread = None
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "OKX ETH Trading Bot",
+        "strategy": "Adaptive Zero Lag EMA v2",
+        "timeframe": "45 minutes",
+        "symbol": "ETH-USDT",
+        "trading_active": trading_active,
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de saúde para o Render"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "last_signal": keep_alive.last_signal_time
+    })
+
+@app.route('/start', methods=['POST'])
+def start_trading():
+    """Inicia o bot de trading"""
+    global trading_active, trade_thread
+    
+    if trading_active:
+        return jsonify({"status": "error", "message": "Trading já está ativo"})
+    
+    try:
+        # Iniciar keep-alive
+        keep_alive.start_keep_alive()
+        
+        # Iniciar thread de trading
+        trading_active = True
+        trade_thread = threading.Thread(target=trading_loop, daemon=True)
+        trade_thread.start()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Bot de trading iniciado",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Erro ao iniciar trading: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/stop', methods=['POST'])
+def stop_trading():
+    """Para o bot de trading"""
+    global trading_active
+    
+    try:
+        trading_active = False
+        keep_alive.stop_keep_alive()
+        
+        # Fechar todas as posições
+        okx_client.close_all_positions()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Bot de trading parado",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Erro ao parar trading: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Obtém status atual do bot"""
+    balance = okx_client.get_balance()
+    price = okx_client.get_ticker_price()
+    
+    return jsonify({
+        "trading_active": trading_active,
+        "balance_usdt": balance,
+        "current_price": price,
+        "strategy_params": {
+            "period": strategy.period,
+            "gain_limit": strategy.gain_limit,
+            "threshold": strategy.threshold
+        },
+        "timestamp": datetime.now().isoformat()
+    })
 
 def trading_loop():
-    """Loop principal de trading sincronizado com candles de 45m."""
-    logger.info("Loop de trading (45m) iniciado.")
-    
-    # Sincronização inicial: espera até o próximo múltiplo de 45 minutos
-    now = datetime.utcnow()
-    next_run = now.replace(second=0, microsecond=0)
-    
-    # Calcula minutos para o próximo candle de 45m
-    minutes_since_epoch = (next_run - next_run.replace(minute=0, hour=0)).minutes
-    remainder = minutes_since_epoch % 45
-    if remainder > 0:
-        wait_minutes = 45 - remainder
-    else:
-        # Estamos exatamente no fechamento, espera o próximo ciclo
-        wait_minutes = 45
-    
-    next_run = next_run + timedelta(minutes=wait_minutes)
-    logger.info(f"Próxima execução agendada para: {next_run} UTC")
-    time.sleep((next_run - datetime.utcnow()).total_seconds())
+    """Loop principal de trading"""
+    logger.info("Loop de trading iniciado")
     
     while trading_active:
-        cycle_start = datetime.utcnow()
-        logger.info(f"--- Início do ciclo de trading {cycle_start} UTC ---")
-        
         try:
-            # 1. OBTER DADOS: Busca candles FECHADOS de 45m (ex: último candle de 45m)
+            # Obter candles de 45 minutos
             candles = okx_client.get_candles(timeframe="45m", limit=100)
             
-            if len(candles) < 30:
-                logger.warning(f"Dados insuficientes: {len(candles)} candles. Aguardando próximo ciclo.")
-                time.sleep(2700)  # Espera 45 minutos
-                continue
-            
-            # O último candle na lista é o mais recente (candle atual, ainda não fechado?)
-            # Vamos usar o penúltimo como último fechado para análise
-            last_closed_candle = candles[-2] if len(candles) > 1 else candles[-1]
-            logger.info(f"Último candle fechado em: {last_closed_candle['timestamp']}, Preço de fechamento: {last_closed_candle['close']}")
-            
-            # 2. CALCULAR SINAL: Envia TODOS os candles fechados para a estratégia
-            # A lógica interna da estratégia deve usar confirmação de 1 barra (como o PineScript)
-            signal = strategy.calculate_signals(candles)
-            
-            logger.info(f"Sinal calculado: {signal}")
-            
-            # 3. EXECUTAR ORDEM: Se houver sinal (BUY/SELL) confirmado
-            if signal["signal"] in ["BUY", "SELL"]:
-                logger.info(f"SINAL CONFIRMADO: {signal['signal']} a {signal.get('price', 'N/A')}")
+            if len(candles) >= 30:  # Esperar dados suficientes
+                # Calcular sinal
+                signal = strategy.calculate_signals(candles)
                 
-                # Calcular tamanho da posição (95% do saldo, SL=2000 pontos)
-                position_size = okx_client.calculate_position_size(sl_points=2000)
+                if signal["signal"] in ["BUY", "SELL"]:
+                    logger.info(f"Sinal gerado: {signal}")
+                    
+                    # Calcular tamanho da posição (95% do saldo)
+                    position_size = okx_client.calculate_position_size(sl_points=2000)
+                    
+                    if position_size > 0:
+                        # Executar ordem
+                        success = okx_client.place_order(
+                            side=signal["signal"],
+                            quantity=position_size,
+                            sl_points=2000,
+                            tp_points=55
+                        )
+                        
+                        if success:
+                            logger.info(f"Ordem {signal['signal']} executada com sucesso")
+                        else:
+                            logger.error(f"Falha ao executar ordem {signal['signal']}")
+            
+            # Esperar 5 minutos antes de verificar novamente
+            for _ in range(300):  # 300 segundos = 5 minutos
+                if not trading_active:
+                    break
+                time.sleep(1)
                 
-                if position_size > 0:
-                    success = okx_client.place_order(
-                        side=signal["signal"],
-                        quantity=position_size,
-                        sl_points=2000,
-                        tp_points=55
-                    )
-                    if success:
-                        logger.info(f"Ordem {signal['signal']} executada com sucesso. Tamanho: {position_size:.4f} ETH")
-                    else:
-                        logger.error(f"Falha ao executar ordem {signal['signal']}")
-                else:
-                    logger.warning("Tamanho da posição calculado como 0. Ordem não enviada.")
-            else:
-                logger.info("Nenhum sinal de trade confirmado neste ciclo.")
-        
         except Exception as e:
-            logger.error(f"Erro no ciclo de trading: {e}", exc_info=True)
-        
-        # 4. SINCRONIZAÇÃO: Espera até o próximo fechamento de 45 minutos
-        now = datetime.utcnow()
-        next_run = now.replace(second=0, microsecond=0)
-        minutes_since_epoch = (next_run - next_run.replace(minute=0, hour=0)).minutes
-        remainder = minutes_since_epoch % 45
-        wait_minutes = 45 - remainder if remainder > 0 else 45
-        
-        # Garante que esperamos pelo menos 1 minuto para evitar execuções consecutivas
-        wait_minutes = max(wait_minutes, 1)
-        next_run = next_run + timedelta(minutes=wait_minutes)
-        
-        wait_seconds = (next_run - datetime.utcnow()).total_seconds()
-        logger.info(f"Próxima execução em {wait_seconds:.0f} segundos (~{wait_minutes} min), às {next_run} UTC")
-        
-        # Aguarda o tempo calculado, checando periodicamente se trading_active ainda é True
-        while wait_seconds > 0 and trading_active:
-            time.sleep(min(30, wait_seconds))  # Dorme em blocos de até 30s
-            wait_seconds = (next_run - datetime.utcnow()).total_seconds()
+            logger.error(f"Erro no loop de trading: {e}")
+            time.sleep(60)
+
+if __name__ == '__main__':
+    # Iniciar keep-alive imediatamente
+    keep_alive.start_keep_alive()
+    
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
