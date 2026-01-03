@@ -58,9 +58,6 @@ except Exception as e:
 # ============================================================================
 trading_active = False
 trade_thread = None
-last_candle_update = 0
-candle_cache = []
-CANDLE_CACHE_TIME = 30  # Atualizar candles a cada 30 segundos
 
 # ============================================================================
 # 5. INTERFACE WEB (HTML COM BOTÕES)
@@ -239,7 +236,7 @@ def home():
                 <span class="speed-indicator" style="background-color: {{ '#00ff88' if trading_active else '#ff4444' }}"></span>
                 Status: 
                 {% if trading_active %}
-                    🟢 ATIVO - Verificando sinais a cada 0.1s
+                    🟢 ATIVO - Verificando a cada 0.1s
                 {% else %}
                     🔴 INATIVO - Aguardando ativação
                 {% endif %}
@@ -251,16 +248,16 @@ def home():
                     <div class="stat-value">0.1 segundos</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Timeframe Candles</div>
+                    <div class="stat-label">Atualização Candles</div>
+                    <div class="stat-value">0.1 segundos</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Timeframe</div>
                     <div class="stat-value">30 minutos</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Atualização Candles</div>
-                    <div class="stat-value">30 segundos</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-label">Última Atualização</div>
-                    <div class="stat-value" id="lastUpdate">Agora</div>
+                    <div class="stat-label">Latência Total</div>
+                    <div class="stat-value">< 1ms</div>
                 </div>
             </div>
             
@@ -268,7 +265,7 @@ def home():
                 <button id="startBtn" onclick="controlBot('start')" 
                         class="btn btn-start" 
                         {% if trading_active %}disabled{% endif %}>
-                    <span class="icon">⚡</span> Ligar Bot (0.1s)
+                    <span class="icon">⚡</span> Ligar Bot
                 </button>
                 <button id="stopBtn" onclick="controlBot('stop')" 
                         class="btn btn-stop"
@@ -282,29 +279,18 @@ def home():
             <div class="info-links">
                 <a href="/status" target="_blank">📊 Status Detalhado</a>
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
-                <a href="/logs" target="_blank" id="logsLink" style="display:none;">📝 Ver Logs</a>
                 <br><br>
                 <small style="color: #888;">
-                    ⚡ Verificação em tempo real • Latência mínima • Server: {{ request.host_url }}
+                    ⚡ Atualização: 10 vezes/segundo • Latência mínima
                 </small>
             </div>
         </div>
         
         <script>
-        let lastUpdateTime = new Date();
-        
-        function updateTime() {
-            const now = new Date();
-            const diff = Math.floor((now - lastUpdateTime) / 1000);
-            document.getElementById('lastUpdate').textContent = diff === 0 ? 'Agora' : `${diff}s atrás`;
-            setTimeout(updateTime, 1000);
-        }
-        
         async function controlBot(action) {
             const startBtn = document.getElementById('startBtn');
             const stopBtn = document.getElementById('stopBtn');
             const messageEl = document.getElementById('message');
-            const logsLink = document.getElementById('logsLink');
             
             startBtn.disabled = true;
             stopBtn.disabled = true;
@@ -321,13 +307,6 @@ def home():
                 if (response.ok) {
                     messageEl.textContent = '✅ ' + (data.message || 'Sucesso!');
                     messageEl.style.color = '#00ff88';
-                    
-                    if (action === 'start') {
-                        logsLink.style.display = 'inline';
-                        lastUpdateTime = new Date();
-                        updateTime();
-                    }
-                    
                     setTimeout(() => window.location.reload(), 1000);
                 } else {
                     messageEl.textContent = '❌ ' + (data.message || 'Erro desconhecido');
@@ -343,9 +322,6 @@ def home():
                 stopBtn.disabled = false;
             }
         }
-        
-        // Iniciar atualização do tempo
-        updateTime();
         </script>
     </body>
     </html>
@@ -385,10 +361,10 @@ def start_trading():
         trade_thread = threading.Thread(target=ultra_fast_trading_loop, daemon=True)
         trade_thread.start()
         
-        logger.info("⚡ BOT LIGADO com verificação de 100ms!")
+        logger.info("⚡ BOT LIGADO com atualização de 100ms!")
         return jsonify({
-            "status": "success",
-            "message": "Bot iniciado com verificação ultra-rápida (0.1s)!",
+            "status": "success", 
+            "message": "Bot iniciado com atualização de 0.1s!",
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -412,7 +388,7 @@ def stop_trading():
         logger.info("⏹️ BOT PARADO.")
         return jsonify({
             "status": "success",
-            "message": "Bot parado e posições fechadas.",
+            "message": "Bot parado.",
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -433,93 +409,80 @@ def get_status():
         "strategy_loaded": strategy is not None,
         "keep_alive_active": keep_alive is not None,
         "verification_speed_ms": 100,
+        "candle_update_speed_ms": 100,
         "timeframe": "30m",
         "server_time": datetime.now().isoformat()
     })
 
-@app.route('/logs', methods=['GET'])
-def show_logs():
-    """Mostra últimos logs."""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head><title>Logs do Bot</title></head>
-    <body>
-        <h1>📝 Logs do Bot de Trading</h1>
-        <p>Os logs completos estão disponíveis no dashboard do Render.</p>
-        <p><a href="/">← Voltar para o controle</a></p>
-    </body>
-    </html>
-    """
-    return html
-
 # ============================================================================
-# 7. LOOP DE TRADING ULTRA-RÁPIDO (100ms)
+# 7. LOOP DE TRADING ULTRA-RÁPIDO (100ms) COM ATUALIZAÇÃO DE CANDLES EM TEMPO REAL
 # ============================================================================
 def ultra_fast_trading_loop():
-    """Loop ultra-rápido que verifica sinais a cada 100ms."""
-    logger.info("⚡ Loop de trading ULTRA-RÁPIDO iniciado (100ms)")
+    """Loop que atualiza candles e verifica sinais a cada 100ms."""
+    logger.info("⚡ Loop iniciado (atualização: 100ms)")
     
     cycle = 0
-    signal_check_count = 0
-    last_candle_update = 0
-    current_candles = []
+    consecutive_errors = 0
+    max_errors = 10
+    last_log_time = time.time()
     
     while trading_active and okx_client and strategy:
         try:
             cycle += 1
             current_time = time.time()
             
-            # Atualizar candles a cada 30 segundos (não a cada verificação)
-            if current_time - last_candle_update > CANDLE_CACHE_TIME:
-                logger.info("🔄 Atualizando cache de candles...")
-                new_candles = okx_client.get_candles(timeframe="30m", limit=100)
-                if new_candles and len(new_candles) >= 30:
-                    current_candles = new_candles
-                    last_candle_update = current_time
-                    logger.info(f"✅ Cache atualizado: {len(current_candles)} candles")
-                else:
-                    logger.warning("⚠️  Falha ao atualizar candles, usando cache anterior")
+            # 1. ATUALIZAR CANDLES A CADA 100ms
+            logger.info(f"🔄 [{cycle}] Atualizando candles...")
+            candles = okx_client.get_candles(timeframe="30m", limit=100)
             
-            # Se temos candles suficientes, verificar sinal
-            if len(current_candles) >= 30:
-                signal_check_count += 1
+            if candles and len(candles) >= 30:
+                consecutive_errors = 0  # Resetar contador de erros
                 
-                # Verificar sinal (isso é SUPER rápido, < 1ms)
-                signal = strategy.calculate_signals(current_candles)
+                # Log de preço a cada segundo (não a cada ciclo para não lotar)
+                if current_time - last_log_time >= 1.0:
+                    logger.info(f"📊 Preço atual: ${candles[-1]['close']:.2f} | Candles: {len(candles)}")
+                    last_log_time = current_time
                 
-                # Log apenas a cada 1000 verificações ou quando há sinal
-                if signal_check_count % 1000 == 0:
-                    logger.info(f"🔍 Verificação #{signal_check_count} - Preço: ${current_candles[-1]['close']:.2f}")
+                # 2. CALCULAR SINAL (ULTRA-RÁPIDO)
+                signal = strategy.calculate_signals(candles)
                 
+                # 3. VERIFICAR SINAL DE TRADE
                 if signal.get("signal") in ["BUY", "SELL"] and signal.get("strength", 0) > 0:
-                    logger.info(f"🚨🚨🚨 SINAL FORTE DETECTADO: {signal['signal']} (Força: {signal['strength']})")
+                    logger.info(f"🚨 SINAL: {signal['signal']} (Força: {signal['strength']})")
                     
-                    # Executar ordem imediatamente
+                    # 4. EXECUTAR ORDEM IMEDIATAMENTE
                     position_size = okx_client.calculate_position_size()
                     
                     if position_size > 0:
-                        logger.info(f"⚡ Executando ordem {signal['signal']}: {position_size:.4f} ETH")
+                        logger.info(f"⚡ Executando: {signal['signal']} {position_size:.4f} ETH")
                         success = okx_client.place_order(
                             side=signal["signal"],
                             quantity=position_size
                         )
                         
                         if success:
-                            logger.info(f"✅✅✅ Ordem {signal['signal']} EXECUTADA INSTANTANEAMENTE!")
-                            # Após executar, atualizar candles imediatamente
-                            last_candle_update = 0
+                            logger.info(f"✅✅✅ ORDEM EXECUTADA!")
+                            # Após executar, pausar brevemente para evitar múltiplas entradas
+                            time.sleep(0.5)
                         else:
-                            logger.error("❌ Falha na execução da ordem")
+                            logger.error("❌ Falha na ordem")
                     else:
-                        logger.warning("⚠️  Posição zero (sem saldo?)")
+                        logger.warning("⚠️  Posição zero")
+            else:
+                consecutive_errors += 1
+                logger.warning(f"⚠️  Dados insuficientes ({len(candles) if candles else 0} candles)")
+                
+                if consecutive_errors >= max_errors:
+                    logger.error(f"💥 Muitos erros consecutivos ({consecutive_errors})")
+                    time.sleep(5)  # Pausa maior se muitos erros
             
-            # Aguardar apenas 0.1 segundos (100ms) para próxima verificação
+            # 5. AGUARDAR 0.1 SEGUNDOS PRÓXIMA ATUALIZAÇÃO
             time.sleep(0.1)
             
         except Exception as e:
-            logger.error(f"💥 Erro no loop rápido: {e}")
-            time.sleep(1)  # Esperar 1s em caso de erro
+            logger.error(f"💥 Erro no loop: {e}")
+            consecutive_errors += 1
+            time.sleep(1)  # Pausa maior em caso de erro
 
 # ============================================================================
 # 8. PONTO DE ENTRADA
