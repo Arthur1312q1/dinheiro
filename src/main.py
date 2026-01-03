@@ -12,7 +12,10 @@ from flask import Flask, request, jsonify, render_template_string
 # ============================================================================
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -25,7 +28,6 @@ try:
     from trading_logic import AdaptiveZeroLagEMA
     from keep_alive import KeepAliveSystem
     logger.info("✅ Módulos internos importados com sucesso.")
-    OKXClient, AdaptiveZeroLagEMA, KeepAliveSystem = OKXClient, AdaptiveZeroLagEMA, KeepAliveSystem
 except ImportError as e:
     logger.error(f"❌ Erro ao importar módulos: {e}")
     OKXClient = AdaptiveZeroLagEMA = KeepAliveSystem = None
@@ -37,6 +39,15 @@ try:
     okx_client = OKXClient() if OKXClient else None
     strategy = AdaptiveZeroLagEMA() if AdaptiveZeroLagEMA else None
     keep_alive = KeepAliveSystem() if KeepAliveSystem else None
+    
+    if okx_client and strategy:
+        # Teste inicial de conexão
+        test_candles = okx_client.get_candles(timeframe="30m", limit=10)
+        if test_candles:
+            logger.info(f"✅ Teste OKX: {len(test_candles)} candles obtidos")
+        else:
+            logger.warning("⚠️  Teste OKX: Nenhum candle obtido")
+    
     logger.info("✅ Componentes do bot inicializados.")
 except Exception as e:
     logger.error(f"⚠️  Falha na inicialização: {e}")
@@ -47,6 +58,9 @@ except Exception as e:
 # ============================================================================
 trading_active = False
 trade_thread = None
+last_candle_update = 0
+candle_cache = []
+CANDLE_CACHE_TIME = 30  # Atualizar candles a cada 30 segundos
 
 # ============================================================================
 # 5. INTERFACE WEB (HTML COM BOTÕES)
@@ -58,36 +72,38 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Controle do Bot de Trading</title>
+        <title>Bot Trading - AZLEMA v2</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 text-align: center;
                 padding: 20px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
                 min-height: 100vh;
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                color: #333;
+                color: #fff;
             }
             .container {
-                background: rgba(255, 255, 255, 0.95);
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
                 padding: 40px 30px;
                 border-radius: 20px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                max-width: 500px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+                max-width: 600px;
                 width: 90%;
-                border: 1px solid rgba(255,255,255,0.2);
+                border: 1px solid rgba(255,255,255,0.1);
             }
             h1 {
-                color: #2d3436;
+                color: #00ff88;
                 margin-bottom: 5px;
                 font-size: 28px;
+                text-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
             }
             .subtitle {
-                color: #636e72;
+                color: #a0a0c0;
                 margin-bottom: 30px;
                 font-size: 16px;
             }
@@ -98,18 +114,39 @@ def home():
                 font-weight: bold;
                 font-size: 18px;
                 border: 2px solid transparent;
-                transition: all 0.3s;
+                background: rgba(0, 0, 0, 0.3);
             }
             .status-active {
-                background-color: #d4edda;
-                color: #155724;
-                border-color: #c3e6cb;
-                box-shadow: 0 0 15px rgba(76, 175, 80, 0.2);
+                color: #00ff88;
+                border-color: #00ff88;
+                box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
             }
             .status-inactive {
-                background-color: #f8d7da;
-                color: #721c24;
-                border-color: #f5c6cb;
+                color: #ff4444;
+                border-color: #ff4444;
+            }
+            .stats {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+                margin: 25px 0;
+                text-align: left;
+            }
+            .stat-item {
+                background: rgba(255, 255, 255, 0.05);
+                padding: 15px;
+                border-radius: 10px;
+                border-left: 4px solid #00ff88;
+            }
+            .stat-label {
+                font-size: 12px;
+                color: #a0a0c0;
+                text-transform: uppercase;
+            }
+            .stat-value {
+                font-size: 18px;
+                color: #fff;
+                font-weight: bold;
             }
             .button-group {
                 display: flex;
@@ -132,11 +169,11 @@ def home():
                 align-items: center;
                 justify-content: center;
                 gap: 10px;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
             }
             .btn:hover {
                 transform: translateY(-3px);
-                box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+                box-shadow: 0 8px 25px rgba(0,0,0,0.4);
             }
             .btn:active {
                 transform: translateY(-1px);
@@ -155,10 +192,10 @@ def home():
             .info-links {
                 margin-top: 35px;
                 padding-top: 20px;
-                border-top: 1px solid #eee;
+                border-top: 1px solid rgba(255,255,255,0.1);
             }
             .info-links a {
-                color: #6c5ce7;
+                color: #00ff88;
                 text-decoration: none;
                 margin: 0 15px;
                 font-size: 15px;
@@ -166,39 +203,72 @@ def home():
             }
             .info-links a:hover {
                 text-decoration: underline;
-                color: #a29bfe;
+                color: #00cc6a;
             }
             #message {
                 height: 25px;
                 margin-top: 20px;
-                color: #0984e3;
+                color: #00ff88;
                 font-weight: bold;
                 font-size: 16px;
             }
             .icon {
                 font-size: 22px;
             }
+            .speed-indicator {
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                margin-right: 8px;
+                animation: pulse 0.1s infinite;
+            }
+            @keyframes pulse {
+                0% { opacity: 0.3; }
+                50% { opacity: 1; }
+                100% { opacity: 0.3; }
+            }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🤖 Bot de Trading ETH/USDT</h1>
-            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 1H</p>
+            <h1>⚡ Bot Trading ETH/USDT</h1>
+            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Verificação: 100ms</p>
             
             <div class="status-box {{ 'status-active' if trading_active else 'status-inactive' }}">
+                <span class="speed-indicator" style="background-color: {{ '#00ff88' if trading_active else '#ff4444' }}"></span>
                 Status: 
                 {% if trading_active %}
-                    🟢 ATIVO - Analisando mercado e executando trades
+                    🟢 ATIVO - Verificando sinais a cada 0.1s
                 {% else %}
                     🔴 INATIVO - Aguardando ativação
                 {% endif %}
+            </div>
+            
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-label">Velocidade Verificação</div>
+                    <div class="stat-value">0.1 segundos</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Timeframe Candles</div>
+                    <div class="stat-value">30 minutos</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Atualização Candles</div>
+                    <div class="stat-value">30 segundos</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Última Atualização</div>
+                    <div class="stat-value" id="lastUpdate">Agora</div>
+                </div>
             </div>
             
             <div class="button-group">
                 <button id="startBtn" onclick="controlBot('start')" 
                         class="btn btn-start" 
                         {% if trading_active %}disabled{% endif %}>
-                    <span class="icon">▶️</span> Ligar Bot
+                    <span class="icon">⚡</span> Ligar Bot (0.1s)
                 </button>
                 <button id="stopBtn" onclick="controlBot('stop')" 
                         class="btn btn-stop"
@@ -212,22 +282,33 @@ def home():
             <div class="info-links">
                 <a href="/status" target="_blank">📊 Status Detalhado</a>
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
+                <a href="/logs" target="_blank" id="logsLink" style="display:none;">📝 Ver Logs</a>
                 <br><br>
                 <small style="color: #888;">
-                    Bot rodando em: <strong>{{ request.host_url }}</strong>
+                    ⚡ Verificação em tempo real • Latência mínima • Server: {{ request.host_url }}
                 </small>
             </div>
         </div>
         
         <script>
+        let lastUpdateTime = new Date();
+        
+        function updateTime() {
+            const now = new Date();
+            const diff = Math.floor((now - lastUpdateTime) / 1000);
+            document.getElementById('lastUpdate').textContent = diff === 0 ? 'Agora' : `${diff}s atrás`;
+            setTimeout(updateTime, 1000);
+        }
+        
         async function controlBot(action) {
             const startBtn = document.getElementById('startBtn');
             const stopBtn = document.getElementById('stopBtn');
             const messageEl = document.getElementById('message');
+            const logsLink = document.getElementById('logsLink');
             
             startBtn.disabled = true;
             stopBtn.disabled = true;
-            messageEl.textContent = 'Processando...';
+            messageEl.textContent = '⚡ Processando...';
             
             try {
                 const response = await fetch('/' + action, {
@@ -239,22 +320,32 @@ def home():
                 
                 if (response.ok) {
                     messageEl.textContent = '✅ ' + (data.message || 'Sucesso!');
-                    messageEl.style.color = '#00b894';
-                    setTimeout(() => window.location.reload(), 1500);
+                    messageEl.style.color = '#00ff88';
+                    
+                    if (action === 'start') {
+                        logsLink.style.display = 'inline';
+                        lastUpdateTime = new Date();
+                        updateTime();
+                    }
+                    
+                    setTimeout(() => window.location.reload(), 1000);
                 } else {
                     messageEl.textContent = '❌ ' + (data.message || 'Erro desconhecido');
-                    messageEl.style.color = '#d63031';
+                    messageEl.style.color = '#ff4444';
                     startBtn.disabled = false;
                     stopBtn.disabled = false;
                 }
             } catch (error) {
-                messageEl.textContent = '❌ Erro de conexão com o servidor';
-                messageEl.style.color = '#d63031';
+                messageEl.textContent = '❌ Erro de conexão';
+                messageEl.style.color = '#ff4444';
                 console.error('Erro:', error);
                 startBtn.disabled = false;
                 stopBtn.disabled = false;
             }
         }
+        
+        // Iniciar atualização do tempo
+        updateTime();
         </script>
     </body>
     </html>
@@ -283,7 +374,7 @@ def start_trading():
         return jsonify({"status": "error", "message": "O bot já está ativo!"}), 400
     
     if not okx_client:
-        return jsonify({"status": "error", "message": "Cliente OKX não configurado. Verifique as API Keys."}), 500
+        return jsonify({"status": "error", "message": "Cliente OKX não configurado."}), 500
     
     try:
         if keep_alive:
@@ -291,13 +382,13 @@ def start_trading():
             logger.info("✅ Sistema de keep-alive iniciado.")
         
         trading_active = True
-        trade_thread = threading.Thread(target=trading_loop, daemon=True)
+        trade_thread = threading.Thread(target=ultra_fast_trading_loop, daemon=True)
         trade_thread.start()
         
-        logger.info("🚀 BOT LIGADO via interface web!")
+        logger.info("⚡ BOT LIGADO com verificação de 100ms!")
         return jsonify({
             "status": "success",
-            "message": "Bot de trading iniciado com sucesso!",
+            "message": "Bot iniciado com verificação ultra-rápida (0.1s)!",
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -318,7 +409,7 @@ def stop_trading():
         if okx_client:
             okx_client.close_all_positions()
         
-        logger.info("⏹️ BOT PARADO via interface web.")
+        logger.info("⏹️ BOT PARADO.")
         return jsonify({
             "status": "success",
             "message": "Bot parado e posições fechadas.",
@@ -341,66 +432,97 @@ def get_status():
         "api_connected": okx_client is not None,
         "strategy_loaded": strategy is not None,
         "keep_alive_active": keep_alive is not None,
-        "server_time": datetime.now().isoformat(),
-        "service_url": request.host_url
+        "verification_speed_ms": 100,
+        "timeframe": "30m",
+        "server_time": datetime.now().isoformat()
     })
 
+@app.route('/logs', methods=['GET'])
+def show_logs():
+    """Mostra últimos logs."""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Logs do Bot</title></head>
+    <body>
+        <h1>📝 Logs do Bot de Trading</h1>
+        <p>Os logs completos estão disponíveis no dashboard do Render.</p>
+        <p><a href="/">← Voltar para o controle</a></p>
+    </body>
+    </html>
+    """
+    return html
+
 # ============================================================================
-# 7. LÓGICA DE TRADING (EXECUTADA EM SEGUNDO PLANO)
+# 7. LOOP DE TRADING ULTRA-RÁPIDO (100ms)
 # ============================================================================
-def trading_loop():
-    """Loop principal que executa a estratégia."""
-    logger.info("🔄 Loop de trading iniciado.")
+def ultra_fast_trading_loop():
+    """Loop ultra-rápido que verifica sinais a cada 100ms."""
+    logger.info("⚡ Loop de trading ULTRA-RÁPIDO iniciado (100ms)")
     
     cycle = 0
+    signal_check_count = 0
+    last_candle_update = 0
+    current_candles = []
+    
     while trading_active and okx_client and strategy:
         try:
             cycle += 1
-            logger.info(f"📊 Ciclo #{cycle} - Obtendo dados...")
+            current_time = time.time()
             
-            # AGORA USA TIMEFRAME "1H" (1 HORA)
-            candles = okx_client.get_candles(timeframe="1H", limit=100)
-            
-            if len(candles) < 30:
-                logger.warning(f"Dados insuficientes ({len(candles)} candles)")
-                time.sleep(300)  # Espera 5 minutos antes de tentar novamente
-                continue
-            
-            logger.info(f"✅ {len(candles)} candles obtidos. Analisando sinais...")
-            signal = strategy.calculate_signals(candles)
-            logger.info(f"Sinal calculado: {signal}")
-            
-            if signal.get("signal") in ["BUY", "SELL"] and signal.get("strength", 0) > 0:
-                logger.info(f"🚨 SINAL DETECTADO: {signal['signal']} (Força: {signal['strength']})")
-                
-                position_size = okx_client.calculate_position_size()
-                
-                if position_size > 0:
-                    logger.info(f"💰 Calculando posição: {position_size:.4f} ETH")
-                    success = okx_client.place_order(
-                        side=signal["signal"],
-                        quantity=position_size
-                    )
-                    
-                    if success:
-                        logger.info(f"✅ Ordem {signal['signal']} executada com sucesso!")
-                    else:
-                        logger.error("❌ Falha ao executar ordem")
+            # Atualizar candles a cada 30 segundos (não a cada verificação)
+            if current_time - last_candle_update > CANDLE_CACHE_TIME:
+                logger.info("🔄 Atualizando cache de candles...")
+                new_candles = okx_client.get_candles(timeframe="30m", limit=100)
+                if new_candles and len(new_candles) >= 30:
+                    current_candles = new_candles
+                    last_candle_update = current_time
+                    logger.info(f"✅ Cache atualizado: {len(current_candles)} candles")
                 else:
-                    logger.warning("⚠️  Tamanho da posição é 0 (saldo insuficiente?)")
-            else:
-                logger.info("⏸️  Nenhum sinal de trade detectado")
+                    logger.warning("⚠️  Falha ao atualizar candles, usando cache anterior")
             
-            # Espera 5 minutos antes do próximo ciclo (não precisa esperar 1 hora inteira)
-            logger.info("⏳ Aguardando 5 minutos para próximo ciclo...")
-            time.sleep(300)
+            # Se temos candles suficientes, verificar sinal
+            if len(current_candles) >= 30:
+                signal_check_count += 1
+                
+                # Verificar sinal (isso é SUPER rápido, < 1ms)
+                signal = strategy.calculate_signals(current_candles)
+                
+                # Log apenas a cada 1000 verificações ou quando há sinal
+                if signal_check_count % 1000 == 0:
+                    logger.info(f"🔍 Verificação #{signal_check_count} - Preço: ${current_candles[-1]['close']:.2f}")
+                
+                if signal.get("signal") in ["BUY", "SELL"] and signal.get("strength", 0) > 0:
+                    logger.info(f"🚨🚨🚨 SINAL FORTE DETECTADO: {signal['signal']} (Força: {signal['strength']})")
+                    
+                    # Executar ordem imediatamente
+                    position_size = okx_client.calculate_position_size()
+                    
+                    if position_size > 0:
+                        logger.info(f"⚡ Executando ordem {signal['signal']}: {position_size:.4f} ETH")
+                        success = okx_client.place_order(
+                            side=signal["signal"],
+                            quantity=position_size
+                        )
+                        
+                        if success:
+                            logger.info(f"✅✅✅ Ordem {signal['signal']} EXECUTADA INSTANTANEAMENTE!")
+                            # Após executar, atualizar candles imediatamente
+                            last_candle_update = 0
+                        else:
+                            logger.error("❌ Falha na execução da ordem")
+                    else:
+                        logger.warning("⚠️  Posição zero (sem saldo?)")
+            
+            # Aguardar apenas 0.1 segundos (100ms) para próxima verificação
+            time.sleep(0.1)
             
         except Exception as e:
-            logger.error(f"💥 Erro no ciclo de trading: {e}")
-            time.sleep(60)  # Espera 1 minuto antes de tentar novamente
+            logger.error(f"💥 Erro no loop rápido: {e}")
+            time.sleep(1)  # Esperar 1s em caso de erro
 
 # ============================================================================
-# 8. PONTO DE ENTRADA (PARA EXECUÇÃO LOCAL)
+# 8. PONTO DE ENTRADA
 # ============================================================================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
@@ -409,4 +531,4 @@ if __name__ == '__main__':
     if keep_alive:
         keep_alive.start_keep_alive()
     
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
