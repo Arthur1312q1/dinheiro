@@ -183,7 +183,7 @@ def home():
     <body>
         <div class="container">
             <h1>🤖 Bot de Trading ETH/USDT</h1>
-            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 45min</p>
+            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 1H</p>
             
             <div class="status-box {{ 'status-active' if trading_active else 'status-inactive' }}">
                 Status: 
@@ -358,39 +358,46 @@ def trading_loop():
             cycle += 1
             logger.info(f"📊 Ciclo #{cycle} - Obtendo dados...")
             
-            candles = okx_client.get_candles(timeframe="45m", limit=100)
+            # AGORA USA TIMEFRAME "1H" (1 HORA)
+            candles = okx_client.get_candles(timeframe="1H", limit=100)
             
             if len(candles) < 30:
                 logger.warning(f"Dados insuficientes ({len(candles)} candles)")
-                time.sleep(300)
+                time.sleep(300)  # Espera 5 minutos antes de tentar novamente
                 continue
             
+            logger.info(f"✅ {len(candles)} candles obtidos. Analisando sinais...")
             signal = strategy.calculate_signals(candles)
             logger.info(f"Sinal calculado: {signal}")
             
             if signal.get("signal") in ["BUY", "SELL"] and signal.get("strength", 0) > 0:
-                logger.info(f"🚨 SINAL: {signal['signal']} (Força: {signal['strength']})")
+                logger.info(f"🚨 SINAL DETECTADO: {signal['signal']} (Força: {signal['strength']})")
                 
-                position_size = okx_client.calculate_position_size(sl_points=2000)
+                position_size = okx_client.calculate_position_size()
                 
                 if position_size > 0:
+                    logger.info(f"💰 Calculando posição: {position_size:.4f} ETH")
                     success = okx_client.place_order(
                         side=signal["signal"],
-                        quantity=position_size,
-                        sl_points=2000,
-                        tp_points=55
+                        quantity=position_size
                     )
                     
                     if success:
-                        logger.info(f"✅ Ordem executada: {signal['signal']} {position_size:.4f} ETH")
+                        logger.info(f"✅ Ordem {signal['signal']} executada com sucesso!")
                     else:
-                        logger.error("❌ Falha na ordem")
+                        logger.error("❌ Falha ao executar ordem")
+                else:
+                    logger.warning("⚠️  Tamanho da posição é 0 (saldo insuficiente?)")
+            else:
+                logger.info("⏸️  Nenhum sinal de trade detectado")
             
+            # Espera 5 minutos antes do próximo ciclo (não precisa esperar 1 hora inteira)
+            logger.info("⏳ Aguardando 5 minutos para próximo ciclo...")
             time.sleep(300)
             
         except Exception as e:
-            logger.error(f"💥 Erro no ciclo: {e}")
-            time.sleep(60)
+            logger.error(f"💥 Erro no ciclo de trading: {e}")
+            time.sleep(60)  # Espera 1 minuto antes de tentar novamente
 
 # ============================================================================
 # 8. PONTO DE ENTRADA (PARA EXECUÇÃO LOCAL)
