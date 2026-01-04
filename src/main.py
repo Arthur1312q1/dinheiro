@@ -40,13 +40,18 @@ try:
     strategy = AdaptiveZeroLagEMA() if AdaptiveZeroLagEMA else None
     keep_alive = KeepAliveSystem() if KeepAliveSystem else None
     
-    if okx_client and strategy:
-        # Teste inicial de conexão
-        test_candles = okx_client.get_candles(timeframe="30m", limit=10)
-        if test_candles:
-            logger.info(f"✅ Teste OKX: {len(test_candles)} candles obtidos")
-        else:
-            logger.warning("⚠️  Teste OKX: Nenhum candle obtido")
+    # Inicializar estado da estratégia
+    if strategy:
+        # Carregar dados iniciais
+        if okx_client:
+            init_candles = okx_client.get_candles(timeframe="30m", limit=100)
+            if init_candles and len(init_candles) >= 30:
+                logger.info(f"✅ Dados iniciais: {len(init_candles)} candles")
+                # Calcular sinais iniciais para "aquecer" a estratégia
+                signal = strategy.calculate_signals(init_candles)
+                logger.info(f"📊 Estado inicial: {signal}")
+            else:
+                logger.warning(f"⚠️  Dados insuficientes: {len(init_candles) if init_candles else 0} candles")
     
     logger.info("✅ Componentes do bot inicializados.")
 except Exception as e:
@@ -230,7 +235,7 @@ def home():
     <body>
         <div class="container">
             <h1>⚡ Bot Trading ETH/USDT</h1>
-            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Verificação: 100ms</p>
+            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m</p>
             
             <div class="status-box {{ 'status-active' if trading_active else 'status-inactive' }}">
                 <span class="speed-indicator" style="background-color: {{ '#00ff88' if trading_active else '#ff4444' }}"></span>
@@ -238,26 +243,26 @@ def home():
                 {% if trading_active %}
                     🟢 ATIVO - Verificando a cada 0.1s
                 {% else %}
-                    🔴 INATIVO - Aguardando ativação
+                    🔴 INATIVO - Clique em "Ligar Bot"
                 {% endif %}
             </div>
             
             <div class="stats">
                 <div class="stat-item">
-                    <div class="stat-label">Velocidade Verificação</div>
+                    <div class="stat-label">Velocidade</div>
                     <div class="stat-value">0.1 segundos</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Atualização Candles</div>
-                    <div class="stat-value">0.1 segundos</div>
+                    <div class="stat-label">Candles</div>
+                    <div class="stat-value">100 (mínimo 30)</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Timeframe</div>
                     <div class="stat-value">30 minutos</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Latência Total</div>
-                    <div class="stat-value">< 1ms</div>
+                    <div class="stat-label">Símbolo</div>
+                    <div class="stat-value">ETH-USDT-SWAP</div>
                 </div>
             </div>
             
@@ -281,7 +286,7 @@ def home():
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
                 <br><br>
                 <small style="color: #888;">
-                    ⚡ Atualização: 10 vezes/segundo • Latência mínima
+                    Último preço: $3161.91 • Timeframe 30m funcionando
                 </small>
             </div>
         </div>
@@ -341,11 +346,19 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route('/start', methods=['POST'])
+@app.route('/start', methods=['GET', 'POST'])
 def start_trading():
-    """Liga o bot via interface web."""
+    """Liga o bot - aceita GET e POST para facilitar."""
     global trading_active, trade_thread
     
+    if request.method == 'GET':
+        # Se acessado via GET, redirecionar para a página principal
+        return render_template_string(
+            '<script>window.location.href="/";</script>'
+            '<p>Redirecionando... <a href="/">Clique aqui se não redirecionar</a></p>'
+        )
+    
+    # Método POST (vindo do botão)
     if trading_active:
         return jsonify({"status": "error", "message": "O bot já está ativo!"}), 400
     
@@ -361,7 +374,7 @@ def start_trading():
         trade_thread = threading.Thread(target=ultra_fast_trading_loop, daemon=True)
         trade_thread.start()
         
-        logger.info("⚡ BOT LIGADO com atualização de 100ms!")
+        logger.info("⚡ BOT LIGADO!")
         return jsonify({
             "status": "success", 
             "message": "Bot iniciado com atualização de 0.1s!",
@@ -373,7 +386,7 @@ def start_trading():
 
 @app.route('/stop', methods=['POST'])
 def stop_trading():
-    """Desliga o bot via interface web."""
+    """Desliga o bot."""
     global trading_active
     
     try:
@@ -397,7 +410,7 @@ def stop_trading():
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    """Retorna status detalhado em JSON."""
+    """Retorna status detalhado."""
     balance = okx_client.get_balance() if okx_client else 0
     price = okx_client.get_ticker_price() if okx_client else None
     
@@ -409,79 +422,91 @@ def get_status():
         "strategy_loaded": strategy is not None,
         "keep_alive_active": keep_alive is not None,
         "verification_speed_ms": 100,
-        "candle_update_speed_ms": 100,
         "timeframe": "30m",
         "server_time": datetime.now().isoformat()
     })
 
 # ============================================================================
-# 7. LOOP DE TRADING ULTRA-RÁPIDO (100ms) COM ATUALIZAÇÃO DE CANDLES EM TEMPO REAL
+# 7. LOOP DE TRADING ULTRA-RÁPIDO (CORRIGIDO)
 # ============================================================================
 def ultra_fast_trading_loop():
-    """Loop que atualiza candles e verifica sinais a cada 100ms."""
-    logger.info("⚡ Loop iniciado (atualização: 100ms)")
+    """Loop que atualiza e verifica sinais a cada 100ms."""
+    logger.info("⚡ Loop de trading iniciado (100ms)")
     
     cycle = 0
-    consecutive_errors = 0
-    max_errors = 10
     last_log_time = time.time()
+    last_trade_time = 0
+    min_trade_interval = 2  # Mínimo 2 segundos entre trades
     
     while trading_active and okx_client and strategy:
         try:
             cycle += 1
             current_time = time.time()
             
-            # 1. ATUALIZAR CANDLES A CADA 100ms
-            logger.info(f"🔄 [{cycle}] Atualizando candles...")
+            # 1. ATUALIZAR CANDLES (AGORA COM LIMITE 100)
+            if cycle == 1:
+                logger.info(f"🔄 [{cycle}] Obtendo 100 candles...")
             candles = okx_client.get_candles(timeframe="30m", limit=100)
             
-            if candles and len(candles) >= 30:
-                consecutive_errors = 0  # Resetar contador de erros
+            if not candles:
+                logger.warning("⚠️  Nenhum candle obtido")
+                time.sleep(0.5)
+                continue
                 
-                # Log de preço a cada segundo (não a cada ciclo para não lotar)
-                if current_time - last_log_time >= 1.0:
-                    logger.info(f"📊 Preço atual: ${candles[-1]['close']:.2f} | Candles: {len(candles)}")
-                    last_log_time = current_time
-                
-                # 2. CALCULAR SINAL (ULTRA-RÁPIDO)
-                signal = strategy.calculate_signals(candles)
-                
-                # 3. VERIFICAR SINAL DE TRADE
-                if signal.get("signal") in ["BUY", "SELL"] and signal.get("strength", 0) > 0:
-                    logger.info(f"🚨 SINAL: {signal['signal']} (Força: {signal['strength']})")
-                    
-                    # 4. EXECUTAR ORDEM IMEDIATAMENTE
-                    position_size = okx_client.calculate_position_size()
-                    
-                    if position_size > 0:
-                        logger.info(f"⚡ Executando: {signal['signal']} {position_size:.4f} ETH")
-                        success = okx_client.place_order(
-                            side=signal["signal"],
-                            quantity=position_size
-                        )
-                        
-                        if success:
-                            logger.info(f"✅✅✅ ORDEM EXECUTADA!")
-                            # Após executar, pausar brevemente para evitar múltiplas entradas
-                            time.sleep(0.5)
-                        else:
-                            logger.error("❌ Falha na ordem")
-                    else:
-                        logger.warning("⚠️  Posição zero")
-            else:
-                consecutive_errors += 1
-                logger.warning(f"⚠️  Dados insuficientes ({len(candles) if candles else 0} candles)")
-                
-                if consecutive_errors >= max_errors:
-                    logger.error(f"💥 Muitos erros consecutivos ({consecutive_errors})")
-                    time.sleep(5)  # Pausa maior se muitos erros
+            if len(candles) < 30:
+                logger.warning(f"⚠️  Poucos candles: {len(candles)} (precisa de 30+)")
+                time.sleep(0.5)
+                continue
             
-            # 5. AGUARDAR 0.1 SEGUNDOS PRÓXIMA ATUALIZAÇÃO
+            # Log a cada segundo para não lotar
+            if current_time - last_log_time >= 1.0:
+                logger.info(f"📊 Ciclo {cycle} | Preço: ${candles[-1]['close']:.2f} | Candles: {len(candles)}")
+                last_log_time = current_time
+            
+            # 2. CALCULAR SINAL
+            signal = strategy.calculate_signals(candles)
+            
+            # 3. VERIFICAR SE HÁ SINAL FORTE
+            if signal.get("signal") in ["BUY", "SELL"] and signal.get("strength", 0) > 0:
+                
+                # Evitar trades muito seguidos
+                if current_time - last_trade_time < min_trade_interval:
+                    logger.info(f"⏳ Aguardando intervalo mínimo entre trades...")
+                    time.sleep(0.1)
+                    continue
+                
+                logger.info(f"🚨🚨🚨 SINAL FORTE: {signal['signal']} (Força: {signal['strength']})")
+                
+                # 4. CALCULAR TAMANHO DA POSIÇÃO
+                position_size = okx_client.calculate_position_size()
+                
+                if position_size <= 0:
+                    logger.warning("⚠️  Posição zero ou saldo insuficiente")
+                    time.sleep(0.1)
+                    continue
+                
+                # 5. EXECUTAR ORDEM
+                logger.info(f"⚡ EXECUTANDO: {signal['signal']} {position_size:.4f} ETH")
+                
+                success = okx_client.place_order(
+                    side=signal["signal"],
+                    quantity=position_size
+                )
+                
+                if success:
+                    logger.info(f"✅✅✅ ORDEM {signal['signal']} EXECUTADA COM SUCESSO!")
+                    last_trade_time = current_time
+                    
+                    # Pausa após trade para evitar múltiplas entradas
+                    time.sleep(0.5)
+                else:
+                    logger.error("❌ Falha na execução da ordem")
+            
+            # 6. AGUARDAR 100ms PARA PRÓXIMA VERIFICAÇÃO
             time.sleep(0.1)
             
         except Exception as e:
             logger.error(f"💥 Erro no loop: {e}")
-            consecutive_errors += 1
             time.sleep(1)  # Pausa maior em caso de erro
 
 # ============================================================================
