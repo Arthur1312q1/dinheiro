@@ -4,10 +4,10 @@ import hashlib
 import time
 import requests
 import json
-from typing import Dict, Optional, List
 import logging
+from typing import Dict, Optional, List
+from urllib.parse import urlparse, parse_qs
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class OKXClient:
@@ -19,105 +19,97 @@ class OKXClient:
         self.leverage = 1
         self.balance_percentage = 0.95
         
-        # Verificar credenciais
-        if not self.api_key or not self.secret_key or not self.passphrase:
-            logger.error("❌ Credenciais OKX não configuradas. Configure:")
+        if not all([self.api_key, self.secret_key, self.passphrase]):
+            logger.error("❌ Credenciais OKX não configuradas!")
+            logger.error("   Configure no Render:")
             logger.error("   - OKX_API_KEY")
-            logger.error("   - OKX_SECRET_KEY") 
+            logger.error("   - OKX_SECRET_KEY")
             logger.error("   - OKX_PASSPHRASE")
             raise ValueError("Credenciais OKX não configuradas")
         else:
             logger.info("✅ Credenciais OKX carregadas")
     
-    def _sign(self, timestamp: str, method: str, request_path: str, body: str = "") -> str:
-        """Gera assinatura HMAC SHA256 - CORRIGIDA"""
+    def _get_timestamp(self):
+        """Retorna timestamp no formato ISO 8601 exigido pela OKX"""
+        return time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+    
+    def _sign(self, timestamp, method, request_path, body=''):
+        """
+        Gera assinatura HMAC SHA256 conforme documentação da OKX
+        Formato: timestamp + method + request_path + body
+        """
         try:
-            # Format: timestamp + method + request_path + body
-            if body is None:
-                body = ""
+            message = str(timestamp) + str(method.upper()) + str(request_path) + str(body)
+            logger.debug(f"📝 Mensagem para assinatura: {message[:100]}...")
             
-            # IMPORTANTE: method deve estar em MAIÚSCULAS
-            method = method.upper()
-            
-            message = timestamp + method + request_path + str(body)
-            logger.debug(f"📝 Mensagem para assinatura: {message}")
-            
-            # Decodificar secret_key (deve estar em formato string)
+            # A secret_key deve estar em formato string
             secret_key_bytes = self.secret_key.encode('utf-8')
             message_bytes = message.encode('utf-8')
             
-            # Criar assinatura
             signature = hmac.new(
                 secret_key_bytes,
                 message_bytes,
                 hashlib.sha256
-            ).digest()
+            ).hexdigest()
             
-            # Converter para base64
-            signature_base64 = signature.hex()
-            logger.debug(f"🔑 Assinatura gerada: {signature_base64[:20]}...")
-            
-            return signature_base64
-            
+            logger.debug(f"🔑 Assinatura gerada: {signature[:20]}...")
+            return signature
         except Exception as e:
             logger.error(f"💥 Erro ao gerar assinatura: {e}")
             raise
     
-    def _headers(self, method: str, request_path: str, body: str = "") -> Dict:
-        """Cria headers para requisição - CORRIGIDA"""
-        try:
-            # Timestamp no formato exato da OKX: ISO 8601 com 3 ms
-            timestamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-            
-            # Garantir que o body seja string JSON ou vazio
-            if body is None:
-                body = ""
-            
-            # Gerar assinatura
-            signature = self._sign(timestamp, method, request_path, body)
-            
-            headers = {
-                'OK-ACCESS-KEY': self.api_key,
-                'OK-ACCESS-SIGN': signature,
-                'OK-ACCESS-TIMESTAMP': timestamp,
-                'OK-ACCESS-PASSPHRASE': self.passphrase,
-                'Content-Type': 'application/json'
-            }
-            
-            logger.debug(f"📤 Headers: {headers['OK-ACCESS-KEY'][:10]}... | Timestamp: {timestamp}")
-            return headers
-            
-        except Exception as e:
-            logger.error(f"💥 Erro ao criar headers: {e}")
-            raise
+    def _headers(self, method, request_path, body=''):
+        """Cria headers para requisição"""
+        timestamp = self._get_timestamp()
+        signature = self._sign(timestamp, method, request_path, body)
+        
+        headers = {
+            'OK-ACCESS-KEY': self.api_key,
+            'OK-ACCESS-SIGN': signature,
+            'OK-ACCESS-TIMESTAMP': timestamp,
+            'OK-ACCESS-PASSPHRASE': self.passphrase,
+            'Content-Type': 'application/json'
+        }
+        
+        logger.debug(f"📤 Headers criados (API Key: {self.api_key[:10]}...)")
+        return headers
     
-    def _request(self, method: str, endpoint: str, data: Dict = None) -> Dict:
-        """Faz requisição para API OKX - COM TRATAMENTO DE ERROS"""
+    def _parse_request_path(self, endpoint):
+        """Extrai o caminho da requisição sem parâmetros de query para assinatura"""
+        # Para endpoints com query parameters, precisamos incluir apenas o path
+        parsed = urlparse(endpoint)
+        request_path = parsed.path
+        if parsed.query:
+            request_path = f"{parsed.path}?{parsed.query}"
+        return request_path
+    
+    def _request(self, method, endpoint, data=None):
+        """Faz requisição para API OKX"""
         try:
             url = f"{self.base_url}{endpoint}"
-            body = ""
+            body = ''
             
-            if data:
+            if data and method in ['POST', 'PUT']:
                 body = json.dumps(data, separators=(',', ':'))
-                logger.debug(f"📦 Body: {body}")
+                logger.debug(f"📦 Body JSON: {body}")
             
-            # Extrair caminho da requisição (sem o domínio)
-            request_path = endpoint.split('?')[0]  # Sem query parameters
+            # O request_path para assinatura deve incluir query parameters se existirem
+            request_path = self._parse_request_path(endpoint)
             
             headers = self._headers(method, request_path, body)
             
             logger.info(f"🌐 {method} {endpoint}")
             
-            response = requests.request(
-                method=method,
-                url=url,
-                headers=headers,
-                data=body if method in ['POST', 'PUT'] else None,
-                params=data if method == 'GET' and '?' in endpoint else None,
-                timeout=10
-            )
+            if method == 'GET':
+                response = requests.get(url, headers=headers, timeout=10)
+            elif method == 'POST':
+                response = requests.post(url, headers=headers, data=body, timeout=10)
+            else:
+                logger.error(f"Método não suportado: {method}")
+                return {"code": "-1", "msg": "Método não suportado"}
             
             logger.debug(f"📥 Status: {response.status_code}")
+            logger.debug(f"📥 Response: {response.text[:200]}...")
             
             if response.status_code != 200:
                 logger.error(f"❌ HTTP {response.status_code}: {response.text}")
@@ -142,23 +134,17 @@ class OKXClient:
             logger.error(f"💥 Erro na requisição: {e}")
             return {"code": "exception", "msg": str(e)}
     
-    def get_balance(self) -> float:
-        """Obtém saldo disponível em USDT - CORRIGIDA"""
+    def get_balance(self):
+        """Obtém saldo disponível em USDT"""
         try:
-            endpoint = "/api/v5/account/balance"
-            
-            # Query parameters para GET requests
-            params = {"ccy": "USDT"}
-            
-            # Para GET, os params vão na URL, não no body
-            endpoint_with_params = f"{endpoint}?ccy=USDT"
-            
-            response = self._request("GET", endpoint_with_params)
+            # Endpoint correto para obter saldo
+            endpoint = "/api/v5/account/balance?ccy=USDT"
+            response = self._request("GET", endpoint)
             
             if response.get("code") == "0":
-                data = response.get("data", [{}])
+                data = response.get("data", [])
                 if data and len(data) > 0:
-                    details = data[0].get("details", [{}])
+                    details = data[0].get("details", [])
                     if details and len(details) > 0:
                         balance_str = details[0].get("availBal", "0")
                         try:
@@ -167,24 +153,25 @@ class OKXClient:
                             return balance
                         except ValueError:
                             logger.error(f"❌ Formato de saldo inválido: {balance_str}")
-                            return 0
+                            return 0.0
+                logger.warning("⚠️  Nenhum dado de saldo retornado")
             else:
                 logger.error(f"❌ Erro na API: {response.get('msg')}")
-                
-            return 0
+            
+            return 0.0
             
         except Exception as e:
             logger.error(f"💥 Erro ao obter saldo: {e}")
-            return 0
+            return 0.0
     
-    def get_ticker_price(self, symbol: str = "ETH-USDT-SWAP") -> Optional[float]:
+    def get_ticker_price(self, symbol="ETH-USDT-SWAP"):
         """Obtém preço atual"""
         try:
             endpoint = f"/api/v5/market/ticker?instId={symbol}"
             response = self._request("GET", endpoint)
             
             if response.get("code") == "0":
-                data = response.get("data", [{}])
+                data = response.get("data", [])
                 if data and len(data) > 0:
                     price_str = data[0].get("last", "0")
                     try:
@@ -200,11 +187,10 @@ class OKXClient:
             logger.error(f"💥 Erro ao obter preço: {e}")
             return None
     
-    def get_candles(self, symbol: str = "ETH-USDT-SWAP", timeframe: str = "30m", limit: int = 100) -> List[Dict]:
-        """Obtém candles de 30 minutos"""
+    def get_candles(self, symbol="ETH-USDT-SWAP", timeframe="30m", limit=100):
+        """Obtém candles"""
         try:
             endpoint = f"/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
-            
             logger.info(f"🔍 Buscando {limit} candles: {symbol} | {timeframe}")
             
             response = self._request("GET", endpoint)
@@ -213,7 +199,6 @@ class OKXClient:
                 candles_data = response.get("data", [])
                 if candles_data:
                     candles = []
-                    # Inverter para ter do mais antigo para o mais recente
                     for c in reversed(candles_data):
                         try:
                             candles.append({
@@ -243,20 +228,20 @@ class OKXClient:
             logger.error(f"💥 Erro ao obter candles: {e}")
             return []
     
-    def calculate_position_size(self, sl_points: int = 2000) -> float:
+    def calculate_position_size(self, sl_points=2000):
         """Calcula tamanho da posição usando 95% do saldo"""
         try:
             # Obter saldo
             balance = self.get_balance()
             if balance <= 0:
                 logger.error(f"❌ Saldo insuficiente: ${balance:.2f}")
-                return 0
+                return 0.0
             
             # Obter preço atual
             price = self.get_ticker_price()
             if not price or price <= 0:
                 logger.error(f"❌ Preço inválido: {price}")
-                return 0
+                return 0.0
             
             # Capital de risco (95% do saldo)
             risk_capital = balance * self.balance_percentage
@@ -279,9 +264,9 @@ class OKXClient:
             
         except Exception as e:
             logger.error(f"💥 Erro no cálculo da posição: {e}")
-            return 0
+            return 0.0
     
-    def place_order(self, side: str, quantity: float, sl_points: int = 2000, tp_points: int = 55) -> bool:
+    def place_order(self, side, quantity, sl_points=2000, tp_points=55):
         """Coloca ordem com stop loss e take profit"""
         try:
             symbol = "ETH-USDT-SWAP"
@@ -382,7 +367,7 @@ class OKXClient:
             logger.error(f"💥 Erro ao executar ordem: {e}")
             return False
     
-    def close_all_positions(self) -> bool:
+    def close_all_positions(self):
         """Fecha todas as posições abertas"""
         try:
             response = self._request("GET", "/api/v5/account/positions")
@@ -426,33 +411,35 @@ class OKXClient:
             logger.error(f"💥 Erro ao fechar posições: {e}")
             return False
     
-    def test_connection(self) -> bool:
+    def test_connection(self):
         """Testa a conexão com a OKX"""
         try:
             logger.info("🔗 Testando conexão com OKX...")
             
-            # Testar saldo
+            # Primeiro testar um endpoint público para ver se a API está acessível
+            time_response = self._request("GET", "/api/v5/public/time")
+            if time_response.get("code") == "0":
+                logger.info("✅ Conexão básica OK")
+            else:
+                logger.error("❌ Falha na conexão básica")
+                return False
+            
+            # Testar saldo (pode falhar se as credenciais estiverem erradas)
             balance = self.get_balance()
             if balance > 0:
                 logger.info(f"✅ Saldo OK: ${balance:.2f}")
+            elif balance == 0:
+                logger.warning("⚠️  Saldo zero (pode ser normal em conta de teste)")
             else:
-                logger.warning("⚠️  Saldo zero ou erro")
+                logger.error("❌ Erro ao obter saldo (credenciais inválidas?)")
             
             # Testar preço
             price = self.get_ticker_price()
             if price:
                 logger.info(f"✅ Preço OK: ${price:.2f}")
-            else:
-                logger.error("❌ Erro ao obter preço")
-                return False
-            
-            # Testar candles
-            candles = self.get_candles(limit=5)
-            if candles:
-                logger.info(f"✅ Candles OK: {len(candles)} obtidos")
                 return True
             else:
-                logger.error("❌ Erro ao obter candles")
+                logger.error("❌ Erro ao obter preço")
                 return False
                 
         except Exception as e:
