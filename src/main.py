@@ -39,7 +39,6 @@ try:
     okx_client = OKXClient() if OKXClient else None
     keep_alive = KeepAliveSystem() if KeepAliveSystem else None
     
-    # Inicializar o Strategy Runner (que carrega o Pine Script)
     strategy_runner = None
     if okx_client:
         strategy_runner = StrategyRunner(okx_client)
@@ -63,7 +62,6 @@ trade_thread = None
 # ============================================================================
 @app.route('/', methods=['GET'])
 def home():
-    """Página inicial com interface para controlar o bot."""
     html = """
     <!DOCTYPE html>
     <html>
@@ -235,7 +233,7 @@ def home():
                 <span class="speed-indicator" style="background-color: {{ '#00ff88' if trading_active else '#ff4444' }}"></span>
                 Status: 
                 {% if trading_active %}
-                    🟢 ATIVO - Monitorando a cada 200ms
+                    🟢 ATIVO - Executando Pine Script
                 {% else %}
                     🔴 INATIVO - Aguardando ativação
                 {% endif %}
@@ -252,7 +250,7 @@ def home():
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Verificação</div>
-                    <div class="stat-value">A cada 200ms</div>
+                    <div class="stat-value">A cada 60s</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Símbolo</div>
@@ -282,7 +280,7 @@ def home():
                 <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
-                    Mínimo de ordem: 0.001 ETH • Loop de alta frequência: 200ms
+                    Mínimo de ordem: 0.001 ETH • Executando estratégia Pine Script original
                 </small>
             </div>
         </div>
@@ -329,12 +327,8 @@ def home():
     """
     return render_template_string(html, trading_active=trading_active)
 
-# ============================================================================
-# 6. ENDPOINTS DA API
-# ============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Endpoint para keep-alive (UptimeRobot)."""
     return jsonify({
         "status": "healthy",
         "service": "OKX ETH Trading Bot (Pine Script Engine)",
@@ -344,17 +338,14 @@ def health_check():
 
 @app.route('/start', methods=['GET', 'POST'])
 def start_trading():
-    """Liga o bot - aceita GET e POST para facilitar."""
     global trading_active, trade_thread
     
     if request.method == 'GET':
-        # Se acessado via GET, redirecionar para a página principal
         return render_template_string(
             '<script>window.location.href="/";</script>'
             '<p>Redirecionando... <a href="/">Clique aqui se não redirecionar</a></p>'
         )
     
-    # Método POST (vindo do botão)
     if trading_active:
         return jsonify({"status": "error", "message": "O bot já está ativo!"}), 400
     
@@ -369,17 +360,16 @@ def start_trading():
             keep_alive.start_keep_alive()
             logger.info("✅ Sistema de keep-alive iniciado.")
         
-        # Iniciar o strategy runner
         strategy_runner.start()
         
         trading_active = True
         trade_thread = threading.Thread(target=trading_loop_pine_engine, daemon=True)
         trade_thread.start()
         
-        logger.info("⚡ BOT LIGADO com Pine Script Engine (Alta Frequência - 200ms)!")
+        logger.info("⚡ BOT LIGADO com Pine Script Engine!")
         return jsonify({
             "status": "success", 
-            "message": "Bot iniciado com Pine Script Engine (Alta Frequência)!",
+            "message": "Bot iniciado com Pine Script Engine!",
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -388,7 +378,6 @@ def start_trading():
 
 @app.route('/stop', methods=['POST'])
 def stop_trading():
-    """Desliga o bot."""
     global trading_active
     
     try:
@@ -415,7 +404,6 @@ def stop_trading():
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    """Retorna status detalhado."""
     balance = okx_client.get_balance() if okx_client else 0
     price = okx_client.get_ticker_price() if okx_client else None
     
@@ -428,13 +416,13 @@ def get_status():
         "keep_alive_active": keep_alive is not None,
         "timeframe": "30m",
         "engine": "Pine Script Interpreter",
-        "loop_frequency_ms": 200,
-        "server_time": datetime.now().isoformat()
+        "server_time": datetime.now().isoformat(),
+        "min_order_size": 0.001,
+        "min_order_value_usd": price * 0.001 if price else 0
     })
 
 @app.route('/strategy-status', methods=['GET'])
 def get_strategy_status():
-    """Retorna status detalhado da estratégia Pine Script."""
     if not strategy_runner:
         return jsonify({"error": "Strategy Runner não inicializado"}), 500
     
@@ -443,15 +431,11 @@ def get_strategy_status():
 
 @app.route('/test-auth', methods=['GET'])
 def test_auth():
-    """Endpoint para testar autenticação OKX."""
     if not okx_client:
         return jsonify({"status": "error", "message": "Cliente OKX não inicializado"}), 500
     
     try:
-        # Testar obtenção de saldo
         balance = okx_client.get_balance()
-        
-        # Testar obtenção de preço
         price = okx_client.get_ticker_price()
         
         return jsonify({
@@ -460,103 +444,46 @@ def test_auth():
             "current_eth_price": price,
             "api_key_exists": bool(okx_client.api_key),
             "secret_key_exists": bool(okx_client.secret_key),
-            "passphrase_exists": bool(okx_client.passphrase)
+            "passphrase_exists": bool(okx_client.passphrase),
+            "min_order_size": 0.001,
+            "minimum_required_usdt": price * 0.001 if price else 0
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ============================================================================
-# 7. LOOP DE TRADING COM PINE SCRIPT ENGINE - ALTA FREQUÊNCIA (200ms)
-# ============================================================================
 def trading_loop_pine_engine():
-    """Loop principal de ALTA FREQUÊNCIA para estratégias de curto prazo."""
-    logger.info("⚡ Loop de trading INICIADO (Alta Frequência - 200ms)")
+    logger.info("⏳ Loop de trading iniciado (Pine Script Engine)")
     
-    # ETAPA 1: INICIALIZAÇÃO COM DADOS HISTÓRICOS
-    # ============================================
-    logger.info("🔍 Buscando 100 candles históricos para inicialização...")
-    historical_candles = okx_client.get_candles(timeframe="30m", limit=100)
-    
-    if not historical_candles or len(historical_candles) < 100:
-        logger.error(f"❌ Não foi possível obter 100 candles. Obtidos: {len(historical_candles) if historical_candles else 0}")
-        global trading_active
-        trading_active = False
-        return
-    
-    # 'Aquece' a estratégia com os 100 candles históricos (sem gerar trades)
-    strategy_runner.warm_up_strategy(historical_candles)
-    
-    # Captura o timestamp do ÚLTIMO candle histórico carregado
-    last_known_timestamp = historical_candles[-1]['timestamp']
-    logger.info(f"✅ Inicialização concluída. Monitorando mercado a cada 200ms.")
-    
-    # Variáveis para controle de ciclo e logs
     cycle = 0
-    last_log_time = time.time()
-    last_candle_check = 0
-    candle_check_interval = 2  # Verificar candles a cada 2 segundos
     
-    # ETAPA 2: LOOP DE ALTA FREQUÊNCIA (200ms)
-    # ============================================
     while trading_active and okx_client and strategy_runner:
-        cycle_start = time.time()
-        cycle += 1
-        
         try:
-            # --- VERIFICAÇÃO PRINCIPAL A CADA 200ms ---
-            # 1. Verifica se há candles NOVOS de 30m (a cada 2 segundos para não sobrecarregar API)
-            current_time = time.time()
-            if current_time - last_candle_check >= candle_check_interval:
-                last_candle_check = current_time
-                
-                # Busca candles recentes (apenas os mais novos)
-                recent_candles = okx_client.get_candles(timeframe="30m", limit=3)
-                
-                if recent_candles:
-                    # FILTRA: Pega APENAS candles com timestamp MAIOR que o último conhecido
-                    new_candles = [c for c in recent_candles if c['timestamp'] > last_known_timestamp]
-                    
-                    if new_candles:
-                        # Processa os candles novos (esta fase pode gerar trades)
-                        logger.info(f"🔄 Candle NOVO detectado! Processando {len(new_candles)} candle(s)...")
-                        
-                        for candle in new_candles:
-                            signal = strategy_runner.run_strategy_on_new_candles([candle])
-                            last_known_timestamp = candle['timestamp']
-                            
-                            # Log do sinal IMEDIATAMENTE
-                            if signal['signal'] != 'HOLD':
-                                logger.info(f"🚨 SINAL IMEDIATO: {signal['signal']} | Preço: ${signal['price']:.2f} | Hora: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+            cycle += 1
             
-            # 2. Log de status a cada 10 segundos (para não poluir)
-            if current_time - last_log_time >= 10:
-                last_log_time = current_time
-                # Obtém preço atual para log (usando ticker, mais leve que candles)
-                try:
-                    price = okx_client.get_ticker_price()
-                    if price:
-                        logger.info(f"📊 Monitor ativo | Preço: ${price:.2f} | Ciclos: {cycle} | Delay médio: {int((time.time()-cycle_start)*1000)}ms")
-                except Exception as e:
-                    logger.debug(f"Erro ao obter preço para log: {e}")
+            candles = okx_client.get_candles(timeframe="30m", limit=10)
             
-            # 3. Controle de timing PRECISO - 200ms exatos entre ciclos
-            cycle_duration = time.time() - cycle_start
-            sleep_time = max(0.0, 0.2 - cycle_duration)  # Mantém 200ms exatos
+            if not candles or len(candles) < 5:
+                logger.warning(f"Dados insuficientes ({len(candles) if candles else 0} candles)")
+                time.sleep(60)
+                continue
             
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            logger.info(f"🔄 Ciclo {cycle} | Verificando candle mais recente...")
+            signal = strategy_runner.run_strategy_on_candles(candles)
+            
+            if signal['signal'] != 'HOLD':
+                logger.info(f"📢 Sinal: {signal['signal']} | Preço: ${signal['price']:.2f}")
             else:
-                # Se o ciclo demorar mais que 200ms, log um aviso
-                if cycle_duration > 0.25:  # Se passar de 250ms
-                    logger.warning(f"⚠️  Ciclo lento: {cycle_duration*1000:.1f}ms (meta: 200ms)")
-        
+                if cycle % 5 == 0:
+                    logger.info(f"📊 Ciclo {cycle} | Preço: ${candles[-1]['close']:.2f} | Sem sinal")
+            
+            time.sleep(60)
+            
         except Exception as e:
-            logger.error(f"💥 Erro no loop de trading: {e}")
-            # Não travar o loop por erro único
-            time.sleep(1)  # Pequena pausa antes de continuar
+            logger.error(f"💥 Erro no loop: {e}")
+            time.sleep(60)
 
 # ============================================================================
-# 8. PONTO DE ENTRADA
+# PONTO DE ENTRADA PRINCIPAL
 # ============================================================================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
@@ -564,5 +491,17 @@ if __name__ == '__main__':
     
     if keep_alive:
         keep_alive.start_keep_alive()
+    
+    # Iniciar serviço de ping automático para manter o app ativo no Render
+    try:
+        from ping_service import PingService
+        # 🔽 **SUBSTITUA ESTA URL PELA URL DO SEU BOT NO RENDER** 🔽
+        ping_service = PingService("https://dinheiro.onrender.com")
+        ping_service.start_ping_loop()
+        logger.info("✅ Serviço de ping automático inicializado")
+    except ImportError as e:
+        logger.warning(f"⚠️  Módulo ping_service não encontrado: {e}")
+    except Exception as e:
+        logger.warning(f"⚠️  Não foi possível iniciar o serviço de ping: {e}")
     
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
