@@ -4,7 +4,6 @@ Integra o interpretador com o cliente OKX
 """
 import os
 import logging
-import time
 from typing import Dict, List, Optional
 
 from pine_engine import PineScriptInterpreter
@@ -30,13 +29,14 @@ class StrategyRunner:
             logger.error("❌ Não foi possível carregar o código Pine Script")
     
     def _load_pine_script(self) -> Optional[str]:
-        """Carrega o código Pine Script do arquivo"""
+        """Carrega o código Pine Script do arquivo."""
         try:
             # Tenta vários caminhos possíveis
             possible_paths = [
                 "strategy/Adaptive_Zero_Lag_EMA_v2.pine",
                 "src/strategy/Adaptive_Zero_Lag_EMA_v2.pine",
-                "./strategy/Adaptive_Zero_Lag_EMA_v2.pine"
+                "./strategy/Adaptive_Zero_Lag_EMA_v2.pine",
+                "Adaptive_Zero_Lag_EMA_v2.pine"
             ]
             
             for script_path in possible_paths:
@@ -52,73 +52,98 @@ class StrategyRunner:
             return None
     
     def start(self):
-        """Inicia a execução da estratégia"""
+        """Inicia a execução da estratégia."""
         if not self.interpreter:
             logger.error("❌ Interpreter não inicializado")
             return False
         
         self.is_running = True
-        self.last_processed_timestamp = 0  # Reset ao iniciar
+        self.last_processed_timestamp = 0
         logger.info("🚀 Strategy Runner iniciado")
         return True
     
     def stop(self):
-        """Para a execução da estratégia"""
+        """Para a execução da estratégia."""
         self.is_running = False
         logger.info("⏹️ Strategy Runner parado")
     
-    def run_strategy_on_candles(self, candles: List[Dict]) -> Dict:
+    def warm_up_strategy(self, historical_candles: List[Dict]):
         """
-        Executa a estratégia em uma lista de candles
-        Apenas processa candles NOVOS para evitar sinais históricos
+        Processa candles históricos APENAS para inicializar os cálculos da estratégia
+        (EMAs, EC, séries temporais). NÃO gera ou executa trades durante este processo.
         """
-        if not self.interpreter or not candles:
-            return {"signal": "HOLD", "strength": 0}
+        if not self.interpreter:
+            return
         
-        # Encontrar o candle mais recente
-        latest_candle = candles[-1] if candles else None
+        logger.info(f"🔥 Aquecendo a estratégia com {len(historical_candles)} candles históricos...")
         
-        if not latest_candle:
-            return {"signal": "HOLD", "strength": 0}
+        # Reseta o interpretador para estado limpo antes do warm-up
+        self.interpreter.reset()
         
-        # Verificar se este candle já foi processado
-        if latest_candle['timestamp'] <= self.last_processed_timestamp:
-            return {"signal": "HOLD", "strength": 0}
-        
-        # Apenas processar o ÚLTIMO candle (evitar processar histórico)
-        logger.info(f"📊 Processando candle mais recente: Timestamp {latest_candle['timestamp']}")
-        
-        # Processar apenas o último candle
-        result = self.interpreter.process_candle(latest_candle)
-        self.last_processed_timestamp = latest_candle['timestamp']
-        
-        # Se houver sinal de trade, executar na OKX
-        if result['signal'] in ['BUY', 'SELL'] and result['strength'] > 0:
-            logger.info(f"📢 SINAL DETECTADO: {result['signal']} no preço ${result['price']:.2f}")
+        # Processa cada candle histórico, mas IGNORA qualquer sinal de trade
+        for candle in historical_candles:
+            # Processa o candle no interpretador
+            result = self.interpreter.process_candle(candle)
             
-            # Calcular tamanho da posição
-            position_size = self.okx_client.calculate_position_size()
+            # Atualiza o último timestamp processado
+            self.last_processed_timestamp = candle['timestamp']
             
-            if position_size >= 0.01:  # Mínimo da OKX
-                logger.info(f"📈 Executando {result['signal']} com {position_size:.4f} ETH")
+            # Log apenas para primeiros e últimos candles do warm-up
+            if len(self.interpreter.series_data['src'].values) == 1:
+                logger.info(f"   Primeiro candle histórico: ${candle['close']:.2f}")
+            elif len(self.interpreter.series_data['src'].values) == len(historical_candles):
+                logger.info(f"   Último candle histórico: ${candle['close']:.2f}")
+        
+        logger.info(f"✅ Estratégia aquecida. Estado inicial carregado com {self.interpreter.candle_count} candles.")
+        logger.info(f"   Último timestamp processado: {self.last_processed_timestamp}")
+    
+    def run_strategy_on_new_candles(self, new_candles: List[Dict]) -> Dict:
+        """
+        Processa APENAS candles NOVOS (com timestamp > last_processed_timestamp).
+        Esta é a fase de execução em tempo real que pode gerar trades.
+        """
+        if not self.interpreter or not new_candles or not self.is_running:
+            return {"signal": "HOLD", "strength": 0}
+        
+        last_signal = {"signal": "HOLD", "strength": 0}
+        
+        for candle in new_candles:
+            # Verifica se é realmente um candle novo
+            if candle['timestamp'] <= self.last_processed_timestamp:
+                continue
+            
+            # Processa o candle através do interpretador Pine Script
+            result = self.interpreter.process_candle(candle)
+            last_signal = result
+            self.last_processed_timestamp = candle['timestamp']
+            
+            # Se houver sinal de trade, executar na OKX
+            if result['signal'] in ['BUY', 'SELL'] and result['strength'] > 0:
+                logger.info(f"📢 SINAL DE {result['signal']} detectado no preço ${result['price']:.2f}")
                 
-                # Executar ordem na OKX
-                success = self.okx_client.place_order(
-                    side=result['signal'],
-                    quantity=position_size
-                )
+                # Calcular tamanho da posição
+                position_size = self.okx_client.calculate_position_size()
                 
-                if success:
-                    logger.info(f"✅ Ordem {result['signal']} executada na OKX")
+                if position_size > 0:
+                    logger.info(f"📈 Executando {result['signal']} com {position_size:.4f} ETH")
+                    
+                    # Executar ordem na OKX
+                    success = self.okx_client.place_order(
+                        side=result['signal'],
+                        quantity=position_size
+                    )
+                    
+                    if success:
+                        logger.info(f"✅ Ordem {result['signal']} executada na OKX")
+                    else:
+                        logger.error(f"❌ Falha na ordem {result['signal']}")
                 else:
-                    logger.error(f"❌ Falha na ordem {result['signal']}")
-            else:
-                logger.warning(f"⚠️  Posição muito pequena ({position_size:.4f} ETH). Mínimo: 0.01 ETH")
+                    logger.warning(f"⚠️  Posição muito pequena ou cálculo falhou ({position_size:.6f} ETH)")
         
-        return result
+        return last_signal
     
     def get_strategy_status(self) -> Dict:
-        """Retorna o status atual da estratégia"""
+        """Retorna o status atual da estratégia."""
         if not self.interpreter:
             return {"status": "not_initialized"}
         
