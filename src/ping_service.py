@@ -12,10 +12,10 @@ class PingService:
         """
         Inicializa o serviço de ping.
         
-        :param app_url: URL completa do seu bot no Render (ex: https://seu-bot.onrender.com)
+        :param app_url: URL completa do seu bot no Render (ex: https://dinheiro.onrender.com)
         """
         self.app_url = app_url
-        self.health_endpoint = f"{app_url}/health"  # Usa o endpoint de saúde
+        self.health_endpoint = f"{app_url}/health"
         self.is_running = True
         self.interval = 300  # 300 segundos = 5 minutos (menor que 15 min do Render)
         
@@ -41,7 +41,6 @@ class PingService:
             
             while self.is_running:
                 self.send_ping()
-                # Aguarda o intervalo, mas verifica periodicamente se deve parar
                 for _ in range(self.interval):
                     if not self.is_running:
                         break
@@ -56,17 +55,15 @@ class PingService:
         self.is_running = False
         logger.info("⏹️ Serviço de ping parado")
 
-# Configuração para seu bot específico
+# Ponto de entrada se executado diretamente
 if __name__ == '__main__':
-    # 🔽 SUBSTITUA A URL ABAIXO PELA URL DO SEU BOT NO RENDER 🔽
+    # 🔽 **SUBSTITUA ESTA URL PELA URL DO SEU BOT NO RENDER** 🔽
     YOUR_RENDER_APP_URL = "https://dinheiro.onrender.com"
     
-    # Cria e inicia o serviço
     ping_service = PingService(YOUR_RENDER_APP_URL)
     
     try:
         ping_service.start_ping_loop()
-        # Mantém o script principal em execução
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
