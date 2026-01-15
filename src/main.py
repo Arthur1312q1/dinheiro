@@ -235,7 +235,7 @@ def home():
                 <span class="speed-indicator" style="background-color: {{ '#00ff88' if trading_active else '#ff4444' }}"></span>
                 Status: 
                 {% if trading_active %}
-                    🟢 ATIVO - Executando Pine Script
+                    🟢 ATIVO - Monitorando a cada 200ms
                 {% else %}
                     🔴 INATIVO - Aguardando ativação
                 {% endif %}
@@ -252,7 +252,7 @@ def home():
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Verificação</div>
-                    <div class="stat-value">A cada 60s</div>
+                    <div class="stat-value">A cada 200ms</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Símbolo</div>
@@ -282,7 +282,7 @@ def home():
                 <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
-                    Mínimo de ordem: 0.001 ETH • Executando estratégia Pine Script original
+                    Mínimo de ordem: 0.001 ETH • Loop de alta frequência: 200ms
                 </small>
             </div>
         </div>
@@ -376,10 +376,10 @@ def start_trading():
         trade_thread = threading.Thread(target=trading_loop_pine_engine, daemon=True)
         trade_thread.start()
         
-        logger.info("⚡ BOT LIGADO com Pine Script Engine!")
+        logger.info("⚡ BOT LIGADO com Pine Script Engine (Alta Frequência - 200ms)!")
         return jsonify({
             "status": "success", 
-            "message": "Bot iniciado com Pine Script Engine!",
+            "message": "Bot iniciado com Pine Script Engine (Alta Frequência)!",
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -428,6 +428,7 @@ def get_status():
         "keep_alive_active": keep_alive is not None,
         "timeframe": "30m",
         "engine": "Pine Script Interpreter",
+        "loop_frequency_ms": 200,
         "server_time": datetime.now().isoformat()
     })
 
@@ -465,11 +466,11 @@ def test_auth():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================================
-# 7. LOOP DE TRADING COM PINE SCRIPT ENGINE - CORRIGIDO
+# 7. LOOP DE TRADING COM PINE SCRIPT ENGINE - ALTA FREQUÊNCIA (200ms)
 # ============================================================================
 def trading_loop_pine_engine():
-    """Loop principal corrigido: inicializa com 100 candles, depois processa apenas os novos."""
-    logger.info("⏳ Loop de trading iniciado (Lógica Corrigida)")
+    """Loop principal de ALTA FREQUÊNCIA para estratégias de curto prazo."""
+    logger.info("⚡ Loop de trading INICIADO (Alta Frequência - 200ms)")
     
     # ETAPA 1: INICIALIZAÇÃO COM DADOS HISTÓRICOS
     # ============================================
@@ -478,7 +479,6 @@ def trading_loop_pine_engine():
     
     if not historical_candles or len(historical_candles) < 100:
         logger.error(f"❌ Não foi possível obter 100 candles. Obtidos: {len(historical_candles) if historical_candles else 0}")
-        # Desativa o trading se não conseguiu dados suficientes
         global trading_active
         trading_active = False
         return
@@ -488,50 +488,72 @@ def trading_loop_pine_engine():
     
     # Captura o timestamp do ÚLTIMO candle histórico carregado
     last_known_timestamp = historical_candles[-1]['timestamp']
-    logger.info(f"✅ Inicialização concluída. Último candle conhecido: timestamp {last_known_timestamp}")
+    logger.info(f"✅ Inicialização concluída. Monitorando mercado a cada 200ms.")
     
-    # ETAPA 2: EXECUÇÃO EM TEMPO REAL
-    # ============================================
+    # Variáveis para controle de ciclo e logs
     cycle = 0
+    last_log_time = time.time()
+    last_candle_check = 0
+    candle_check_interval = 2  # Verificar candles a cada 2 segundos
+    
+    # ETAPA 2: LOOP DE ALTA FREQUÊNCIA (200ms)
+    # ============================================
     while trading_active and okx_client and strategy_runner:
+        cycle_start = time.time()
+        cycle += 1
+        
         try:
-            cycle += 1
+            # --- VERIFICAÇÃO PRINCIPAL A CADA 200ms ---
+            # 1. Verifica se há candles NOVOS de 30m (a cada 2 segundos para não sobrecarregar API)
+            current_time = time.time()
+            if current_time - last_candle_check >= candle_check_interval:
+                last_candle_check = current_time
+                
+                # Busca candles recentes (apenas os mais novos)
+                recent_candles = okx_client.get_candles(timeframe="30m", limit=3)
+                
+                if recent_candles:
+                    # FILTRA: Pega APENAS candles com timestamp MAIOR que o último conhecido
+                    new_candles = [c for c in recent_candles if c['timestamp'] > last_known_timestamp]
+                    
+                    if new_candles:
+                        # Processa os candles novos (esta fase pode gerar trades)
+                        logger.info(f"🔄 Candle NOVO detectado! Processando {len(new_candles)} candle(s)...")
+                        
+                        for candle in new_candles:
+                            signal = strategy_runner.run_strategy_on_new_candles([candle])
+                            last_known_timestamp = candle['timestamp']
+                            
+                            # Log do sinal IMEDIATAMENTE
+                            if signal['signal'] != 'HOLD':
+                                logger.info(f"🚨 SINAL IMEDIATO: {signal['signal']} | Preço: ${signal['price']:.2f} | Hora: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
             
-            # Busca candles recentes (apenas alguns para eficiência)
-            recent_candles = okx_client.get_candles(timeframe="30m", limit=10)
+            # 2. Log de status a cada 10 segundos (para não poluir)
+            if current_time - last_log_time >= 10:
+                last_log_time = current_time
+                # Obtém preço atual para log (usando ticker, mais leve que candles)
+                try:
+                    price = okx_client.get_ticker_price()
+                    if price:
+                        logger.info(f"📊 Monitor ativo | Preço: ${price:.2f} | Ciclos: {cycle} | Delay médio: {int((time.time()-cycle_start)*1000)}ms")
+                except Exception as e:
+                    logger.debug(f"Erro ao obter preço para log: {e}")
             
-            if not recent_candles:
-                logger.warning(f"Ciclo {cycle}: Nenhum candle obtido.")
-                time.sleep(60)
-                continue
+            # 3. Controle de timing PRECISO - 200ms exatos entre ciclos
+            cycle_duration = time.time() - cycle_start
+            sleep_time = max(0.0, 0.2 - cycle_duration)  # Mantém 200ms exatos
             
-            # FILTRA: Pega APENAS candles com timestamp MAIOR que o último conhecido
-            new_candles = [c for c in recent_candles if c['timestamp'] > last_known_timestamp]
-            
-            if not new_candles:
-                # Nenhum candle novo desde a última verificação
-                if cycle % 5 == 0:  # Log reduzido para evitar spam
-                    logger.info(f"📊 Ciclo {cycle}: Aguardando novo candle de 30m. Último preço: ${recent_candles[-1]['close']:.2f}")
-                time.sleep(60)
-                continue
-            
-            # Processa os candles novos (esta fase pode gerar trades)
-            logger.info(f"🔄 Ciclo {cycle}: Processando {len(new_candles)} candle(s) novo(s)...")
-            signal = strategy_runner.run_strategy_on_new_candles(new_candles)
-            
-            # Atualiza o último timestamp conhecido
-            last_known_timestamp = new_candles[-1]['timestamp']
-            
-            # Log do sinal, se houver
-            if signal['signal'] != 'HOLD':
-                logger.info(f"📢 Sinal do ciclo: {signal['signal']} | Preço: ${signal['price']:.2f}")
-            
-            # Aguarda 60 segundos antes da próxima verificação
-            time.sleep(60)
-            
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # Se o ciclo demorar mais que 200ms, log um aviso
+                if cycle_duration > 0.25:  # Se passar de 250ms
+                    logger.warning(f"⚠️  Ciclo lento: {cycle_duration*1000:.1f}ms (meta: 200ms)")
+        
         except Exception as e:
             logger.error(f"💥 Erro no loop de trading: {e}")
-            time.sleep(60)
+            # Não travar o loop por erro único
+            time.sleep(1)  # Pequena pausa antes de continuar
 
 # ============================================================================
 # 8. PONTO DE ENTRADA
