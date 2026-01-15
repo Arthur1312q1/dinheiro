@@ -252,7 +252,7 @@ def home():
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Verificação</div>
-                    <div class="stat-value">A cada 30s</div>
+                    <div class="stat-value">A cada 60s</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Símbolo</div>
@@ -279,9 +279,10 @@ def home():
                 <a href="/status" target="_blank">📊 Status Detalhado</a>
                 <a href="/strategy-status" target="_blank">📈 Status Estratégia</a>
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
+                <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
-                    Executando estratégia Pine Script original • Zero modificações
+                    Mínimo de ordem: 0.01 ETH ($33+) • Executando estratégia Pine Script original
                 </small>
             </div>
         </div>
@@ -427,7 +428,9 @@ def get_status():
         "keep_alive_active": keep_alive is not None,
         "timeframe": "30m",
         "engine": "Pine Script Interpreter",
-        "server_time": datetime.now().isoformat()
+        "server_time": datetime.now().isoformat(),
+        "min_order_size": 0.01,
+        "min_order_value_usd": price * 0.01 if price else 0
     })
 
 @app.route('/strategy-status', methods=['GET'])
@@ -439,8 +442,34 @@ def get_strategy_status():
     status = strategy_runner.get_strategy_status()
     return jsonify(status)
 
+@app.route('/test-auth', methods=['GET'])
+def test_auth():
+    """Endpoint para testar autenticação OKX"""
+    if not okx_client:
+        return jsonify({"status": "error", "message": "Cliente OKX não inicializado"}), 500
+    
+    try:
+        # Testar obtenção de saldo
+        balance = okx_client.get_balance()
+        
+        # Testar obtenção de preço
+        price = okx_client.get_ticker_price()
+        
+        return jsonify({
+            "auth_test": "success" if balance is not None else "failed",
+            "balance_usdt": balance,
+            "current_eth_price": price,
+            "api_key_exists": bool(okx_client.api_key),
+            "secret_key_exists": bool(okx_client.secret_key),
+            "passphrase_exists": bool(okx_client.passphrase),
+            "min_order_size": okx_client.MIN_ORDER_SIZE if hasattr(okx_client, 'MIN_ORDER_SIZE') else 0.01,
+            "minimum_required_usdt": price * 0.01 if price else 0
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ============================================================================
-# 7. LOOP DE TRADING COM PINE SCRIPT ENGINE
+# 7. LOOP DE TRADING COM PINE SCRIPT ENGINE - CORRIGIDO
 # ============================================================================
 def trading_loop_pine_engine():
     """Loop principal que executa a estratégia Pine Script."""
@@ -452,28 +481,27 @@ def trading_loop_pine_engine():
         try:
             cycle += 1
             
-            # 1. Obter candles da OKX
-            candles = okx_client.get_candles(timeframe="30m", limit=100)
+            # 1. Obter candles da OKX (apenas alguns candles recentes)
+            candles = okx_client.get_candles(timeframe="30m", limit=10)  # Apenas 10 candles
             
-            if not candles or len(candles) < 30:
+            if not candles or len(candles) < 5:
                 logger.warning(f"Dados insuficientes ({len(candles) if candles else 0} candles)")
-                time.sleep(30)
+                time.sleep(60)
                 continue
             
-            # 2. Executar estratégia Pine Script nos candles
-            logger.info(f"🔄 Ciclo {cycle} | Executando Pine Script em {len(candles)} candles...")
+            # 2. Executar estratégia APENAS no candle mais recente
+            logger.info(f"🔄 Ciclo {cycle} | Verificando candle mais recente...")
             signal = strategy_runner.run_strategy_on_candles(candles)
             
             # 3. Log do resultado
             if signal['signal'] != 'HOLD':
-                logger.info(f"📢 Sinal da estratégia: {signal['signal']} (Força: {signal['strength']})")
+                logger.info(f"📢 Sinal: {signal['signal']} | Preço: ${signal['price']:.2f}")
             else:
-                # Log reduzido para evitar poluição
-                if cycle % 10 == 0:
-                    logger.info(f"📊 Ciclo {cycle} | Preço: ${candles[-1]['close']:.2f} | Sinal: HOLD")
+                if cycle % 5 == 0:  # Log reduzido
+                    logger.info(f"📊 Ciclo {cycle} | Preço: ${candles[-1]['close']:.2f} | Sem sinal")
             
-            # 4. Aguardar próximo ciclo (30 segundos é suficiente para candles de 30m)
-            time.sleep(30)
+            # 4. Aguardar próximo ciclo (verificar a cada 1 minuto em vez de 30 segundos)
+            time.sleep(60)
             
         except Exception as e:
             logger.error(f"💥 Erro no loop: {e}")
