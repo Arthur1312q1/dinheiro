@@ -282,7 +282,7 @@ def home():
                 <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
-                    Mínimo de ordem: 0.01 ETH ($33+) • Executando estratégia Pine Script original
+                    Mínimo de ordem: 0.001 ETH • Executando estratégia Pine Script original
                 </small>
             </div>
         </div>
@@ -428,9 +428,7 @@ def get_status():
         "keep_alive_active": keep_alive is not None,
         "timeframe": "30m",
         "engine": "Pine Script Interpreter",
-        "server_time": datetime.now().isoformat(),
-        "min_order_size": 0.01,
-        "min_order_value_usd": price * 0.01 if price else 0
+        "server_time": datetime.now().isoformat()
     })
 
 @app.route('/strategy-status', methods=['GET'])
@@ -444,7 +442,7 @@ def get_strategy_status():
 
 @app.route('/test-auth', methods=['GET'])
 def test_auth():
-    """Endpoint para testar autenticação OKX"""
+    """Endpoint para testar autenticação OKX."""
     if not okx_client:
         return jsonify({"status": "error", "message": "Cliente OKX não inicializado"}), 500
     
@@ -461,9 +459,7 @@ def test_auth():
             "current_eth_price": price,
             "api_key_exists": bool(okx_client.api_key),
             "secret_key_exists": bool(okx_client.secret_key),
-            "passphrase_exists": bool(okx_client.passphrase),
-            "min_order_size": okx_client.MIN_ORDER_SIZE if hasattr(okx_client, 'MIN_ORDER_SIZE') else 0.01,
-            "minimum_required_usdt": price * 0.01 if price else 0
+            "passphrase_exists": bool(okx_client.passphrase)
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -472,39 +468,69 @@ def test_auth():
 # 7. LOOP DE TRADING COM PINE SCRIPT ENGINE - CORRIGIDO
 # ============================================================================
 def trading_loop_pine_engine():
-    """Loop principal que executa a estratégia Pine Script."""
-    logger.info("⏳ Loop de trading iniciado (Pine Script Engine)")
+    """Loop principal corrigido: inicializa com 100 candles, depois processa apenas os novos."""
+    logger.info("⏳ Loop de trading iniciado (Lógica Corrigida)")
     
+    # ETAPA 1: INICIALIZAÇÃO COM DADOS HISTÓRICOS
+    # ============================================
+    logger.info("🔍 Buscando 100 candles históricos para inicialização...")
+    historical_candles = okx_client.get_candles(timeframe="30m", limit=100)
+    
+    if not historical_candles or len(historical_candles) < 100:
+        logger.error(f"❌ Não foi possível obter 100 candles. Obtidos: {len(historical_candles) if historical_candles else 0}")
+        # Desativa o trading se não conseguiu dados suficientes
+        global trading_active
+        trading_active = False
+        return
+    
+    # 'Aquece' a estratégia com os 100 candles históricos (sem gerar trades)
+    strategy_runner.warm_up_strategy(historical_candles)
+    
+    # Captura o timestamp do ÚLTIMO candle histórico carregado
+    last_known_timestamp = historical_candles[-1]['timestamp']
+    logger.info(f"✅ Inicialização concluída. Último candle conhecido: timestamp {last_known_timestamp}")
+    
+    # ETAPA 2: EXECUÇÃO EM TEMPO REAL
+    # ============================================
     cycle = 0
-    
     while trading_active and okx_client and strategy_runner:
         try:
             cycle += 1
             
-            # 1. Obter candles da OKX (apenas alguns candles recentes)
-            candles = okx_client.get_candles(timeframe="30m", limit=10)  # Apenas 10 candles
+            # Busca candles recentes (apenas alguns para eficiência)
+            recent_candles = okx_client.get_candles(timeframe="30m", limit=10)
             
-            if not candles or len(candles) < 5:
-                logger.warning(f"Dados insuficientes ({len(candles) if candles else 0} candles)")
+            if not recent_candles:
+                logger.warning(f"Ciclo {cycle}: Nenhum candle obtido.")
                 time.sleep(60)
                 continue
             
-            # 2. Executar estratégia APENAS no candle mais recente
-            logger.info(f"🔄 Ciclo {cycle} | Verificando candle mais recente...")
-            signal = strategy_runner.run_strategy_on_candles(candles)
+            # FILTRA: Pega APENAS candles com timestamp MAIOR que o último conhecido
+            new_candles = [c for c in recent_candles if c['timestamp'] > last_known_timestamp]
             
-            # 3. Log do resultado
+            if not new_candles:
+                # Nenhum candle novo desde a última verificação
+                if cycle % 5 == 0:  # Log reduzido para evitar spam
+                    logger.info(f"📊 Ciclo {cycle}: Aguardando novo candle de 30m. Último preço: ${recent_candles[-1]['close']:.2f}")
+                time.sleep(60)
+                continue
+            
+            # Processa os candles novos (esta fase pode gerar trades)
+            logger.info(f"🔄 Ciclo {cycle}: Processando {len(new_candles)} candle(s) novo(s)...")
+            signal = strategy_runner.run_strategy_on_new_candles(new_candles)
+            
+            # Atualiza o último timestamp conhecido
+            last_known_timestamp = new_candles[-1]['timestamp']
+            
+            # Log do sinal, se houver
             if signal['signal'] != 'HOLD':
-                logger.info(f"📢 Sinal: {signal['signal']} | Preço: ${signal['price']:.2f}")
-            else:
-                if cycle % 5 == 0:  # Log reduzido
-                    logger.info(f"📊 Ciclo {cycle} | Preço: ${candles[-1]['close']:.2f} | Sem sinal")
+                logger.info(f"📢 Sinal do ciclo: {signal['signal']} | Preço: ${signal['price']:.2f}")
             
-            # 4. Aguardar próximo ciclo (verificar a cada 1 minuto em vez de 30 segundos)
+            # Aguarda 60 segundos antes da próxima verificação
             time.sleep(60)
             
         except Exception as e:
-            logger.error(f"💥 Erro no loop: {e}")
+            logger.error(f"💥 Erro no loop de trading: {e}")
             time.sleep(60)
 
 # ============================================================================
