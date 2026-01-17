@@ -37,7 +37,13 @@ except ImportError as e:
 # ============================================================================
 try:
     okx_client = OKXClient() if OKXClient else None
-    keep_alive = KeepAliveSystem() if KeepAliveSystem else None
+    
+    # IMPORTANTE: Inicializar KeepAliveSystem com a URL do próprio serviço
+    # Isso permite que o keep-alive faça chamadas HTTP internas
+    port = int(os.environ.get('PORT', 10000))
+    service_url = f"http://localhost:{port}"  # URL interna do próprio serviço
+    
+    keep_alive = KeepAliveSystem(base_url=service_url) if KeepAliveSystem else None
     
     # Inicializar o Strategy Runner (que agora usa WebSocket)
     strategy_runner = None
@@ -179,7 +185,7 @@ def home():
                 if (response.ok) {
                     messageEl.textContent = '✅ ' + (data.message || 'Sucesso!');
                     messageEl.style.color = '#00ff88';
-                    setTimeout(() => window.location.reload(), 1000);
+                    setTimeout(() => window.location.reload(), 1000)
                 } else {
                     messageEl.textContent = '❌ ' + (data.message || 'Erro desconhecido');
                     messageEl.style.color = '#ff4444';
@@ -201,7 +207,7 @@ def home():
     return render_template_string(html, trading_active=trading_active)
 
 # ============================================================================
-# 6. ENDPOINTS DA API
+# 6. ENDPOINTS DA API (CRÍTICO: ADICIONAR 2 ENDPOINTS DE PING INTERNO)
 # ============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -210,6 +216,24 @@ def health_check():
         "status": "healthy",
         "service": "OKX ETH Trading Bot (Tempo Real - WebSocket)",
         "trading_active": trading_active,
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/ping-internal-1', methods=['GET'])
+def internal_ping_1():
+    """PRIMEIRO ENDPOINT DE PING INTERNO - Mantém serviço ativo no Render."""
+    return jsonify({
+        "status": "pong_internal_1",
+        "message": "Sinal interno de keep-alive #1",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/ping-internal-2', methods=['GET'])
+def internal_ping_2():
+    """SEGUNDO ENDPOINT DE PING INTERNO - Mantém serviço ativo no Render."""
+    return jsonify({
+        "status": "pong_internal_2",
+        "message": "Sinal interno de keep-alive #2",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -236,7 +260,7 @@ def start_trading():
     try:
         if keep_alive:
             keep_alive.start_keep_alive()
-            logger.info("✅ Sistema de keep-alive iniciado.")
+            logger.info("✅ Sistema de keep-alive interno (2 sinais) iniciado.")
         
         # Iniciar o strategy runner (isso já inicia o WebSocket internamente)
         if not strategy_runner.start():
