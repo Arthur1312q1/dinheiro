@@ -20,26 +20,25 @@ class OKXClient:
         self.base_url = "https://www.okx.com"
         self.leverage = 1
         self.balance_percentage = 0.95
+        self.min_order_size = 0.001  # Tamanho mínimo para ETH-USDT-SWAP (3.33 USD)
         
         # Validação básica
         if not all([self.api_key, self.secret_key, self.passphrase]):
-            logger.error("❌ Credenciais da OKX não configuradas. Configure OKX_API_KEY, OKX_SECRET_KEY e OKX_PASSPHRASE no Render.")
+            logger.error("❌ Credenciais da OKX não configuradas.")
             raise ValueError("Credenciais OKX ausentes")
         
-        logger.info("✅ Cliente OKX inicializado (modo assinatura corrigido)")
+        logger.info("✅ Cliente OKX inicializado")
     
     def _get_timestamp(self):
-        """Retorna timestamp ISO 8601 no UTC, EXATAMENTE como a OKX espera."""
+        """Retorna timestamp ISO 8601 no UTC"""
         return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     
     def _signature(self, timestamp, method, request_path, body=''):
-        """Gera assinatura HMAC SHA256 no formato EXATO da OKX."""
+        """Gera assinatura HMAC SHA256"""
         try:
             message = timestamp + method.upper() + request_path + body
-            logger.debug(f"Mensagem para assinatura: {message}")
             
-            # A secret key fornecida pela OKX geralmente está em Base64
-            # Se for muito longa, assume que é base64
+            # Decodifica a secret key (pode estar em base64)
             if len(self.secret_key) > 50:
                 try:
                     secret_decoded = base64.b64decode(self.secret_key)
@@ -48,7 +47,6 @@ class OKXClient:
             else:
                 secret_decoded = self.secret_key.encode('utf-8')
             
-            # Cria a assinatura
             signature = hmac.new(
                 secret_decoded, 
                 message.encode('utf-8'), 
@@ -62,7 +60,7 @@ class OKXClient:
             raise
     
     def _get_headers(self, method, request_path, body=''):
-        """Retorna headers completos para autenticação."""
+        """Retorna headers completos"""
         timestamp = self._get_timestamp()
         signature = self._signature(timestamp, method, request_path, body)
         
@@ -75,7 +73,7 @@ class OKXClient:
         }
     
     def _make_request(self, method, endpoint, data=None, retry=3):
-        """Faz requisição para API OKX com tratamento de erros."""
+        """Faz requisição para API OKX"""
         url = self.base_url + endpoint
         body = ''
         
@@ -85,8 +83,6 @@ class OKXClient:
         for attempt in range(retry):
             try:
                 headers = self._get_headers(method, endpoint, body)
-                
-                logger.debug(f"Requisição {method} {endpoint} (tentativa {attempt+1})")
                 
                 if method == 'GET':
                     resp = requests.get(url, headers=headers, timeout=10)
@@ -114,53 +110,35 @@ class OKXClient:
                 return {"code": "-1", "msg": str(e)}
     
     def get_balance(self):
-        """Obtém saldo USDT da conta de trading (não apenas spot)."""
-        logger.info("Obtendo saldo da conta de trading...")
+        """Obtém saldo USDT"""
+        logger.info("💰 Obtendo saldo da conta...")
         
-        # Endpoint específico para saldo da conta de trading
         response = self._make_request("GET", "/api/v5/account/balance?ccy=USDT")
         
         if response.get('code') == '0':
             try:
-                # Estrutura de resposta da OKX para conta de trading
                 data = response.get('data', [{}])
                 if data and 'details' in data[0]:
                     for detail in data[0]['details']:
                         if detail.get('ccy') == 'USDT':
                             balance = float(detail.get('availBal', 0))
-                            logger.info(f"Saldo disponível USDT: ${balance:.2f}")
+                            logger.info(f"✅ Saldo disponível USDT: ${balance:.2f}")
                             return balance
                 
-                # Fallback: tenta obter do campo 'totalEq'
                 total_eq = data[0].get('totalEq', '0')
                 if total_eq and float(total_eq) > 0:
                     balance = float(total_eq)
-                    logger.info(f"Saldo total equivalente: ${balance:.2f}")
+                    logger.info(f"✅ Saldo total equivalente: ${balance:.2f}")
                     return balance
                     
             except Exception as e:
-                logger.error(f"Erro ao processar saldo: {e}")
+                logger.error(f"❌ Erro ao processar saldo: {e}")
         
-        logger.error("Falha ao obter saldo")
+        logger.error("❌ Falha ao obter saldo")
         return 0.0
     
-    def get_min_order_size(self, symbol="ETH-USDT-SWAP"):
-        """Obtém tamanho mínimo de ordem dinamicamente da API."""
-        try:
-            response = self._make_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={symbol}")
-            if response.get('code') == '0':
-                data = response.get('data', [{}])
-                if data:
-                    min_sz = float(data[0].get('minSz', '0.001'))
-                    logger.info(f"Tamanho mínimo de ordem ({symbol}): {min_sz}")
-                    return min_sz
-        except Exception as e:
-            logger.error(f"Erro ao obter min order size: {e}")
-        
-        return 0.001  # Fallback
-    
     def calculate_position_size(self):
-        """Calcula tamanho de posição respeitando o mínimo da OKX."""
+        """Calcula tamanho de posição"""
         balance = self.get_balance()
         if balance <= 0:
             return 0.0
@@ -169,25 +147,23 @@ class OKXClient:
         if not price:
             return 0.0
         
-        min_order = self.get_min_order_size()
         risk_capital = balance * self.balance_percentage
         
-        # Quantidade desejada baseada em 95% do saldo
+        # Quantidade baseada em 95% do saldo
         desired_qty = risk_capital / price
         
-        # Usa o MÁXIMO entre a quantidade desejada e o mínimo
-        # Se 95% do saldo for menor que o mínimo, usa o mínimo (para contas pequenas)
-        final_qty = max(desired_qty, min_order)
+        # Garante o mínimo de 0.001 ETH
+        final_qty = max(desired_qty, self.min_order_size)
         
         # Verifica se não excede o saldo
         if final_qty * price > balance:
             final_qty = balance / price
         
-        logger.info(f"Cálculo posição: Saldo=${balance:.2f}, Preço=${price:.2f}, Mín={min_order}, Qtd={final_qty:.6f}ETH (${final_qty*price:.2f})")
+        logger.info(f"🧮 Cálculo: Saldo=${balance:.2f}, Preço=${price:.2f}, Qtd={final_qty:.6f}ETH")
         return final_qty
     
     def get_ticker_price(self, symbol="ETH-USDT-SWAP"):
-        """Obtém preço atual."""
+        """Obtém preço atual"""
         try:
             response = self._make_request("GET", f"/api/v5/market/ticker?instId={symbol}")
             if response.get('code') == '0':
@@ -196,13 +172,57 @@ class OKXClient:
                     price = float(data[0].get('last', '0'))
                     return price
         except Exception as e:
-            logger.error(f"Erro ao obter preço: {e}")
+            logger.error(f"❌ Erro ao obter preço: {e}")
         return None
     
+    def get_candles(self, symbol="ETH-USDT-SWAP", timeframe="30m", limit=100):
+        """Obtém candles históricos"""
+        try:
+            endpoint = f"/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
+            
+            response = self._make_request("GET", endpoint)
+            
+            if response.get('code') == '0':
+                candles_data = response.get('data', [])
+                if candles_data:
+                    candles = []
+                    for candle in reversed(candles_data):
+                        try:
+                            candles.append({
+                                "timestamp": int(candle[0]),
+                                "open": float(candle[1]),
+                                "high": float(candle[2]),
+                                "low": float(candle[3]),
+                                "close": float(candle[4]),
+                                "volume": float(candle[5])
+                            })
+                        except:
+                            continue
+                    
+                    if candles:
+                        logger.info(f"✅ {len(candles)} candles obtidos")
+                        return candles
+                    
+            return []
+        except Exception as e:
+            logger.error(f"💥 Erro em get_candles: {e}")
+            return []
+    
     def place_order(self, side, quantity):
-        """Executa ordem de mercado."""
+        """Executa ordem de mercado"""
         try:
             symbol = "ETH-USDT-SWAP"
+            
+            # Configurar alavancagem
+            leverage_data = {
+                "instId": symbol,
+                "lever": "1",
+                "mgnMode": "cross"
+            }
+            
+            self._make_request("POST", "/api/v5/account/set-leverage", leverage_data)
+            
+            # Ordem principal
             order_data = {
                 "instId": symbol,
                 "tdMode": "cross",
@@ -211,22 +231,22 @@ class OKXClient:
                 "sz": str(round(quantity, 4))
             }
             
-            logger.info(f"Enviando ordem {side} de {quantity:.4f} ETH...")
+            logger.info(f"📤 Enviando ordem {side} de {quantity:.4f} ETH...")
             response = self._make_request("POST", "/api/v5/trade/order", order_data)
             
             if response.get('code') == '0':
-                logger.info(f"✅ Ordem {side} executada com sucesso!")
+                logger.info(f"✅✅✅ ORDEM {side.upper()} EXECUTADA!")
                 return True
             else:
-                logger.error(f"Falha na ordem: {response.get('msg')}")
+                logger.error(f"❌ Falha na ordem: {response.get('msg')}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Erro ao executar ordem: {e}")
+            logger.error(f"💥 Erro ao executar ordem: {e}")
             return False
     
     def close_all_positions(self):
-        """Fecha todas as posições abertas."""
+        """Fecha todas as posições abertas"""
         try:
             response = self._make_request("GET", "/api/v5/account/positions")
             if response.get('code') == '0':
@@ -247,6 +267,6 @@ class OKXClient:
                 logger.info("Todas as posições fechadas")
                 return True
         except Exception as e:
-            logger.error(f"Erro ao fechar posições: {e}")
+            logger.error(f"❌ Erro ao fechar posições: {e}")
         
         return False
