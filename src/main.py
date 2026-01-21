@@ -39,17 +39,16 @@ try:
     okx_client = OKXClient() if OKXClient else None
     
     # IMPORTANTE: Inicializar KeepAliveSystem com a URL do próprio serviço
-    # Isso permite que o keep-alive faça chamadas HTTP internas
     port = int(os.environ.get('PORT', 10000))
     service_url = f"http://localhost:{port}"  # URL interna do próprio serviço
     
     keep_alive = KeepAliveSystem(base_url=service_url) if KeepAliveSystem else None
     
-    # Inicializar o Strategy Runner (que agora usa WebSocket)
+    # Inicializar o Strategy Runner (que agora usa WebSocket + Barras 30m)
     strategy_runner = None
     if okx_client:
         strategy_runner = StrategyRunner(okx_client)
-        logger.info("✅ Strategy Runner (WebSocket) inicializado.")
+        logger.info("✅ Strategy Runner (WebSocket + Barras 30m) inicializado.")
     
     logger.info("✅ Componentes do bot inicializados.")
 except Exception as e:
@@ -106,14 +105,14 @@ def home():
     </head>
     <body>
         <div class="container">
-            <h1>⚡ Bot Trading ETH/USDT (TEMPO REAL)</h1>
-            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Conexão: WebSocket • Loop: ~30ms</p>
+            <h1>⚡ Bot Trading ETH/USDT (MODO SIMULAÇÃO)</h1>
+            <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Modo: SIMULAÇÃO</p>
             
             <div class="status-box {{ 'status-active' if trading_active else 'status-inactive' }}">
                 <span class="speed-indicator" style="background-color: {{ '#00ff88' if trading_active else '#ff4444' }}"></span>
                 Status: 
                 {% if trading_active %}
-                    🟢 ATIVO - Operando em Tempo Real
+                    🟢 ATIVO - Simulando (sem ordens reais)
                 {% else %}
                     🔴 INATIVO - Aguardando ativação
                 {% endif %}
@@ -125,12 +124,12 @@ def home():
                     <div class="stat-value">Pine Script v3</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Conexão</div>
-                    <div class="stat-value">WebSocket OKX</div>
+                    <div class="stat-label">Timeframe</div>
+                    <div class="stat-value">30 minutos</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Velocidade</div>
-                    <div class="stat-value">~30ms por tick</div>
+                    <div class="stat-label">Modo</div>
+                    <div class="stat-value">SIMULAÇÃO</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Símbolo</div>
@@ -157,9 +156,10 @@ def home():
                 <a href="/status" target="_blank">📊 Status Detalhado</a>
                 <a href="/strategy-status" target="_blank">📈 Status Estratégia</a>
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
+                <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
-                    Operando com dados de ticker em tempo real via WebSocket.
+                    <strong>MODO SIMULAÇÃO ATIVO:</strong> Nenhuma ordem real será enviada à OKX.
                 </small>
             </div>
         </div>
@@ -207,21 +207,21 @@ def home():
     return render_template_string(html, trading_active=trading_active)
 
 # ============================================================================
-# 6. ENDPOINTS DA API (CRÍTICO: ADICIONAR 2 ENDPOINTS DE PING INTERNO)
+# 6. ENDPOINTS DA API
 # ============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
     """Endpoint para keep-alive (UptimeRobot)."""
     return jsonify({
         "status": "healthy",
-        "service": "OKX ETH Trading Bot (Tempo Real - WebSocket)",
+        "service": "OKX ETH Trading Bot (Simulação - Barras 30m)",
         "trading_active": trading_active,
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/ping-internal-1', methods=['GET'])
 def internal_ping_1():
-    """PRIMEIRO ENDPOINT DE PING INTERNO - Mantém serviço ativo no Render."""
+    """PRIMEIRO ENDPOINT DE PING INTERNO"""
     return jsonify({
         "status": "pong_internal_1",
         "message": "Sinal interno de keep-alive #1",
@@ -230,7 +230,7 @@ def internal_ping_1():
 
 @app.route('/ping-internal-2', methods=['GET'])
 def internal_ping_2():
-    """SEGUNDO ENDPOINT DE PING INTERNO - Mantém serviço ativo no Render."""
+    """SEGUNDO ENDPOINT DE PING INTERNO"""
     return jsonify({
         "status": "pong_internal_2",
         "message": "Sinal interno de keep-alive #2",
@@ -262,7 +262,7 @@ def start_trading():
             keep_alive.start_keep_alive()
             logger.info("✅ Sistema de keep-alive interno (2 sinais) iniciado.")
         
-        # Iniciar o strategy runner (isso já inicia o WebSocket internamente)
+        # Iniciar o strategy runner (modo SIMULAÇÃO)
         if not strategy_runner.start():
             return jsonify({"status": "error", "message": "Falha ao iniciar WebSocket."}), 500
         
@@ -270,10 +270,11 @@ def start_trading():
         trade_thread = threading.Thread(target=trading_loop_realtime, daemon=True)
         trade_thread.start()
         
-        logger.info("⚡ BOT LIGADO em modo TEMPO REAL (WebSocket)!")
+        logger.info("⚡ BOT LIGADO em modo SIMULAÇÃO (Barras 30m)!")
+        logger.info("⚠️  NENHUMA ORDEM REAL SERÁ ENVIADA À OKX")
         return jsonify({
             "status": "success", 
-            "message": "Bot iniciado em modo tempo real (WebSocket)!",
+            "message": "Bot iniciado em modo SIMULAÇÃO (Barras 30m)!",
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -297,10 +298,7 @@ def stop_trading():
         if strategy_runner:
             strategy_runner.stop()
         
-        if okx_client:
-            okx_client.close_all_positions()
-        
-        logger.info("⏹️ BOT PARADO (modo tempo real).")
+        logger.info("⏹️ BOT PARADO (modo simulação).")
         return jsonify({
             "status": "success",
             "message": "Bot parado.",
@@ -323,7 +321,8 @@ def get_status():
         "api_connected": okx_client is not None,
         "strategy_loaded": strategy_runner is not None,
         "keep_alive_active": keep_alive is not None,
-        "mode": "WebSocket Real-time",
+        "mode": "SIMULAÇÃO (Barras 30m)",
+        "simulation_mode": True,
         "server_time": datetime.now().isoformat()
     })
 
@@ -358,14 +357,14 @@ def test_auth():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================================
-# 7. NOVO LOOP DE TRADING ULTRA-RÁPIDO (WEBSOCKET)
+# 7. NOVO LOOP DE TRADING ULTRA-RÁPIDO (WEBSOCKET + BARRAS 30m)
 # ============================================================================
 def trading_loop_realtime():
     """
     Loop principal ULTRA-RÁPIDO para operações em tempo real.
-    Executa a cada ~30ms (0.03 segundos).
+    Executa a cada ~30ms, mas só processa no fechamento de barras de 30min.
     """
-    logger.info("⏳ Loop de trading ULTRA-RÁPIDO iniciado (WebSocket Real-time)")
+    logger.info("⏳ Loop de trading iniciado (WebSocket + Barras 30m)")
     
     cycle = 0
     last_log_time = time.time()
@@ -374,16 +373,22 @@ def trading_loop_realtime():
         try:
             cycle += 1
             
-            # 1. Executar estratégia em tempo real (WebSocket)
-            # Esta função é NÃO-BLOQUEANTE e muito rápida
-            signal = strategy_runner.run_strategy_realtime()
+            # 1. Executa estratégia em tempo real
+            # Esta função sempre retorna HOLD - a execução real acontece internamente
+            status = strategy_runner.run_strategy_realtime()
             
-            # 2. Log reduzido para não sobrecarregar (apenas a cada ~3 segundos)
+            # 2. Log reduzido para não sobrecarregar (apenas a cada ~10 segundos)
             current_time = time.time()
-            if current_time - last_log_time > 3.0:
-                price = strategy_runner.current_price
+            if current_time - last_log_time > 10.0:  # Aumentado para 10 segundos
+                price = status.get('current_price')
+                bar_count = status.get('bar_count', 0)
+                pending_buy = status.get('pending_buy', False)
+                pending_sell = status.get('pending_sell', False)
+                
                 if price:
-                    logger.info(f"🔁 Ciclo #{cycle} | Preço: ${price:.2f} | Sinal: {signal.get('signal', 'HOLD')}")
+                    logger.info(f"🔁 Ciclo #{cycle} | Barra #{bar_count} | Preço: ${price:.2f}")
+                    logger.info(f"   Estados: pendingBuy={pending_buy}, pendingSell={pending_sell}")
+                
                 last_log_time = current_time
             
             # 3. Aguarda ~30ms para próxima iteração
