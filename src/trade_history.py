@@ -14,17 +14,37 @@ logger = logging.getLogger(__name__)
 class TradeHistory:
     """Gerencia o histórico de operações de trading"""
     
-    def __init__(self, file_path="data/trade_history.json"):
-        self.file_path = file_path
+    def __init__(self, file_path=None):
+        # Caminho absoluto para pasta data
+        if file_path is None:
+            # Tenta criar na pasta /data (Render Disk) ou local
+            if os.path.exists('/data'):
+                self.file_path = "/data/trade_history.json"
+                logger.info("📁 Usando disco persistente /data do Render")
+            else:
+                # Fallback para pasta local
+                import sys
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                data_dir = os.path.join(base_dir, 'data')
+                self.file_path = os.path.join(data_dir, 'trade_history.json')
+                logger.info(f"📁 Usando pasta local: {data_dir}")
+        else:
+            self.file_path = file_path
+            
         self.trades = []
         self.load_trades()
         
         # Configurar timezone do Brasil
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
+        
+        logger.info(f"📊 Histórico configurado: {self.file_path}")
     
     def _ensure_data_directory(self):
         """Garante que o diretório de dados existe"""
-        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        directory = os.path.dirname(self.file_path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+            logger.info(f"📂 Diretório criado: {directory}")
     
     def get_brazil_time(self):
         """Retorna o horário atual no fuso do Brasil"""
