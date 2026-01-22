@@ -16,125 +16,66 @@ class KeepAliveSystem:
         # Detectar se está rodando no Render
         self.is_render = os.getenv('RENDER', '').lower() == 'true'
         
-        # Determinar a URL base automaticamente
-        if base_url:
-            # Se URL fornecida, usar ela
-            self.base_url = base_url
-        elif self.is_render:
-            # No Render, usar URL externa da variável de ambiente
-            self.base_url = os.getenv('RENDER_SERVICE_URL', '')
-            if not self.base_url:
-                logger.warning("⚠️ RENDER_SERVICE_URL não definida. Usando URL padrão do Render.")
-                # Fallback: tentar construir a URL do serviço
-                service_name = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
-                render_domain = os.getenv('RENDER_EXTERNAL_URL', 'onrender.com')
-                self.base_url = f"https://{service_name}.{render_domain}"
+        # NO RENDER: Usamos apenas 1 endpoint (/health)
+        if self.is_render:
+            # URL fixa para o Render
+            SERVICE_NAME = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
+            self.base_url = f"https://{SERVICE_NAME}.onrender.com"
+            logger.info(f"✅ KeepAliveSystem (RENDER): usando {self.base_url}")
         else:
             # Ambiente local
-            port = os.getenv('PORT', '10000')
-            self.base_url = f"http://localhost:{port}"
+            if base_url:
+                self.base_url = base_url
+            else:
+                port = os.getenv('PORT', '10000')
+                self.base_url = f"http://localhost:{port}"
+            logger.info(f"✅ KeepAliveSystem (LOCAL): usando {self.base_url}")
         
-        logger.info(f"✅ KeepAliveSystem inicializado: is_render={self.is_render}, base_url={self.base_url}")
-        
-        # URLs dos endpoints internos
-        self.internal_signal_1_url = f"{self.base_url}/ping-internal-1"
-        self.internal_signal_2_url = f"{self.base_url}/ping-internal-2"
-        self.render_ping_url = f"{self.base_url}/render-ping"
+        # Endpoint de health check
+        self.health_url = f"{self.base_url}/health"
         
         # Configuração do UptimeRobot (externo)
         self.uptimerobot_url = os.getenv('UPTIMEROBOT_URL', '')
         self.cycle_count = 0
     
-    def send_internal_signal_1(self):
-        """PRIMEIRO sinal interno - Ping endpoint #1"""
+    def send_health_ping(self):
+        """Envia ping para endpoint /health"""
         try:
-            response = requests.get(self.internal_signal_1_url, timeout=10)
+            response = requests.get(self.health_url, timeout=10)
             if response.status_code == 200:
-                logger.info(f"[🖥️ INTERNO 1] Sinal enviado - {datetime.now().strftime('%H:%M:%S')}")
+                logger.info(f"✅ Health ping enviado - {datetime.now().strftime('%H:%M:%S')}")
                 self.last_signal_time = time.time()
                 return True
         except Exception as e:
-            logger.error(f"Erro no sinal interno 1: {e}")
-        return False
-    
-    def send_internal_signal_2(self):
-        """SEGUNDO sinal interno - Ping endpoint #2"""
-        try:
-            response = requests.get(self.internal_signal_2_url, timeout=10)
-            if response.status_code == 200:
-                logger.info(f"[🖥️ INTERNO 2] Sinal enviado - {datetime.now().strftime('%H:%M:%S')}")
-                self.last_signal_time = time.time()
-                return True
-        except Exception as e:
-            logger.error(f"Erro no sinal interno 2: {e}")
-        return False
-    
-    def send_render_ping(self):
-        """Sinal para endpoint público do Render"""
-        try:
-            response = requests.get(self.render_ping_url, timeout=10)
-            if response.status_code == 200:
-                logger.info(f"[🌐 RENDER] Ping enviado - {datetime.now().strftime('%H:%M:%S')}")
-                return True
-        except Exception as e:
-            logger.error(f"Erro no ping Render: {e}")
-        return False
-    
-    def send_external_signal(self):
-        """Sinal externo para UptimeRobot"""
-        if self.uptimerobot_url:
-            try:
-                response = requests.get(self.uptimerobot_url, timeout=10)
-                if response.status_code == 200:
-                    logger.info("[🌐 EXTERNO] UptimeRobot notificado")
-                    return True
-            except Exception as e:
-                logger.error(f"Erro no sinal externo: {e}")
+            logger.error(f"❌ Erro no health ping: {e}")
         return False
     
     def start_keep_alive(self):
-        """Inicia o sistema de keep-alive com múltiplos endpoints"""
+        """Inicia o sistema de keep-alive SIMPLIFICADO"""
         def keep_alive_loop():
-            logger.info(f"[🚀] Sistema de keep-alive iniciado (Render={self.is_render})")
+            logger.info("[🚀] Sistema de keep-alive iniciado (modo simplificado)")
             
             while self.is_running:
                 try:
-                    # No Render, usar URL pública para todos os pings
+                    # NO RENDER: Apenas 1 ping a cada 5 minutos
                     if self.is_render:
-                        # Envia 4 requisições em sequência (total ~4s)
-                        self.send_render_ping()
-                        time.sleep(1)
-                        self.send_internal_signal_1()
-                        time.sleep(1)
-                        self.send_internal_signal_2()
-                        time.sleep(1)
-                        self.send_internal_signal_1()  # Segundo ciclo
-                        
+                        self.send_health_ping()
                         self.cycle_count += 1
                         
-                        # A cada 5 minutos, envia sinal externo para UptimeRobot
-                        if self.cycle_count % 12 == 0:  # 12 ciclos * ~26s = ~5min
-                            self.send_external_signal()
-                        
-                        # Aguarda 22 segundos (total ~26s)
-                        time.sleep(22)
+                        # Aguarda 5 minutos (300 segundos)
+                        time.sleep(300)
                     
                     else:
-                        # Ambiente local: comportamento original
-                        self.send_internal_signal_1()
-                        time.sleep(1)
-                        self.send_internal_signal_2()
-                        
+                        # AMBIENTE LOCAL: comportamento antigo
+                        self.send_health_ping()
                         self.cycle_count += 1
                         
-                        if self.cycle_count % 12 == 0:
-                            self.send_external_signal()
-                        
-                        time.sleep(24)
+                        # Aguarda 30 segundos
+                        time.sleep(30)
                         
                 except Exception as e:
                     logger.error(f"Erro no loop keep-alive: {e}")
-                    time.sleep(30)
+                    time.sleep(60)  # Em caso de erro, tenta novamente em 1 minuto
         
         thread = threading.Thread(target=keep_alive_loop, daemon=True)
         thread.start()
