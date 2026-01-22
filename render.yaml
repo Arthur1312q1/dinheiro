@@ -5,7 +5,7 @@ services:
     region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120 --access-logfile - --worker-class gthread
+    startCommand: python main.py
     healthCheckPath: /health
     healthCheckInterval: 60s
     healthCheckTimeout: 10s
@@ -19,12 +19,6 @@ services:
       - key: RENDER_SERVICE_NAME
         value: "okx-eth-trading-bot"
         sync: false
-      - key: RENDER_EXTERNAL_URL
-        value: "onrender.com"
-        sync: false
-      - key: UPTIMEROBOT_URL
-        value: ""  # Configure sua URL do UptimeRobot aqui
-        sync: false
       - key: OKX_API_KEY
         value: ""  # Sua API Key da OKX
         sync: false
@@ -34,7 +28,3 @@ services:
       - key: OKX_PASSPHRASE
         value: ""  # Seu Passphrase da OKX
         sync: false
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
