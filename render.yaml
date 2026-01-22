@@ -20,11 +20,15 @@ services:
         value: "okx-eth-trading-bot"
         sync: false
       - key: OKX_API_KEY
-        value: ""  # Sua API Key da OKX
+        value: ""
         sync: false
       - key: OKX_SECRET_KEY
-        value: ""  # Seu Secret Key da OKX
+        value: ""
         sync: false
       - key: OKX_PASSPHRASE
-        value: ""  # Seu Passphrase da OKX
+        value: ""
         sync: false
+    disk:
+      name: trade-history-data
+      mountPath: /data
+      sizeGB: 1
