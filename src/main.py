@@ -21,7 +21,24 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ============================================================================
-# 2. IMPORTAR MÓDULOS INTERNOS
+# 2. DETECTAR AMBIENTE RENDER ANTES DE IMPORTAR MÓDULOS
+# ============================================================================
+IS_RENDER = os.getenv('RENDER', '').lower() == 'true'
+PORT = int(os.environ.get('PORT', 10000))
+
+if IS_RENDER:
+    logger.info("🌍 AMBIENTE RENDER DETECTADO - Configurando keep-alive automático")
+    # No Render, construir URL externa
+    SERVICE_NAME = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
+    RENDER_DOMAIN = os.getenv('RENDER_EXTERNAL_URL', 'onrender.com')
+    EXTERNAL_URL = f"https://{SERVICE_NAME}.{RENDER_DOMAIN}"
+    logger.info(f"🔗 URL Externa do Render: {EXTERNAL_URL}")
+else:
+    EXTERNAL_URL = f"http://localhost:{PORT}"
+    logger.info("💻 Ambiente local detectado")
+
+# ============================================================================
+# 3. IMPORTAR MÓDULOS INTERNOS
 # ============================================================================
 try:
     from okx_client import OKXClient
@@ -33,24 +50,29 @@ except ImportError as e:
     OKXClient = KeepAliveSystem = StrategyRunner = None
 
 # ============================================================================
-# 3. INICIALIZAR COMPONENTES
+# 4. INICIALIZAR COMPONENTES
 # ============================================================================
 try:
     okx_client = OKXClient() if OKXClient else None
     
-    # IMPORTANTE: Inicializar KeepAliveSystem com a URL do próprio serviço
-    port = int(os.environ.get('PORT', 10000))
-    service_url = f"http://localhost:{port}"  # URL interna do próprio serviço
+    # Inicializar KeepAliveSystem com URL externa no Render
+    # IMPORTANTE: Sempre usar URL externa no Render
+    if IS_RENDER:
+        base_url = EXTERNAL_URL
+        logger.info(f"🔗 Keep-alive usando URL externa: {base_url}")
+    else:
+        base_url = EXTERNAL_URL
     
-    keep_alive = KeepAliveSystem(base_url=service_url) if KeepAliveSystem else None
+    keep_alive = KeepAliveSystem(base_url=base_url) if KeepAliveSystem else None
     
-    # Inicializar o Strategy Runner (que agora usa WebSocket + Barras 30m)
+    # Inicializar o Strategy Runner
     strategy_runner = None
     if okx_client:
         strategy_runner = StrategyRunner(okx_client)
         logger.info("✅ Strategy Runner (WebSocket + Barras 30m) inicializado.")
     
     logger.info("✅ Componentes do bot inicializados.")
+    
 except Exception as e:
     logger.error(f"⚠️  Falha na inicialização: {e}")
     okx_client = None
@@ -58,13 +80,25 @@ except Exception as e:
     strategy_runner = None
 
 # ============================================================================
-# 4. VARIÁVEIS DE ESTADO
+# 5. INICIALIZAÇÃO AUTOMÁTICA DO KEEP-ALIVE (APENAS NO RENDER)
+# ============================================================================
+if IS_RENDER and keep_alive:
+    try:
+        # Iniciar keep-alive imediatamente no Render
+        keep_alive.start_keep_alive()
+        logger.info("✅ Keep-alive iniciado automaticamente no Render")
+        logger.info("🔄 Enviando sinais a cada ~26 segundos para manter serviço ativo")
+    except Exception as e:
+        logger.error(f"❌ Erro ao iniciar keep-alive automático: {e}")
+
+# ============================================================================
+# 6. VARIÁVEIS DE ESTADO
 # ============================================================================
 trading_active = False
 trade_thread = None
 
 # ============================================================================
-# 5. INTERFACE WEB (HTML COM BOTÕES)
+# 7. INTERFACE WEB (HTML COM BOTÕES)
 # ============================================================================
 @app.route('/', methods=['GET'])
 def home():
@@ -77,7 +111,7 @@ def home():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; padding: 20px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; color: #fff; }
-            .container { background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); padding: 40px 30px; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); max-width: 600px; width: 90%; border: 1px solid rgba(255,255,255,0.1); }
+            .container { background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); padding: 40px 30px; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); max-width: 650px; width: 90%; border: 1px solid rgba(255,255,255,0.1); }
             h1 { color: #00ff88; margin-bottom: 5px; font-size: 28px; text-shadow: 0 0 10px rgba(0, 255, 136, 0.5); }
             .subtitle { color: #a0a0c0; margin-bottom: 30px; font-size: 16px; }
             .status-box { padding: 20px; margin: 25px 0; border-radius: 12px; font-weight: bold; font-size: 18px; border: 2px solid transparent; background: rgba(0, 0, 0, 0.3); }
@@ -100,12 +134,19 @@ def home():
             #message { height: 25px; margin-top: 20px; color: #00ff88; font-weight: bold; font-size: 16px; }
             .icon { font-size: 22px; }
             .speed-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; animation: pulse 0.1s infinite; }
+            .env-badge { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; margin-left: 10px; }
+            .env-render { background: #5a67d8; color: white; }
+            .env-local { background: #38a169; color: white; }
             @keyframes pulse { 0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; } }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>⚡ Bot Trading ETH/USDT (MODO SIMULAÇÃO)</h1>
+            <h1>⚡ Bot Trading ETH/USDT (MODO SIMULAÇÃO)
+                <span class="env-badge {{ 'env-render' if is_render else 'env-local' }}">
+                    {{ 'RENDER' if is_render else 'LOCAL' }}
+                </span>
+            </h1>
             <p class="subtitle">Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Modo: SIMULAÇÃO</p>
             
             <div class="status-box {{ 'status-active' if trading_active else 'status-inactive' }}">
@@ -137,6 +178,13 @@ def home():
                 </div>
             </div>
             
+            {% if is_render %}
+            <div style="background: rgba(0, 255, 136, 0.1); border: 1px solid #00ff88; border-radius: 10px; padding: 15px; margin: 20px 0;">
+                <strong>✅ KEEP-ALIVE ATIVO:</strong> Serviço mantido automaticamente pelo sistema interno
+                <br><small>4 endpoints pingados a cada ~26s</small>
+            </div>
+            {% endif %}
+            
             <div class="button-group">
                 <button id="startBtn" onclick="controlBot('start')" 
                         class="btn btn-start" 
@@ -156,6 +204,7 @@ def home():
                 <a href="/status" target="_blank">📊 Status Detalhado</a>
                 <a href="/strategy-status" target="_blank">📈 Status Estratégia</a>
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
+                <a href="/render-ping" target="_blank">🔄 Ping Render</a>
                 <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
@@ -204,10 +253,10 @@ def home():
     </body>
     </html>
     """
-    return render_template_string(html, trading_active=trading_active)
+    return render_template_string(html, trading_active=trading_active, is_render=IS_RENDER)
 
 # ============================================================================
-# 6. ENDPOINTS DA API
+# 8. ENDPOINTS DA API (INCLUINDO NOVO /render-ping)
 # ============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -215,7 +264,9 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "service": "OKX ETH Trading Bot (Simulação - Barras 30m)",
+        "environment": "render" if IS_RENDER else "local",
         "trading_active": trading_active,
+        "keep_alive_active": keep_alive.is_running if keep_alive else False,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -225,6 +276,7 @@ def internal_ping_1():
     return jsonify({
         "status": "pong_internal_1",
         "message": "Sinal interno de keep-alive #1",
+        "environment": "render" if IS_RENDER else "local",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -234,7 +286,22 @@ def internal_ping_2():
     return jsonify({
         "status": "pong_internal_2",
         "message": "Sinal interno de keep-alive #2",
+        "environment": "render" if IS_RENDER else "local",
         "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/render-ping', methods=['GET'])
+def render_ping():
+    """Endpoint específico para ping de serviços externos (Render)"""
+    cycle_count = keep_alive.cycle_count if keep_alive else 0
+    return jsonify({
+        "status": "pong",
+        "service": "OKX ETH Trading Bot",
+        "environment": "render" if IS_RENDER else "local",
+        "keep_alive_cycles": cycle_count,
+        "trading_active": trading_active,
+        "timestamp": datetime.now().isoformat(),
+        "message": "✅ Serviço ativo no Render - Keep-alive funcionando"
     })
 
 @app.route('/start', methods=['GET', 'POST'])
@@ -258,9 +325,11 @@ def start_trading():
         return jsonify({"status": "error", "message": "Strategy Runner não inicializado."}), 500
     
     try:
-        if keep_alive:
+        # No Render, o keep-alive já está rodando automaticamente
+        # Em ambiente local, iniciamos manualmente
+        if not IS_RENDER and keep_alive:
             keep_alive.start_keep_alive()
-            logger.info("✅ Sistema de keep-alive interno (2 sinais) iniciado.")
+            logger.info("✅ Sistema de keep-alive interno iniciado (ambiente local).")
         
         # Iniciar o strategy runner (modo SIMULAÇÃO)
         if not strategy_runner.start():
@@ -292,7 +361,9 @@ def stop_trading():
         # Aguardar o loop de trading terminar
         time.sleep(0.1)
         
-        if keep_alive:
+        # Parar keep-alive apenas em ambiente local
+        # No Render, mantemos rodando para manter serviço ativo
+        if not IS_RENDER and keep_alive:
             keep_alive.stop_keep_alive()
         
         if strategy_runner:
@@ -316,11 +387,13 @@ def get_status():
     
     return jsonify({
         "trading_active": trading_active,
+        "environment": "render" if IS_RENDER else "local",
         "balance_usdt": balance,
         "current_eth_price_realtime": price,
         "api_connected": okx_client is not None,
         "strategy_loaded": strategy_runner is not None,
-        "keep_alive_active": keep_alive is not None,
+        "keep_alive_active": keep_alive.is_running if keep_alive else False,
+        "keep_alive_cycles": keep_alive.cycle_count if keep_alive else 0,
         "mode": "SIMULAÇÃO (Barras 30m)",
         "simulation_mode": True,
         "server_time": datetime.now().isoformat()
@@ -351,13 +424,14 @@ def test_auth():
             "current_eth_price": price,
             "api_key_exists": bool(okx_client.api_key),
             "secret_key_exists": bool(okx_client.secret_key),
-            "passphrase_exists": bool(okx_client.passphrase)
+            "passphrase_exists": bool(okx_client.passphrase),
+            "environment": "render" if IS_RENDER else "local"
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================================
-# 7. NOVO LOOP DE TRADING ULTRA-RÁPIDO (WEBSOCKET + BARRAS 30m)
+# 9. NOVO LOOP DE TRADING ULTRA-RÁPIDO (WEBSOCKET + BARRAS 30m)
 # ============================================================================
 def trading_loop_realtime():
     """
@@ -400,13 +474,15 @@ def trading_loop_realtime():
             time.sleep(1)  # Pausa maior em caso de erro
 
 # ============================================================================
-# 8. PONTO DE ENTRADA
+# 10. PONTO DE ENTRADA
 # ============================================================================
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Iniciando servidor na porta {port}...")
+    logger.info(f"🌐 Iniciando servidor na porta {PORT}...")
+    logger.info(f"🌍 Ambiente: {'RENDER' if IS_RENDER else 'LOCAL'}")
     
-    if keep_alive:
+    # Se estiver no Render e o keep-alive ainda não iniciou, inicie (segurança extra)
+    if IS_RENDER and keep_alive and not keep_alive.is_running:
         keep_alive.start_keep_alive()
+        logger.info("🔄 Keep-alive iniciado via ponto de entrada (backup)")
     
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
