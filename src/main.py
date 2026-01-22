@@ -21,18 +21,18 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ============================================================================
-# 2. DETECTAR AMBIENTE RENDER ANTES DE IMPORTAR MÓDULOS
+# 2. DETECTAR AMBIENTE RENDER
 # ============================================================================
 IS_RENDER = os.getenv('RENDER', '').lower() == 'true'
 PORT = int(os.environ.get('PORT', 10000))
 
+# URL do serviço no Render
 if IS_RENDER:
-    logger.info("🌍 AMBIENTE RENDER DETECTADO - Configurando keep-alive automático")
-    # No Render, construir URL externa
+    # NOVO: Usar método direto para obter a URL do Render
     SERVICE_NAME = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
-    RENDER_DOMAIN = os.getenv('RENDER_EXTERNAL_URL', 'onrender.com')
-    EXTERNAL_URL = f"https://{SERVICE_NAME}.{RENDER_DOMAIN}"
-    logger.info(f"🔗 URL Externa do Render: {EXTERNAL_URL}")
+    EXTERNAL_URL = f"https://{SERVICE_NAME}.onrender.com"
+    logger.info(f"🌍 AMBIENTE RENDER DETECTADO")
+    logger.info(f"🔗 URL Externa: {EXTERNAL_URL}")
 else:
     EXTERNAL_URL = f"http://localhost:{PORT}"
     logger.info("💻 Ambiente local detectado")
@@ -55,12 +55,13 @@ except ImportError as e:
 try:
     okx_client = OKXClient() if OKXClient else None
     
-    # Inicializar KeepAliveSystem com URL externa no Render
-    # IMPORTANTE: Sempre usar URL externa no Render
+    # Inicializar KeepAliveSystem - IMPORTANTE: usar URL correta
     if IS_RENDER:
+        # NO RENDER: Usar a URL externa correta
         base_url = EXTERNAL_URL
-        logger.info(f"🔗 Keep-alive usando URL externa: {base_url}")
+        logger.info(f"🔗 Keep-alive configurado com URL externa")
     else:
+        # LOCAL: usar localhost
         base_url = EXTERNAL_URL
     
     keep_alive = KeepAliveSystem(base_url=base_url) if KeepAliveSystem else None
@@ -85,9 +86,10 @@ except Exception as e:
 if IS_RENDER and keep_alive:
     try:
         # Iniciar keep-alive imediatamente no Render
+        # MAS: vamos usar apenas 1 endpoint (/health) a cada 5 minutos
         keep_alive.start_keep_alive()
         logger.info("✅ Keep-alive iniciado automaticamente no Render")
-        logger.info("🔄 Enviando sinais a cada ~26 segundos para manter serviço ativo")
+        logger.info("🔄 Usando apenas endpoint /health a cada 5 minutos")
     except Exception as e:
         logger.error(f"❌ Erro ao iniciar keep-alive automático: {e}")
 
@@ -180,8 +182,8 @@ def home():
             
             {% if is_render %}
             <div style="background: rgba(0, 255, 136, 0.1); border: 1px solid #00ff88; border-radius: 10px; padding: 15px; margin: 20px 0;">
-                <strong>✅ KEEP-ALIVE ATIVO:</strong> Serviço mantido automaticamente pelo sistema interno
-                <br><small>4 endpoints pingados a cada ~26s</small>
+                <strong>✅ KEEP-ALIVE ATIVO:</strong> Serviço mantido pelo Render Health Check + UptimeRobot
+                <br><small>Endpoint /health pingado automaticamente</small>
             </div>
             {% endif %}
             
@@ -204,7 +206,6 @@ def home():
                 <a href="/status" target="_blank">📊 Status Detalhado</a>
                 <a href="/strategy-status" target="_blank">📈 Status Estratégia</a>
                 <a href="/health" target="_blank">❤️ Saúde do Serviço</a>
-                <a href="/render-ping" target="_blank">🔄 Ping Render</a>
                 <a href="/test-auth" target="_blank">🔐 Testar Autenticação</a>
                 <br><br>
                 <small style="color: #888;">
@@ -256,14 +257,14 @@ def home():
     return render_template_string(html, trading_active=trading_active, is_render=IS_RENDER)
 
 # ============================================================================
-# 8. ENDPOINTS DA API (INCLUINDO NOVO /render-ping)
+# 8. ENDPOINTS DA API (SIMPLIFICADOS)
 # ============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Endpoint para keep-alive (UptimeRobot)."""
+    """Endpoint para keep-alive (UptimeRobot e Render Health Check)."""
     return jsonify({
         "status": "healthy",
-        "service": "OKX ETH Trading Bot (Simulação - Barras 30m)",
+        "service": "OKX ETH Trading Bot (Simulação)",
         "environment": "render" if IS_RENDER else "local",
         "trading_active": trading_active,
         "keep_alive_active": keep_alive.is_running if keep_alive else False,
@@ -272,36 +273,20 @@ def health_check():
 
 @app.route('/ping-internal-1', methods=['GET'])
 def internal_ping_1():
-    """PRIMEIRO ENDPOINT DE PING INTERNO"""
+    """Endpoint de ping interno 1 (não usado no Render)."""
     return jsonify({
         "status": "pong_internal_1",
         "message": "Sinal interno de keep-alive #1",
-        "environment": "render" if IS_RENDER else "local",
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/ping-internal-2', methods=['GET'])
 def internal_ping_2():
-    """SEGUNDO ENDPOINT DE PING INTERNO"""
+    """Endpoint de ping interno 2 (não usado no Render)."""
     return jsonify({
         "status": "pong_internal_2",
         "message": "Sinal interno de keep-alive #2",
-        "environment": "render" if IS_RENDER else "local",
         "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/render-ping', methods=['GET'])
-def render_ping():
-    """Endpoint específico para ping de serviços externos (Render)"""
-    cycle_count = keep_alive.cycle_count if keep_alive else 0
-    return jsonify({
-        "status": "pong",
-        "service": "OKX ETH Trading Bot",
-        "environment": "render" if IS_RENDER else "local",
-        "keep_alive_cycles": cycle_count,
-        "trading_active": trading_active,
-        "timestamp": datetime.now().isoformat(),
-        "message": "✅ Serviço ativo no Render - Keep-alive funcionando"
     })
 
 @app.route('/start', methods=['GET', 'POST'])
@@ -325,12 +310,6 @@ def start_trading():
         return jsonify({"status": "error", "message": "Strategy Runner não inicializado."}), 500
     
     try:
-        # No Render, o keep-alive já está rodando automaticamente
-        # Em ambiente local, iniciamos manualmente
-        if not IS_RENDER and keep_alive:
-            keep_alive.start_keep_alive()
-            logger.info("✅ Sistema de keep-alive interno iniciado (ambiente local).")
-        
         # Iniciar o strategy runner (modo SIMULAÇÃO)
         if not strategy_runner.start():
             return jsonify({"status": "error", "message": "Falha ao iniciar WebSocket."}), 500
@@ -361,11 +340,6 @@ def stop_trading():
         # Aguardar o loop de trading terminar
         time.sleep(0.1)
         
-        # Parar keep-alive apenas em ambiente local
-        # No Render, mantemos rodando para manter serviço ativo
-        if not IS_RENDER and keep_alive:
-            keep_alive.stop_keep_alive()
-        
         if strategy_runner:
             strategy_runner.stop()
         
@@ -393,7 +367,6 @@ def get_status():
         "api_connected": okx_client is not None,
         "strategy_loaded": strategy_runner is not None,
         "keep_alive_active": keep_alive.is_running if keep_alive else False,
-        "keep_alive_cycles": keep_alive.cycle_count if keep_alive else 0,
         "mode": "SIMULAÇÃO (Barras 30m)",
         "simulation_mode": True,
         "server_time": datetime.now().isoformat()
@@ -431,7 +404,7 @@ def test_auth():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================================
-# 9. NOVO LOOP DE TRADING ULTRA-RÁPIDO (WEBSOCKET + BARRAS 30m)
+# 9. LOOP DE TRADING
 # ============================================================================
 def trading_loop_realtime():
     """
@@ -448,12 +421,11 @@ def trading_loop_realtime():
             cycle += 1
             
             # 1. Executa estratégia em tempo real
-            # Esta função sempre retorna HOLD - a execução real acontece internamente
             status = strategy_runner.run_strategy_realtime()
             
             # 2. Log reduzido para não sobrecarregar (apenas a cada ~10 segundos)
             current_time = time.time()
-            if current_time - last_log_time > 10.0:  # Aumentado para 10 segundos
+            if current_time - last_log_time > 10.0:
                 price = status.get('current_price')
                 bar_count = status.get('bar_count', 0)
                 pending_buy = status.get('pending_buy', False)
@@ -466,12 +438,11 @@ def trading_loop_realtime():
                 last_log_time = current_time
             
             # 3. Aguarda ~30ms para próxima iteração
-            # Isso é CRÍTICO para operar em tempo real sem sobrecarregar a CPU
             time.sleep(0.03)
             
         except Exception as e:
             logger.error(f"💥 Erro no loop tempo real: {e}")
-            time.sleep(1)  # Pausa maior em caso de erro
+            time.sleep(1)
 
 # ============================================================================
 # 10. PONTO DE ENTRADA
