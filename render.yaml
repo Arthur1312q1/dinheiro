@@ -5,7 +5,7 @@ services:
     region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    startCommand: python main.py
     healthCheckPath: /health
     healthCheckInterval: 60s
     healthCheckTimeout: 10s
@@ -20,13 +20,13 @@ services:
         value: "okx-eth-trading-bot"
         sync: false
       - key: OKX_API_KEY
-        value: ""  # SUA API KEY
+        value: ""  # SUA API KEY AQUI
         sync: false
       - key: OKX_SECRET_KEY
-        value: ""  # SEU SECRET KEY
+        value: ""  # SEU SECRET KEY AQUI
         sync: false
       - key: OKX_PASSPHRASE
-        value: ""  # SEU PASSPHRASE
+        value: ""  # SEU PASSPHRASE AQUI
         sync: false
     disk:
       name: trade-history-data
