@@ -20,11 +20,15 @@ services:
         value: "okx-eth-trading-bot"
         sync: false
       - key: OKX_API_KEY
-        value: ""
+        value: ""  # SUA API KEY
         sync: false
       - key: OKX_SECRET_KEY
-        value: ""
+        value: ""  # SEU SECRET KEY
         sync: false
       - key: OKX_PASSPHRASE
-        value: ""
+        value: ""  # SEU PASSPHRASE
         sync: false
+    disk:
+      name: trade-history-data
+      mountPath: /data
+      sizeGB: 1
