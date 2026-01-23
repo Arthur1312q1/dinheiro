@@ -8,9 +8,9 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 
 # ============================================================================
-# 1. CONFIGURAÇÃO INICIAL - ADICIONAR src AO PATH
+# 1. CONFIGURAÇÃO INICIAL
 # ============================================================================
-# Adicionar a pasta src ao caminho de importação
+# Adicionar src ao path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, 'src')
 sys.path.insert(0, src_path)
@@ -24,111 +24,74 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ============================================================================
-# 2. DETECTAR AMBIENTE RENDER
+# 2. DETECTAR AMBIENTE
 # ============================================================================
 IS_RENDER = os.getenv('RENDER', '').lower() == 'true'
 PORT = int(os.environ.get('PORT', 10000))
 
-# URL do serviço no Render
 if IS_RENDER:
-    SERVICE_NAME = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
-    EXTERNAL_URL = f"https://{SERVICE_NAME}.onrender.com"
-    logger.info(f"🌍 AMBIENTE RENDER DETECTADO")
-    logger.info(f"🔗 URL Externa: {EXTERNAL_URL}")
+    logger.info("🌍 AMBIENTE RENDER DETECTADO")
 else:
-    EXTERNAL_URL = f"http://localhost:{PORT}"
     logger.info("💻 Ambiente local detectado")
 
 # ============================================================================
 # 3. IMPORTAR MÓDULOS DE src/
 # ============================================================================
 try:
-    # Importar usando caminho absoluto
+    # Importar tudo de src
     from src.okx_client import OKXClient
     from src.keep_alive import KeepAliveSystem
     from src.strategy_runner import StrategyRunner
     from src.trade_history import TradeHistory
-    logger.info("✅ Módulos importados de src/ com sucesso")
-except ImportError as e:
-    logger.error(f"❌ Erro ao importar módulos: {e}")
-    # Fallback: tentar importar diretamente
-    try:
-        import src.okx_client as okx_client_module
-        import src.keep_alive as keep_alive_module
-        import src.strategy_runner as strategy_runner_module
-        import src.trade_history as trade_history_module
-        
-        OKXClient = okx_client_module.OKXClient
-        KeepAliveSystem = keep_alive_module.KeepAliveSystem
-        StrategyRunner = strategy_runner_module.StrategyRunner
-        TradeHistory = trade_history_module.TradeHistory
-        logger.info("✅ Módulos importados via fallback")
-    except Exception as e2:
-        logger.error(f"❌ Erro no fallback: {e2}")
-        OKXClient = KeepAliveSystem = StrategyRunner = TradeHistory = None
-
-# ============================================================================
-# 4. INICIALIZAR COMPONENTES
-# ============================================================================
-okx_client = None
-keep_alive = None
-strategy_runner = None
-trade_history = None
-
-try:
-    # Inicializar cliente OKX
-    if OKXClient:
-        okx_client = OKXClient()
-        logger.info("✅ Cliente OKX inicializado")
     
-    # Inicializar histórico de trades
-    if TradeHistory:
-        trade_history = TradeHistory()
-        logger.info("✅ Sistema de histórico inicializado")
+    logger.info("✅ Módulos importados com sucesso")
+    
+    # Inicializar componentes
+    okx_client = OKXClient()
+    trade_history = TradeHistory()
     
     # Inicializar keep-alive
-    if KeepAliveSystem:
-        if IS_RENDER:
-            base_url = EXTERNAL_URL
-        else:
-            base_url = EXTERNAL_URL
-        
-        keep_alive = KeepAliveSystem(base_url=base_url)
-        logger.info(f"🔗 Keep-alive configurado: {base_url}")
+    if IS_RENDER:
+        SERVICE_NAME = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
+        base_url = f"https://{SERVICE_NAME}.onrender.com"
+    else:
+        base_url = f"http://localhost:{PORT}"
+    
+    keep_alive = KeepAliveSystem(base_url=base_url)
     
     # Inicializar strategy runner
-    if StrategyRunner and okx_client and trade_history:
-        # Passar trade_history para o strategy runner
-        strategy_runner = StrategyRunner(okx_client, trade_history)
-        logger.info("✅ Strategy Runner inicializado")
+    strategy_runner = StrategyRunner(okx_client, trade_history)
     
-    logger.info("✅ Todos os componentes inicializados")
+    logger.info("✅ Sistema inicializado com sucesso")
     
 except Exception as e:
-    logger.error(f"⚠️  Erro na inicialização: {e}")
+    logger.error(f"❌ Erro na inicialização: {e}")
+    okx_client = None
+    trade_history = None
+    keep_alive = None
+    strategy_runner = None
 
 # ============================================================================
-# 5. INICIALIZAR KEEP-ALIVE AUTOMÁTICO NO RENDER
-# ============================================================================
-if IS_RENDER and keep_alive:
-    try:
-        keep_alive.start_keep_alive()
-        logger.info("✅ Keep-alive automático iniciado no Render")
-    except Exception as e:
-        logger.error(f"❌ Erro no keep-alive: {e}")
-
-# ============================================================================
-# 6. VARIÁVEIS DE ESTADO
+# 4. VARIÁVEIS DE ESTADO
 # ============================================================================
 trading_active = False
 trade_thread = None
 
 # ============================================================================
-# 7. INTERFACE WEB
+# 5. INICIAR KEEP-ALIVE AUTOMÁTICO NO RENDER
+# ============================================================================
+if IS_RENDER and keep_alive:
+    try:
+        keep_alive.start_keep_alive()
+        logger.info("✅ Keep-alive automático iniciado")
+    except Exception as e:
+        logger.error(f"❌ Erro no keep-alive: {e}")
+
+# ============================================================================
+# 6. INTERFACE WEB
 # ============================================================================
 @app.route('/')
 def home():
-    """Página principal do bot"""
     html = """
     <!DOCTYPE html>
     <html>
@@ -207,11 +170,10 @@ def home():
     return render_template_string(html, trading_active=trading_active)
 
 # ============================================================================
-# 8. ENDPOINTS DA API
+# 7. ENDPOINTS DA API
 # ============================================================================
 @app.route('/health')
 def health():
-    """Health check para Render e UptimeRobot"""
     return jsonify({
         "status": "healthy",
         "service": "OKX ETH Trading Bot",
@@ -221,17 +183,14 @@ def health():
 
 @app.route('/ping-internal-1')
 def ping1():
-    """Endpoint de ping interno 1"""
     return jsonify({"status": "pong1", "time": datetime.now().isoformat()})
 
 @app.route('/ping-internal-2')
 def ping2():
-    """Endpoint de ping interno 2"""
     return jsonify({"status": "pong2", "time": datetime.now().isoformat()})
 
 @app.route('/start', methods=['POST'])
 def start_trading():
-    """Inicia o bot de trading"""
     global trading_active, trade_thread
     
     if trading_active:
@@ -241,20 +200,16 @@ def start_trading():
         return jsonify({"status": "error", "message": "Strategy Runner não inicializado."}), 500
     
     try:
-        # Iniciar strategy runner
         if not strategy_runner.start():
             return jsonify({"status": "error", "message": "Falha ao iniciar WebSocket."}), 500
         
         trading_active = True
         
-        # Iniciar thread de trading
         def trading_loop():
-            """Loop principal de trading"""
             while trading_active and strategy_runner:
                 try:
-                    # Executar estratégia
                     strategy_runner.run_strategy_realtime()
-                    time.sleep(0.1)  # Pequena pausa
+                    time.sleep(0.1)
                 except Exception as e:
                     logger.error(f"Erro no loop de trading: {e}")
                     time.sleep(1)
@@ -274,7 +229,6 @@ def start_trading():
 
 @app.route('/stop', methods=['POST'])
 def stop_trading():
-    """Para o bot de trading"""
     global trading_active
     
     if strategy_runner:
@@ -287,7 +241,6 @@ def stop_trading():
 
 @app.route('/status')
 def status():
-    """Retorna status do sistema"""
     price = strategy_runner.current_price if strategy_runner else None
     balance = okx_client.get_balance() if okx_client else 0
     
@@ -301,7 +254,6 @@ def status():
 
 @app.route('/history')
 def history_page():
-    """Página web do histórico de trades"""
     try:
         if not trade_history:
             return "Sistema de histórico não inicializado", 500
@@ -475,7 +427,6 @@ def history_page():
 
 @app.route('/clear-history', methods=['POST'])
 def clear_history():
-    """Limpa o histórico de trades"""
     if not trade_history:
         return jsonify({"success": False, "message": "Sistema de histórico não inicializado"}), 500
     
@@ -484,7 +435,6 @@ def clear_history():
 
 @app.route('/test-auth')
 def test_auth():
-    """Testa a autenticação com a OKX"""
     if not okx_client:
         return jsonify({"error": "OKX Client não configurado"}), 500
     
@@ -504,9 +454,8 @@ def test_auth():
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================
-# 9. PONTO DE ENTRADA
+# 8. PONTO DE ENTRADA
 # ============================================================================
 if __name__ == '__main__':
     logger.info(f"🚀 Iniciando servidor na porta {PORT}...")
-    logger.info(f"🌍 Ambiente: {'RENDER' if IS_RENDER else 'LOCAL'}")
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
