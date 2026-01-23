@@ -1,187 +1,122 @@
 """
-Módulo para gerenciar o histórico de operações do bot de trading
-Armazena todas as trades simuladas com detalhes completos
+Sistema de histórico de operações
 """
 import json
 import os
-from datetime import datetime
 import pytz
-import logging
-from typing import List, Dict, Optional
-
-logger = logging.getLogger(__name__)
+from datetime import datetime
+from typing import List, Dict
 
 class TradeHistory:
-    """Gerencia o histórico de operações de trading"""
-    
     def __init__(self, file_path=None):
-        # Caminho absoluto para pasta data
-        if file_path is None:
-            # Tenta criar na pasta /data (Render Disk) ou local
-            if os.path.exists('/data'):
-                self.file_path = "/data/trade_history.json"
-                logger.info("📁 Usando disco persistente /data do Render")
-            else:
-                # Fallback para pasta local
-                import sys
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                data_dir = os.path.join(base_dir, 'data')
-                self.file_path = os.path.join(data_dir, 'trade_history.json')
-                logger.info(f"📁 Usando pasta local: {data_dir}")
-        else:
-            self.file_path = file_path
-            
-        self.trades = []
-        self.load_trades()
-        
         # Configurar timezone do Brasil
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
         
-        logger.info(f"📊 Histórico configurado: {self.file_path}")
-    
-    def _ensure_data_directory(self):
-        """Garante que o diretório de dados existe"""
-        directory = os.path.dirname(self.file_path)
-        if directory and not os.path.exists(directory):
-            os.makedirs(directory, exist_ok=True)
-            logger.info(f"📂 Diretório criado: {directory}")
+        # Determinar caminho do arquivo
+        if file_path is None:
+            # Se estiver no Render, usar /data, senão usar pasta local
+            if os.path.exists('/data'):
+                self.file_path = "/data/trade_history.json"
+            else:
+                # Voltar um nível (para raiz) e criar pasta data
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                data_dir = os.path.join(base_dir, 'data')
+                if not os.path.exists(data_dir):
+                    os.makedirs(data_dir)
+                self.file_path = os.path.join(data_dir, 'trade_history.json')
+        else:
+            self.file_path = file_path
+        
+        self.trades = []
+        self.load_trades()
     
     def get_brazil_time(self):
-        """Retorna o horário atual no fuso do Brasil"""
+        """Retorna horário atual no fuso do Brasil"""
         return datetime.now(self.tz_brazil)
     
-    def format_datetime(self, dt):
-        """Formata datetime para exibição amigável"""
-        return dt.strftime('%d/%m/%Y %H:%M:%S')
-    
-    def calculate_pnl_percent(self, entry_price: float, exit_price: float, side: str) -> float:
-        """
-        Calcula o percentual de lucro/prejuízo
-        side: 'buy' (long) ou 'sell' (short)
-        """
-        if side == 'buy':
-            # Para posição long: (saída - entrada) / entrada
-            return ((exit_price - entry_price) / entry_price) * 100
-        else:
-            # Para posição short: (entrada - saída) / entrada
-            return ((entry_price - exit_price) / entry_price) * 100
-    
-    def calculate_pnl_usdt(self, entry_price: float, quantity: float, pnl_percent: float) -> float:
-        """Calcula o PnL em USDT"""
-        position_value = entry_price * quantity
-        return (position_value * pnl_percent) / 100
-    
-    def add_trade(self, trade_data: Dict):
-        """Adiciona uma nova trade ao histórico"""
+    def add_trade(self, side, entry_price, quantity):
+        """Registra uma nova trade"""
         try:
-            # Gerar ID único
             trade_id = len(self.trades) + 1
+            entry_time = self.get_brazil_time()
             
-            # Garantir que temos timestamp do Brasil
-            if 'entry_time' not in trade_data:
-                trade_data['entry_time'] = self.get_brazil_time()
-            
-            # Formatar horário se for datetime
-            if isinstance(trade_data['entry_time'], datetime):
-                trade_data['entry_time_str'] = self.format_datetime(trade_data['entry_time'])
-            else:
-                trade_data['entry_time_str'] = trade_data['entry_time']
-            
-            # Adicionar campos padrão
-            trade_data.update({
+            trade = {
                 'id': trade_id,
-                'status': 'open',
+                'side': side,
+                'entry_price': entry_price,
+                'quantity': quantity,
+                'entry_time': entry_time.isoformat(),
+                'entry_time_str': entry_time.strftime('%d/%m/%Y %H:%M:%S'),
+                'exit_price': None,
+                'exit_time': None,
                 'pnl_percent': 0.0,
                 'pnl_usdt': 0.0,
-                'exit_time_str': None,
+                'status': 'open',
                 'duration': None
-            })
+            }
             
-            # Salvar a trade
-            self.trades.append(trade_data)
+            self.trades.append(trade)
             self.save_trades()
-            
-            logger.info(f"📝 Trade #{trade_id} registrada: {trade_data['side'].upper()} {trade_data['quantity']:.4f} ETH @ ${trade_data['entry_price']:.2f}")
             return trade_id
             
         except Exception as e:
-            logger.error(f"Erro ao adicionar trade: {e}")
+            import logging
+            logging.error(f"Erro ao registrar trade: {e}")
             return None
     
-    def close_trade(self, trade_id: int, exit_price: float):
+    def close_trade(self, trade_id, exit_price):
         """Fecha uma trade existente"""
         try:
             for trade in self.trades:
                 if trade['id'] == trade_id and trade['status'] == 'open':
                     exit_time = self.get_brazil_time()
+                    entry_price = trade['entry_price']
                     
                     # Calcular PnL
-                    trade['exit_price'] = exit_price
-                    trade['pnl_percent'] = self.calculate_pnl_percent(
-                        trade['entry_price'], 
-                        exit_price, 
-                        trade['side']
-                    )
+                    if trade['side'] == 'buy':
+                        pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+                    else:  # sell
+                        pnl_percent = ((entry_price - exit_price) / entry_price) * 100
                     
-                    # Calcular PnL em USDT
-                    trade['pnl_usdt'] = self.calculate_pnl_usdt(
-                        trade['entry_price'],
-                        trade['quantity'],
-                        trade['pnl_percent']
-                    )
-                    
-                    # Atualizar outros campos
-                    trade['exit_time'] = exit_time
-                    trade['exit_time_str'] = self.format_datetime(exit_time)
-                    trade['status'] = 'closed'
+                    pnl_usdt = (entry_price * trade['quantity'] * pnl_percent) / 100
                     
                     # Calcular duração
-                    if 'entry_time' in trade and isinstance(trade['entry_time'], datetime):
-                        duration = (exit_time - trade['entry_time']).total_seconds()
-                        trade['duration'] = self._format_duration(duration)
+                    entry_time = datetime.fromisoformat(trade['entry_time'].replace('Z', '+00:00'))
+                    duration_seconds = (exit_time - entry_time).total_seconds()
+                    
+                    # Formatar duração
+                    if duration_seconds < 60:
+                        duration = f"{duration_seconds:.0f}s"
+                    elif duration_seconds < 3600:
+                        duration = f"{duration_seconds/60:.1f}m"
+                    else:
+                        duration = f"{duration_seconds/3600:.2f}h"
+                    
+                    # Atualizar trade
+                    trade['exit_price'] = exit_price
+                    trade['exit_time'] = exit_time.isoformat()
+                    trade['exit_time_str'] = exit_time.strftime('%d/%m/%Y %H:%M:%S')
+                    trade['pnl_percent'] = round(pnl_percent, 4)
+                    trade['pnl_usdt'] = round(pnl_usdt, 2)
+                    trade['status'] = 'closed'
+                    trade['duration'] = duration
                     
                     self.save_trades()
-                    
-                    # Determinar emoji baseado no resultado
-                    emoji = "✅" if trade['pnl_percent'] > 0 else "❌" if trade['pnl_percent'] < 0 else "➖"
-                    
-                    logger.info(f"{emoji} Trade #{trade_id} fechada: PnL {trade['pnl_percent']:.4f}% (${trade['pnl_usdt']:.2f})")
                     return True
-                    
-            return False
             
+            return False
         except Exception as e:
-            logger.error(f"Erro ao fechar trade #{trade_id}: {e}")
+            import logging
+            logging.error(f"Erro ao fechar trade: {e}")
             return False
     
-    def _format_duration(self, seconds: float) -> str:
-        """Formata duração em formato legível"""
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        elif seconds < 3600:
-            minutes = seconds / 60
-            return f"{minutes:.1f}m"
-        else:
-            hours = seconds / 3600
-            return f"{hours:.2f}h"
-    
-    def get_all_trades(self, limit: int = 50) -> List[Dict]:
+    def get_all_trades(self, limit=50):
         """Retorna todas as trades (mais recentes primeiro)"""
-        # Ordenar por ID decrescente (mais recentes primeiro)
-        sorted_trades = sorted(self.trades, key=lambda x: x['id'], reverse=True)
-        return sorted_trades[:limit]
+        return sorted(self.trades, key=lambda x: x['id'], reverse=True)[:limit]
     
-    def get_open_trades(self) -> List[Dict]:
-        """Retorna apenas trades abertas"""
-        return [trade for trade in self.trades if trade['status'] == 'open']
-    
-    def get_closed_trades(self) -> List[Dict]:
-        """Retorna apenas trades fechadas"""
-        return [trade for trade in self.trades if trade['status'] == 'closed']
-    
-    def get_stats(self) -> Dict:
+    def get_stats(self):
         """Retorna estatísticas do histórico"""
-        closed_trades = self.get_closed_trades()
+        closed_trades = [t for t in self.trades if t['status'] == 'closed']
         
         if not closed_trades:
             return {
@@ -190,10 +125,7 @@ class TradeHistory:
                 'losing_trades': 0,
                 'win_rate': 0,
                 'total_pnl_percent': 0,
-                'total_pnl_usdt': 0,
-                'avg_pnl_percent': 0,
-                'best_trade': None,
-                'worst_trade': None
+                'total_pnl_usdt': 0
             }
         
         winning = [t for t in closed_trades if t['pnl_percent'] > 0]
@@ -202,71 +134,31 @@ class TradeHistory:
         total_pnl_percent = sum(t['pnl_percent'] for t in closed_trades)
         total_pnl_usdt = sum(t['pnl_usdt'] for t in closed_trades)
         
-        # Melhor e pior trade
-        best_trade = max(closed_trades, key=lambda x: x['pnl_percent']) if closed_trades else None
-        worst_trade = min(closed_trades, key=lambda x: x['pnl_percent']) if closed_trades else None
-        
         return {
             'total_trades': len(closed_trades),
             'winning_trades': len(winning),
             'losing_trades': len(losing),
-            'win_rate': (len(winning) / len(closed_trades)) * 100 if closed_trades else 0,
-            'total_pnl_percent': total_pnl_percent,
-            'total_pnl_usdt': total_pnl_usdt,
-            'avg_pnl_percent': total_pnl_percent / len(closed_trades) if closed_trades else 0,
-            'best_trade': best_trade,
-            'worst_trade': worst_trade
+            'win_rate': (len(winning) / len(closed_trades)) * 100,
+            'total_pnl_percent': round(total_pnl_percent, 4),
+            'total_pnl_usdt': round(total_pnl_usdt, 2)
         }
     
     def save_trades(self):
-        """Salva as trades no arquivo JSON"""
+        """Salva trades em arquivo JSON"""
         try:
-            self._ensure_data_directory()
-            
-            # Converter datetimes para string
-            trades_to_save = []
-            for trade in self.trades:
-                trade_copy = trade.copy()
-                
-                # Converter datetime para string para JSON
-                for key in ['entry_time', 'exit_time']:
-                    if key in trade_copy and isinstance(trade_copy[key], datetime):
-                        trade_copy[key] = trade_copy[key].isoformat()
-                
-                trades_to_save.append(trade_copy)
-            
             with open(self.file_path, 'w', encoding='utf-8') as f:
-                json.dump(trades_to_save, f, indent=2, ensure_ascii=False)
-                
-            logger.info(f"💾 Histórico salvo: {len(trades_to_save)} trades")
-            
+                json.dump(self.trades, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Erro ao salvar histórico: {e}")
+            import logging
+            logging.error(f"Erro ao salvar histórico: {e}")
     
     def load_trades(self):
-        """Carrega trades do arquivo JSON"""
+        """Carrega trades do arquivo"""
         try:
             if os.path.exists(self.file_path):
                 with open(self.file_path, 'r', encoding='utf-8') as f:
-                    trades_data = json.load(f)
-                
-                # Converter strings de volta para datetime
-                for trade in trades_data:
-                    for key in ['entry_time', 'exit_time']:
-                        if key in trade and trade[key]:
-                            try:
-                                trade[key] = datetime.fromisoformat(trade[key])
-                            except:
-                                pass
-                
-                self.trades = trades_data
-                logger.info(f"📂 Histórico carregado: {len(self.trades)} trades")
-            else:
-                self.trades = []
-                logger.info("📂 Nenhum histórico encontrado, iniciando novo")
-                
-        except Exception as e:
-            logger.error(f"Erro ao carregar histórico: {e}")
+                    self.trades = json.load(f)
+        except:
             self.trades = []
     
     def clear_history(self):
@@ -274,4 +166,3 @@ class TradeHistory:
         self.trades = []
         if os.path.exists(self.file_path):
             os.remove(self.file_path)
-        logger.info("🗑️ Histórico limpo")
