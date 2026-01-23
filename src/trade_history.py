@@ -14,21 +14,20 @@ class TradeHistory:
         
         # Determinar caminho do arquivo
         if file_path is None:
-            # Se estiver no Render, usar /data, senão usar pasta local
+            # Usar disco do Render se disponível
             if os.path.exists('/data'):
                 self.file_path = "/data/trade_history.json"
+                print("📁 Usando disco persistente /data do Render")
             else:
-                # Voltar um nível (para raiz) e criar pasta data
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                data_dir = os.path.join(base_dir, 'data')
-                if not os.path.exists(data_dir):
-                    os.makedirs(data_dir)
-                self.file_path = os.path.join(data_dir, 'trade_history.json')
+                # Usar pasta local
+                self.file_path = "trade_history.json"
+                print("📁 Usando arquivo local")
         else:
             self.file_path = file_path
         
         self.trades = []
         self.load_trades()
+        print(f"📊 Histórico inicializado: {len(self.trades)} trades")
     
     def get_brazil_time(self):
         """Retorna horário atual no fuso do Brasil"""
@@ -57,11 +56,11 @@ class TradeHistory:
             
             self.trades.append(trade)
             self.save_trades()
+            print(f"📝 Trade #{trade_id} registrada: {side.upper()} {quantity:.4f} ETH @ ${entry_price:.2f}")
             return trade_id
             
         except Exception as e:
-            import logging
-            logging.error(f"Erro ao registrar trade: {e}")
+            print(f"❌ Erro ao registrar trade: {e}")
             return None
     
     def close_trade(self, trade_id, exit_price):
@@ -81,8 +80,12 @@ class TradeHistory:
                     pnl_usdt = (entry_price * trade['quantity'] * pnl_percent) / 100
                     
                     # Calcular duração
-                    entry_time = datetime.fromisoformat(trade['entry_time'].replace('Z', '+00:00'))
-                    duration_seconds = (exit_time - entry_time).total_seconds()
+                    try:
+                        entry_time_obj = datetime.fromisoformat(trade['entry_time'].replace('Z', '+00:00'))
+                    except:
+                        entry_time_obj = datetime.fromisoformat(trade['entry_time'])
+                    
+                    duration_seconds = (exit_time - entry_time_obj).total_seconds()
                     
                     # Formatar duração
                     if duration_seconds < 60:
@@ -102,12 +105,14 @@ class TradeHistory:
                     trade['duration'] = duration
                     
                     self.save_trades()
+                    
+                    emoji = "✅" if pnl_percent > 0 else "❌" if pnl_percent < 0 else "➖"
+                    print(f"{emoji} Trade #{trade_id} fechada: PnL {pnl_percent:.4f}% (${pnl_usdt:.2f})")
                     return True
             
             return False
         except Exception as e:
-            import logging
-            logging.error(f"Erro ao fechar trade: {e}")
+            print(f"❌ Erro ao fechar trade #{trade_id}: {e}")
             return False
     
     def get_all_trades(self, limit=50):
@@ -149,8 +154,7 @@ class TradeHistory:
             with open(self.file_path, 'w', encoding='utf-8') as f:
                 json.dump(self.trades, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            import logging
-            logging.error(f"Erro ao salvar histórico: {e}")
+            print(f"❌ Erro ao salvar histórico: {e}")
     
     def load_trades(self):
         """Carrega trades do arquivo"""
@@ -166,3 +170,4 @@ class TradeHistory:
         self.trades = []
         if os.path.exists(self.file_path):
             os.remove(self.file_path)
+        print("🗑️ Histórico limpo")
