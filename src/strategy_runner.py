@@ -1,5 +1,3 @@
-[file name]: strategy_runner.py
-[file content begin]
 import os
 import logging
 import time
@@ -471,4 +469,3 @@ if sell_signal
             "ws_connected": self.ws_manager.is_connected,
             "price_fresh": self.ws_manager.is_price_fresh()
         }
-[file content end]
