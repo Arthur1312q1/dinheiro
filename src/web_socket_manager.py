@@ -1,5 +1,3 @@
-[file name]: web_socket_manager.py
-[file content begin]
 import websocket
 import threading
 import json
@@ -18,23 +16,19 @@ class OKXWebSocketManager:
         self.last_update = None
         
     def _on_message(self, ws, message):
-        """Processa mensagens do WebSocket"""
         try:
             data = json.loads(message)
             
-            # Canal de tickers
             if 'arg' in data and data['arg'].get('channel') == 'tickers':
                 ticker_data = data.get('data', [{}])[0]
                 if ticker_data:
                     self.current_price = float(ticker_data.get('last', 0))
                     self.last_update = datetime.now()
                     
-                    # Log a cada 30 segundos para não poluir
                     current_minute = datetime.now().minute
-                    if current_minute % 5 == 0:  # Log a cada 5 minutos
+                    if current_minute % 5 == 0:
                         logger.info(f"📈 Preço atual: ${self.current_price:.2f}")
             
-            # Evento de ping/pong
             elif data.get('event') == 'pong':
                 logger.debug("🏓 Pong recebido")
                 
@@ -52,7 +46,6 @@ class OKXWebSocketManager:
     def _on_open(self, ws):
         logger.info("🌐 Conexão WebSocket OKX estabelecida")
         
-        # Subscribe to ETH-USDT-SWAP ticker
         subscribe_msg = {
             "op": "subscribe",
             "args": [
@@ -68,7 +61,6 @@ class OKXWebSocketManager:
         logger.info("📊 Inscrito no canal 'tickers' (ETH-USDT-SWAP)")
     
     def connect(self):
-        """Conecta ao WebSocket da OKX"""
         if self.is_connected:
             return True
             
@@ -83,15 +75,13 @@ class OKXWebSocketManager:
                 on_close=self._on_close
             )
             
-            # Configurar thread
             self.ws_thread = threading.Thread(
                 target=self._run_websocket,
                 daemon=True
             )
             self.ws_thread.start()
             
-            # Aguardar conexão
-            for _ in range(30):  # Timeout de 30 segundos
+            for _ in range(30):
                 if self.is_connected:
                     logger.info("✅ WebSocket conectado com sucesso")
                     return True
@@ -105,27 +95,22 @@ class OKXWebSocketManager:
             return False
     
     def _run_websocket(self):
-        """Executa o WebSocket"""
         try:
             self.ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             logger.error(f"Erro no run_forever: {e}")
     
     def disconnect(self):
-        """Desconecta o WebSocket"""
         if self.ws:
             self.ws.close()
         self.is_connected = False
         logger.info("🔌 WebSocket desconectado")
     
     def get_current_price(self):
-        """Retorna o preço atual"""
         return self.current_price
     
     def is_price_fresh(self, max_age_seconds=30):
-        """Verifica se o preço é recente"""
         if not self.last_update:
             return False
         age = (datetime.now() - self.last_update).total_seconds()
         return age < max_age_seconds
-[file content end]
