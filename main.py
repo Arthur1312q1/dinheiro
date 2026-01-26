@@ -201,8 +201,12 @@ class SimpleTradeHistory:
     def clear_history(self):
         self.trades = []
         if os.path.exists(self.file_path):
-            os.remove(self.file_path)
-        logger.info("🗑️ Histórico limpo")
+            try:
+                os.remove(self.file_path)
+                logger.info(f"🗑️ Arquivo {self.file_path} removido")
+            except Exception as e:
+                logger.error(f"❌ Erro ao remover arquivo: {e}")
+        logger.info("🗑️ Histórico limpo (classe)")
 
 # Inicializar histórico
 trade_history = SimpleTradeHistory()
@@ -738,6 +742,10 @@ def history_page():
                             } else {
                                 alert('❌ Erro: ' + data.message);
                             }
+                        })
+                        .catch(error => {
+                            alert('❌ Erro na requisição: ' + error);
+                            console.error('Erro detalhado:', error);
                         });
                 }
             }
@@ -1015,19 +1023,30 @@ def export_history():
 def clear_history():
     """Limpa todo o histórico"""
     try:
+        logger.info("🔴 SOLICITADA LIMPEZA DO HISTÓRICO")
+        old_count = len(trade_history.trades)
+        
+        # Limpar o histórico
         trade_history.clear_history()
-        global current_trade_id, position_size, position_side
+        
+        # Resetar variáveis globais
+        global current_trade_id, position_size, position_side, trading_active
         current_trade_id = None
         position_size = 0
         position_side = None
+        trading_active = False
+        
+        logger.info(f"✅ Histórico limpo: {old_count} trades removidas")
         
         return jsonify({
             "success": True, 
-            "message": "Histórico limpo com sucesso!",
+            "message": f"Histórico limpo com sucesso! {old_count} trades removidas.",
             "trades_count": 0
         })
     except Exception as e:
-        logger.error(f"Erro ao limpar histórico: {e}")
+        logger.error(f"❌ Erro ao limpar histórico: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({"success": False, "message": str(e)}), 500
 
 # ============================================================================
@@ -1039,24 +1058,7 @@ if __name__ == '__main__':
     logger.info(f"🎯 Modo: SIMULAÇÃO COMPLETA")
     logger.info(f"🌍 Ambiente: {'RENDER' if IS_RENDER else 'Local'}")
     
-    # Adicionar algumas trades de exemplo se o histórico estiver vazio
-    if len(trade_history.trades) == 0:
-        logger.info("➕ Adicionando trades de exemplo...")
-        
-        # Trades de exemplo
-        example_trades = [
-            ('buy', 2400.0, 0.1, 2450.0),
-            ('sell', 2500.0, 0.1, 2480.0),
-            ('buy', 2450.0, 0.15, 2475.0),
-            ('sell', 2550.0, 0.12, 2530.0),
-            ('buy', 2480.0, 0.1, None),  # Trade aberta
-        ]
-        
-        for side, entry, qty, exit_price in example_trades:
-            trade_id = trade_history.add_trade(side, entry, qty)
-            if exit_price and trade_id:
-                trade_history.close_trade(trade_id, exit_price)
-        
-        logger.info(f"✅ {len(example_trades)} trades de exemplo adicionadas")
+    # NOTA: Removidas as trades de exemplo automáticas
+    # O histórico agora começa vazio
     
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
