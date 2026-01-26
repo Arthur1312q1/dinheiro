@@ -20,13 +20,13 @@ services:
         value: "okx-eth-trading-bot"
         sync: false
       - key: OKX_API_KEY
-        value: ""  # SUA API KEY AQUI
+        value: ""
         sync: false
       - key: OKX_SECRET_KEY
-        value: ""  # SEU SECRET KEY AQUI
+        value: ""
         sync: false
       - key: OKX_PASSPHRASE
-        value: ""  # SEU PASSPHRASE AQUI
+        value: ""
         sync: false
     disk:
       name: trade-history-data
