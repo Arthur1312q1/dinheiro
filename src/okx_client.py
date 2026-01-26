@@ -20,9 +20,8 @@ class OKXClient:
         self.base_url = "https://www.okx.com"
         self.leverage = 1
         self.balance_percentage = 0.95
-        self.min_order_size = 0.001  # Tamanho mínimo para ETH-USDT-SWAP (3.33 USD)
+        self.min_order_size = 0.001
         
-        # Validação básica
         if not all([self.api_key, self.secret_key, self.passphrase]):
             logger.error("❌ Credenciais da OKX não configuradas.")
             raise ValueError("Credenciais OKX ausentes")
@@ -30,15 +29,12 @@ class OKXClient:
         logger.info("✅ Cliente OKX inicializado")
     
     def _get_timestamp(self):
-        """Retorna timestamp ISO 8601 no UTC"""
         return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     
     def _signature(self, timestamp, method, request_path, body=''):
-        """Gera assinatura HMAC SHA256"""
         try:
             message = timestamp + method.upper() + request_path + body
             
-            # Decodifica a secret key (pode estar em base64)
             if len(self.secret_key) > 50:
                 try:
                     secret_decoded = base64.b64decode(self.secret_key)
@@ -60,7 +56,6 @@ class OKXClient:
             raise
     
     def _get_headers(self, method, request_path, body=''):
-        """Retorna headers completos"""
         timestamp = self._get_timestamp()
         signature = self._signature(timestamp, method, request_path, body)
         
@@ -73,7 +68,6 @@ class OKXClient:
         }
     
     def _make_request(self, method, endpoint, data=None, retry=3):
-        """Faz requisição para API OKX"""
         url = self.base_url + endpoint
         body = ''
         
@@ -110,7 +104,6 @@ class OKXClient:
                 return {"code": "-1", "msg": str(e)}
     
     def get_balance(self):
-        """Obtém saldo USDT"""
         logger.info("💰 Obtendo saldo da conta...")
         
         response = self._make_request("GET", "/api/v5/account/balance?ccy=USDT")
@@ -138,7 +131,6 @@ class OKXClient:
         return 0.0
     
     def calculate_position_size(self):
-        """Calcula tamanho de posição"""
         balance = self.get_balance()
         if balance <= 0:
             return 0.0
@@ -149,13 +141,10 @@ class OKXClient:
         
         risk_capital = balance * self.balance_percentage
         
-        # Quantidade baseada em 95% do saldo
         desired_qty = risk_capital / price
         
-        # Garante o mínimo de 0.001 ETH
         final_qty = max(desired_qty, self.min_order_size)
         
-        # Verifica se não excede o saldo
         if final_qty * price > balance:
             final_qty = balance / price
         
@@ -163,7 +152,6 @@ class OKXClient:
         return final_qty
     
     def get_ticker_price(self, symbol="ETH-USDT-SWAP"):
-        """Obtém preço atual"""
         try:
             response = self._make_request("GET", f"/api/v5/market/ticker?instId={symbol}")
             if response.get('code') == '0':
@@ -176,7 +164,6 @@ class OKXClient:
         return None
     
     def get_candles(self, symbol="ETH-USDT-SWAP", timeframe="30m", limit=100):
-        """Obtém candles históricos"""
         try:
             endpoint = f"/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
             
@@ -209,11 +196,9 @@ class OKXClient:
             return []
     
     def place_order(self, side, quantity):
-        """Executa ordem de mercado"""
         try:
             symbol = "ETH-USDT-SWAP"
             
-            # Configurar alavancagem
             leverage_data = {
                 "instId": symbol,
                 "lever": "1",
@@ -222,7 +207,6 @@ class OKXClient:
             
             self._make_request("POST", "/api/v5/account/set-leverage", leverage_data)
             
-            # Ordem principal
             order_data = {
                 "instId": symbol,
                 "tdMode": "cross",
@@ -246,7 +230,6 @@ class OKXClient:
             return False
     
     def close_all_positions(self):
-        """Fecha todas as posições abertas"""
         try:
             response = self._make_request("GET", "/api/v5/account/positions")
             if response.get('code') == '0':
