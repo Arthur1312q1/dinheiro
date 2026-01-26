@@ -1,3 +1,5 @@
+[file name]: main.py
+[file content begin]
 import os
 import sys
 import logging
@@ -43,6 +45,7 @@ try:
     from src.keep_alive import KeepAliveSystem
     from src.strategy_runner import StrategyRunner
     from src.trade_history import TradeHistory
+    from src.web_socket_manager import OKXWebSocketManager
     
     logger.info("✅ Módulos importados com sucesso")
     
@@ -113,6 +116,9 @@ def home():
             .menu a { color: #00ff88; text-decoration: none; margin: 0 15px; font-size: 16px; }
             .menu a:hover { text-decoration: underline; }
             .info { color: #aaa; font-size: 14px; margin-top: 20px; }
+            .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
+            .status-card { background: rgba(255, 255, 255, 0.05); padding: 15px; border-radius: 8px; text-align: left; }
+            .status-card h3 { margin-top: 0; color: #00ff88; }
         </style>
     </head>
     <body>
@@ -140,10 +146,31 @@ def home():
                 <a href="/history">📜 Histórico</a>
                 <a href="/health">❤️ Saúde</a>
                 <a href="/test-auth">🔐 Testar OKX</a>
+                <a href="/logs">📝 Logs</a>
+            </div>
+            
+            <div class="status-grid">
+                <div class="status-card">
+                    <h3>📈 Preço Atual</h3>
+                    <div id="current-price">Carregando...</div>
+                </div>
+                <div class="status-card">
+                    <h3>💰 Saldo</h3>
+                    <div id="balance">Carregando...</div>
+                </div>
+                <div class="status-card">
+                    <h3>📊 Barras Processadas</h3>
+                    <div id="bars-processed">0</div>
+                </div>
+                <div class="status-card">
+                    <h3>🔄 Próxima Barra</h3>
+                    <div id="next-bar">--:--:--</div>
+                </div>
             </div>
             
             <div class="info">
                 <strong>⚠️ MODO SIMULAÇÃO ATIVO:</strong> Nenhuma ordem real será enviada à OKX.
+                <p>As trades são executadas com delay de 1 barra (30 minutos), conforme estratégia Pine Script.</p>
             </div>
         </div>
         
@@ -163,6 +190,47 @@ def home():
                 alert('❌ ' + data.message);
             }
         }
+        
+        // Atualizar status em tempo real
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                if (data.current_price) {
+                    document.getElementById('current-price').innerHTML = `$${data.current_price.toFixed(2)}`;
+                }
+                
+                if (data.balance_usdt) {
+                    document.getElementById('balance').innerHTML = `$${data.balance_usdt.toFixed(2)}`;
+                }
+                
+                if (data.next_bar_at) {
+                    document.getElementById('next-bar').innerHTML = data.next_bar_at;
+                }
+                
+                if (data.bars_processed !== undefined) {
+                    document.getElementById('bars-processed').innerHTML = data.bars_processed;
+                }
+                
+                // Atualizar status do bot
+                const statusDiv = document.querySelector('.status');
+                if (data.trading_active) {
+                    statusDiv.className = 'status active';
+                    statusDiv.innerHTML = '🟢 ATIVO - Simulando (sem ordens reais)';
+                } else {
+                    statusDiv.className = 'status inactive';
+                    statusDiv.innerHTML = '🔴 INATIVO - Aguardando ativação';
+                }
+                
+            } catch (error) {
+                console.error('Erro ao atualizar status:', error);
+            }
+        }
+        
+        // Atualizar a cada 5 segundos
+        setInterval(updateStatus, 5000);
+        updateStatus(); // Executar imediatamente
         </script>
     </body>
     </html>
@@ -178,6 +246,7 @@ def health():
         "status": "healthy",
         "service": "OKX ETH Trading Bot",
         "trading_active": trading_active,
+        "environment": "render" if IS_RENDER else "local",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -200,40 +269,32 @@ def start_trading():
         return jsonify({"status": "error", "message": "Strategy Runner não inicializado."}), 500
     
     try:
+        # Iniciar o strategy runner
         if not strategy_runner.start():
-            return jsonify({"status": "error", "message": "Falha ao iniciar WebSocket."}), 500
+            return jsonify({"status": "error", "message": "Falha ao iniciar o Strategy Runner."}), 500
         
         trading_active = True
         
-        def trading_loop():
-            while trading_active and strategy_runner:
-                try:
-                    strategy_runner.run_strategy_realtime()
-                    time.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"Erro no loop de trading: {e}")
-                    time.sleep(1)
-        
-        trade_thread = threading.Thread(target=trading_loop, daemon=True)
-        trade_thread.start()
-        
         logger.info("⚡ BOT LIGADO em modo SIMULAÇÃO!")
+        
         return jsonify({
             "status": "success", 
-            "message": "Bot iniciado em modo SIMULAÇÃO!"
+            "message": "Bot iniciado em modo SIMULAÇÃO!",
+            "details": "Estratégia: Adaptive Zero Lag EMA v2 | Timeframe: 30 minutos | Delay: 1 barra"
         })
         
     except Exception as e:
-        logger.error(f"Erro ao iniciar: {e}")
+        logger.error(f"Erro ao iniciar bot: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/stop', methods=['POST'])
 def stop_trading():
     global trading_active
     
-    if strategy_runner:
-        strategy_runner.stop()
+    if not strategy_runner:
+        return jsonify({"status": "error", "message": "Strategy Runner não inicializado"}), 500
     
+    strategy_runner.stop()
     trading_active = False
     
     logger.info("⏹️ BOT PARADO")
@@ -241,15 +302,32 @@ def stop_trading():
 
 @app.route('/status')
 def status():
-    price = strategy_runner.current_price if strategy_runner else None
+    if not strategy_runner:
+        return jsonify({
+            "trading_active": trading_active,
+            "error": "Strategy Runner não inicializado"
+        })
+    
+    # Obter status detalhado
+    strategy_status = strategy_runner.get_strategy_status()
+    
+    # Obter saldo
     balance = okx_client.get_balance() if okx_client else 0
     
     return jsonify({
         "trading_active": trading_active,
-        "current_price": price,
+        "current_price": strategy_status.get("current_price"),
         "balance_usdt": balance,
         "environment": "render" if IS_RENDER else "local",
-        "simulation_mode": True
+        "simulation_mode": True,
+        "next_bar_at": strategy_status.get("next_bar_at"),
+        "bars_processed": strategy_status.get("bars_processed", 0),
+        "pending_buy": strategy_status.get("pending_buy", False),
+        "pending_sell": strategy_status.get("pending_sell", False),
+        "position_size": strategy_status.get("position_size", 0),
+        "position_side": strategy_status.get("position_side"),
+        "ws_connected": strategy_status.get("ws_connected", False),
+        "price_fresh": strategy_status.get("price_fresh", False)
     })
 
 @app.route('/history')
@@ -278,26 +356,33 @@ def history_page():
                 .stat-value { font-size: 24px; font-weight: bold; margin: 5px 0; }
                 .positive { color: #00ff88; }
                 .negative { color: #ff4444; }
+                .neutral { color: #888; }
                 .controls { text-align: center; margin: 20px 0; }
                 .btn { padding: 10px 20px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; }
                 .btn-refresh { background: #00ff88; color: black; }
                 .btn-clear { background: #ff4444; color: white; }
                 .btn-back { background: #555; color: white; }
+                .btn-export { background: #3a86ff; color: white; }
                 table { width: 100%; border-collapse: collapse; margin: 20px 0; background: rgba(0,0,0,0.3); }
                 th { background: rgba(0,0,0,0.5); padding: 12px; text-align: left; color: #00ff88; }
                 td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.1); }
                 tr:hover { background: rgba(255,255,255,0.05); }
                 .side-buy { color: #00ff88; font-weight: bold; }
                 .side-sell { color: #ff4444; font-weight: bold; }
+                .pnl-positive { color: #00ff88; }
+                .pnl-negative { color: #ff4444; }
+                .pnl-neutral { color: #888; }
                 .empty { text-align: center; padding: 50px; color: #888; }
                 .footer { text-align: center; margin-top: 30px; color: #888; font-size: 14px; }
+                .filter { margin: 20px 0; text-align: center; }
+                .filter select { padding: 8px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; }
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
                     <h1>📜 Histórico de Operações</h1>
-                    <p>ETH/USDT - Modo SIMULAÇÃO</p>
+                    <p>ETH/USDT - Modo SIMULAÇÃO • Timeframe: 30 minutos</p>
                 </div>
                 
                 <div class="stats">
@@ -315,19 +400,19 @@ def history_page():
                     </div>
                     <div class="stat-card">
                         <div>Taxa de Acerto</div>
-                        <div class="stat-value """ + ("positive" if stats['win_rate'] > 50 else "negative") + """">
+                        <div class="stat-value """ + ("positive" if stats['win_rate'] > 50 else "negative" if stats['win_rate'] < 50 else "neutral") + """">
                             """ + f"{stats['win_rate']:.1f}%" + """
                         </div>
                     </div>
                     <div class="stat-card">
                         <div>Lucro Total %</div>
-                        <div class="stat-value """ + ("positive" if stats['total_pnl_percent'] > 0 else "negative") + """">
+                        <div class="stat-value """ + ("positive" if stats['total_pnl_percent'] > 0 else "negative" if stats['total_pnl_percent'] < 0 else "neutral") + """">
                             """ + f"{stats['total_pnl_percent']:.4f}%" + """
                         </div>
                     </div>
                     <div class="stat-card">
                         <div>Lucro Total USDT</div>
-                        <div class="stat-value """ + ("positive" if stats['total_pnl_usdt'] > 0 else "negative") + """">
+                        <div class="stat-value """ + ("positive" if stats['total_pnl_usdt'] > 0 else "negative" if stats['total_pnl_usdt'] < 0 else "neutral") + """">
                             $""" + f"{stats['total_pnl_usdt']:.2f}" + """
                         </div>
                     </div>
@@ -335,8 +420,20 @@ def history_page():
                 
                 <div class="controls">
                     <button class="btn btn-refresh" onclick="location.reload()">🔄 Atualizar</button>
+                    <button class="btn btn-export" onclick="exportHistory()">📥 Exportar CSV</button>
                     <button class="btn btn-clear" onclick="clearHistory()">🗑️ Limpar Histórico</button>
                     <button class="btn btn-back" onclick="location.href='/'">🏠 Voltar</button>
+                </div>
+                
+                <div class="filter">
+                    <label for="status-filter">Filtrar por status: </label>
+                    <select id="status-filter" onchange="filterTable()">
+                        <option value="all">Todas as trades</option>
+                        <option value="open">Abertas</option>
+                        <option value="closed">Fechadas</option>
+                        <option value="profit">Lucrativas</option>
+                        <option value="loss">Prejudiciais</option>
+                    </select>
                 </div>
         """
         
@@ -346,11 +443,12 @@ def history_page():
                     <div style="font-size: 50px; margin-bottom: 20px;">📭</div>
                     <h3>Nenhuma operação registrada</h3>
                     <p>Quando o bot executar trades, elas aparecerão aqui.</p>
+                    <p><small>Lembre-se: O bot opera em barras de 30 minutos e executa com delay de 1 barra.</small></p>
                 </div>
             """
         else:
             html += """
-                <table>
+                <table id="trades-table">
                     <thead>
                         <tr>
                             <th>ID</th>
@@ -370,10 +468,21 @@ def history_page():
             
             for trade in trades:
                 side_class = "side-buy" if trade['side'] == 'buy' else "side-sell"
-                pnl_class = "positive" if trade['pnl_percent'] > 0 else "negative" if trade['pnl_percent'] < 0 else ""
+                
+                # Determinar classe do PnL
+                pnl_percent = trade.get('pnl_percent', 0)
+                if pnl_percent > 0:
+                    pnl_class = "pnl-positive"
+                elif pnl_percent < 0:
+                    pnl_class = "pnl-negative"
+                else:
+                    pnl_class = "pnl-neutral"
+                
+                # Status icon
+                status_icon = '🟢' if trade['status'] == 'open' else '✅' if pnl_percent > 0 else '❌' if pnl_percent < 0 else '➖'
                 
                 html += f"""
-                        <tr>
+                        <tr class="trade-row" data-status="{trade['status']}" data-pnl="{pnl_percent}">
                             <td><strong>#{trade['id']}</strong></td>
                             <td>{trade['entry_time_str']}</td>
                             <td class="{side_class}">{trade['side'].upper()}</td>
@@ -383,7 +492,7 @@ def history_page():
                             <td class="{pnl_class}">{trade['pnl_percent']:.4f}%</td>
                             <td class="{pnl_class}">${trade['pnl_usdt']:.2f}</td>
                             <td>{trade['duration'] or '-'}</td>
-                            <td>{'🟢' if trade['status'] == 'open' else '✅' if trade['pnl_percent'] > 0 else '❌'}</td>
+                            <td>{status_icon}</td>
                         </tr>
                 """
             
@@ -395,13 +504,44 @@ def history_page():
         html += """
                 <div class="footer">
                     <p><strong>⚠️ MODO SIMULAÇÃO:</strong> Nenhuma ordem real foi executada na OKX.</p>
-                    <p>Horário de Brasília (BRT)</p>
+                    <p>Horário de Brasília (BRT) • Delay de execução: 1 barra (30 minutos)</p>
                 </div>
             </div>
             
             <script>
+            function filterTable() {
+                const filter = document.getElementById('status-filter').value;
+                const rows = document.querySelectorAll('.trade-row');
+                
+                rows.forEach(row => {
+                    const status = row.getAttribute('data-status');
+                    const pnl = parseFloat(row.getAttribute('data-pnl'));
+                    let show = true;
+                    
+                    switch(filter) {
+                        case 'open':
+                            show = status === 'open';
+                            break;
+                        case 'closed':
+                            show = status === 'closed';
+                            break;
+                        case 'profit':
+                            show = status === 'closed' && pnl > 0;
+                            break;
+                        case 'loss':
+                            show = status === 'closed' && pnl < 0;
+                            break;
+                        case 'all':
+                        default:
+                            show = true;
+                    }
+                    
+                    row.style.display = show ? '' : 'none';
+                });
+            }
+            
             function clearHistory() {
-                if (confirm('Tem certeza que deseja limpar todo o histórico?')) {
+                if (confirm('Tem certeza que deseja limpar todo o histórico? Esta ação não pode ser desfeita.')) {
                     fetch('/clear-history', { method: 'POST' })
                         .then(r => r.json())
                         .then(data => {
@@ -414,6 +554,24 @@ def history_page():
                         });
                 }
             }
+            
+            function exportHistory() {
+                fetch('/export-history')
+                    .then(response => response.blob())
+                    .then(blob => {
+                        const url = window.URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'trade_history.csv';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        window.URL.revokeObjectURL(url);
+                    })
+                    .catch(error => {
+                        alert('Erro ao exportar histórico: ' + error);
+                    });
+            }
             </script>
         </body>
         </html>
@@ -424,6 +582,56 @@ def history_page():
     except Exception as e:
         logger.error(f"Erro na página de histórico: {e}")
         return f"<h1>Erro: {str(e)}</h1>"
+
+@app.route('/export-history')
+def export_history():
+    if not trade_history:
+        return "Sistema de histórico não inicializado", 500
+    
+    try:
+        trades = trade_history.get_all_trades(limit=1000)
+        
+        # Criar CSV
+        import csv
+        from io import StringIO
+        
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Cabeçalho
+        writer.writerow([
+            'ID', 'Data/Hora', 'Operação', 'Preço Entrada', 'Preço Saída',
+            'Quantidade (ETH)', 'Variação %', 'Lucro USDT', 'Duração', 'Status'
+        ])
+        
+        # Dados
+        for trade in trades:
+            writer.writerow([
+                trade['id'],
+                trade['entry_time_str'],
+                trade['side'].upper(),
+                f"{trade['entry_price']:.2f}",
+                f"{trade['exit_price']:.2f}" if trade['exit_price'] else '',
+                f"{trade['quantity']:.4f}",
+                f"{trade['pnl_percent']:.4f}",
+                f"{trade['pnl_usdt']:.2f}",
+                trade['duration'] or '',
+                trade['status']
+            ])
+        
+        # Retornar arquivo
+        from flask import Response
+        output.seek(0)
+        
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-disposition": "attachment; filename=trade_history.csv"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro ao exportar histórico: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/clear-history', methods=['POST'])
 def clear_history():
@@ -453,9 +661,108 @@ def test_auth():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/logs')
+def logs_page():
+    """Página para visualizar logs recentes"""
+    try:
+        import io
+        from datetime import datetime, timedelta
+        
+        # Ler últimos 1000 caracteres do log (ajuste conforme necessário)
+        log_content = ""
+        
+        # Tentar ler arquivo de log se existir
+        log_files = ['app.log', 'debug.log', 'logs/app.log']
+        log_found = False
+        
+        for log_file in log_files:
+            if os.path.exists(log_file):
+                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                    # Pegar últimas 100 linhas
+                    log_content = ''.join(lines[-100:])
+                    log_found = True
+                    break
+        
+        if not log_found:
+            log_content = "Nenhum arquivo de log encontrado."
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>📝 Logs do Sistema</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: monospace; background: #1a1a2e; color: #00ff88; padding: 20px; }}
+                .container {{ max-width: 1200px; margin: 0 auto; }}
+                .header {{ margin-bottom: 20px; text-align: center; }}
+                h1 {{ color: #00ff88; }}
+                .log-container {{ background: rgba(0,0,0,0.7); padding: 20px; border-radius: 8px; overflow-x: auto; }}
+                .log-line {{ margin: 2px 0; white-space: pre-wrap; }}
+                .log-error {{ color: #ff4444; }}
+                .log-warning {{ color: #ffaa00; }}
+                .log-info {{ color: #00ff88; }}
+                .log-debug {{ color: #888; }}
+                .controls {{ margin: 20px 0; text-align: center; }}
+                .btn {{ padding: 10px 20px; margin: 5px; background: #00ff88; color: black; border: none; border-radius: 4px; cursor: pointer; }}
+                .btn-back {{ background: #555; color: white; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>📝 Logs do Sistema</h1>
+                    <p>Últimas 100 linhas • Horário: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+                </div>
+                
+                <div class="controls">
+                    <button class="btn" onclick="location.reload()">🔄 Atualizar Logs</button>
+                    <button class="btn btn-back" onclick="location.href='/'">🏠 Voltar</button>
+                </div>
+                
+                <div class="log-container">
+                    <pre>{log_content}</pre>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+        
+    except Exception as e:
+        return f"<h1>Erro ao carregar logs: {str(e)}</h1>"
+
+@app.route('/restart', methods=['POST'])
+def restart_bot():
+    """Reinicia o bot (para debugging)"""
+    global trading_active
+    
+    try:
+        # Parar se estiver rodando
+        if trading_active and strategy_runner:
+            strategy_runner.stop()
+            trading_active = False
+        
+        # Pequena pausa
+        time.sleep(2)
+        
+        return jsonify({
+            "success": True,
+            "message": "Bot reiniciado. Use /start para iniciar novamente."
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # ============================================================================
 # 8. PONTO DE ENTRADA
 # ============================================================================
 if __name__ == '__main__':
     logger.info(f"🚀 Iniciando servidor na porta {PORT}...")
+    logger.info(f"📊 Estratégia: Adaptive Zero Lag EMA v2")
+    logger.info(f"⏰ Timeframe: 30 minutos")
+    logger.info(f"🎯 Modo: SIMULAÇÃO (sem ordens reais)")
+    
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+[file content end]
