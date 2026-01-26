@@ -10,9 +10,7 @@ logger = logging.getLogger(__name__)
 
 class KeepAliveSystem:
     def __init__(self, base_url=None):
-        self.last_signal_time = time.time()
         self.is_running = True
-        
         self.is_render = os.getenv('RENDER', '').lower() == 'true'
         
         if self.is_render:
@@ -20,24 +18,17 @@ class KeepAliveSystem:
             self.base_url = f"https://{SERVICE_NAME}.onrender.com"
             logger.info(f"✅ KeepAliveSystem (RENDER): usando {self.base_url}")
         else:
-            if base_url:
-                self.base_url = base_url
-            else:
-                port = os.getenv('PORT', '10000')
-                self.base_url = f"http://localhost:{port}"
+            port = os.getenv('PORT', '10000')
+            self.base_url = f"http://localhost:{port}"
             logger.info(f"✅ KeepAliveSystem (LOCAL): usando {self.base_url}")
         
         self.health_url = f"{self.base_url}/health"
-        
-        self.uptimerobot_url = os.getenv('UPTIMEROBOT_URL', '')
-        self.cycle_count = 0
     
     def send_health_ping(self):
         try:
             response = requests.get(self.health_url, timeout=10)
             if response.status_code == 200:
                 logger.info(f"✅ Health ping enviado - {datetime.now().strftime('%H:%M:%S')}")
-                self.last_signal_time = time.time()
                 return True
         except Exception as e:
             logger.error(f"❌ Erro no health ping: {e}")
@@ -45,19 +36,16 @@ class KeepAliveSystem:
     
     def start_keep_alive(self):
         def keep_alive_loop():
-            logger.info("[🚀] Sistema de keep-alive iniciado (modo simplificado)")
+            logger.info("[🚀] Sistema de keep-alive iniciado")
             
             while self.is_running:
                 try:
                     if self.is_render:
                         self.send_health_ping()
-                        self.cycle_count += 1
-                        time.sleep(300)
-                    
+                        time.sleep(300)  # 5 minutos no Render
                     else:
                         self.send_health_ping()
-                        self.cycle_count += 1
-                        time.sleep(30)
+                        time.sleep(30)  # 30 segundos local
                         
                 except Exception as e:
                     logger.error(f"Erro no loop keep-alive: {e}")
