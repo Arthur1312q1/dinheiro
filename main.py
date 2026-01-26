@@ -31,8 +31,15 @@ PORT = int(os.environ.get('PORT', 10000))
 # ============================================================================
 class SimpleTradeHistory:
     def __init__(self, file_path=None):
-        import pytz
-        self.tz_brazil = pytz.timezone('America/Sao_Paulo')
+        try:
+            import pytz
+            self.tz_brazil = pytz.timezone('America/Sao_Paulo')
+        except:
+            # Fallback se pytz não estiver disponível
+            class FakeTZ:
+                def localize(self, dt):
+                    return dt
+            self.tz_brazil = FakeTZ()
         
         if file_path is None:
             if IS_RENDER and os.path.exists('/data'):
@@ -65,6 +72,7 @@ class SimpleTradeHistory:
                 'entry_time_str': entry_time.strftime('%d/%m/%Y %H:%M:%S'),
                 'exit_price': None,
                 'exit_time': None,
+                'exit_time_str': None,
                 'pnl_percent': 0.0,
                 'pnl_usdt': 0.0,
                 'status': 'open',
@@ -99,7 +107,10 @@ class SimpleTradeHistory:
                     try:
                         entry_time_obj = datetime.fromisoformat(trade['entry_time'].replace('Z', '+00:00'))
                     except:
-                        entry_time_obj = datetime.fromisoformat(trade['entry_time'])
+                        try:
+                            entry_time_obj = datetime.fromisoformat(trade['entry_time'])
+                        except:
+                            entry_time_obj = datetime.now()
                     
                     duration_seconds = (exit_time - entry_time_obj).total_seconds()
                     
@@ -149,11 +160,11 @@ class SimpleTradeHistory:
                 'avg_pnl_usdt': 0
             }
         
-        winning = [t for t in closed_trades if t['pnl_percent'] > 0]
-        losing = [t for t in closed_trades if t['pnl_percent'] < 0]
+        winning = [t for t in closed_trades if t.get('pnl_percent', 0) > 0]
+        losing = [t for t in closed_trades if t.get('pnl_percent', 0) < 0]
         
-        total_pnl_percent = sum(t['pnl_percent'] for t in closed_trades)
-        total_pnl_usdt = sum(t['pnl_usdt'] for t in closed_trades)
+        total_pnl_percent = sum(t.get('pnl_percent', 0) for t in closed_trades)
+        total_pnl_usdt = sum(t.get('pnl_usdt', 0) for t in closed_trades)
         
         avg_pnl_percent = total_pnl_percent / len(closed_trades) if closed_trades else 0
         avg_pnl_usdt = total_pnl_usdt / len(closed_trades) if closed_trades else 0
@@ -245,6 +256,7 @@ def execute_simulation_trade(side):
 # ============================================================================
 @app.route('/')
 def home():
+    stats = trade_history.get_stats()
     html = """
     <!DOCTYPE html>
     <html>
@@ -290,36 +302,39 @@ def home():
             <div class="stats-grid">
                 <div class="stat-card">
                     <h3>📈 Preço Atual</h3>
-                    <div class="stat-value" id="current-price">${{ "%.2f"|format(current_price) }}</div>
+                    <div class="stat-value" id="current-price">$""" + f"{current_price:.2f}" + """</div>
                 </div>
                 <div class="stat-card">
                     <h3>💰 Posição</h3>
                     <div class="stat-value" id="position">
-                        {% if position_side == 'buy' %}
-                            <span class="positive">LONG {{ "%.4f"|format(position_size) }} ETH</span>
-                        {% elif position_side == 'sell' %}
-                            <span class="negative">SHORT {{ "%.4f"|format(-position_size) }} ETH</span>
-                        {% else %}
-                            Nenhuma
-                        {% endif %}
+    """
+    
+    if position_side == 'buy':
+        html += f"""<span class="positive">LONG {position_size:.4f} ETH</span>"""
+    elif position_side == 'sell':
+        html += f"""<span class="negative">SHORT {-position_size:.4f} ETH</span>"""
+    else:
+        html += """Nenhuma"""
+    
+    html += """
                     </div>
                 </div>
                 <div class="stat-card">
                     <h3>📊 Trades</h3>
-                    <div class="stat-value" id="total-trades">{{ trade_history.trades|length }}</div>
+                    <div class="stat-value" id="total-trades">""" + str(len(trade_history.trades)) + """</div>
                 </div>
                 <div class="stat-card">
                     <h3>🎯 Win Rate</h3>
-                    <div class="stat-value {{ 'positive' if trade_history.get_stats().win_rate > 50 else 'negative' }}" 
-                         id="win-rate">{{ "%.1f"|format(trade_history.get_stats().win_rate) }}%</div>
+                    <div class="stat-value """ + ("positive" if stats['win_rate'] > 50 else "negative") + """" 
+                         id="win-rate">""" + f"{stats['win_rate']:.1f}%" + """</div>
                 </div>
             </div>
             
             <div class="controls">
-                <button class="btn btn-green" onclick="controlBot('start')" {{ 'disabled' if trading_active else '' }}>
+                <button class="btn btn-green" onclick="controlBot('start')" """ + ("disabled" if trading_active else "") + """>
                     ⚡ Iniciar Bot
                 </button>
-                <button class="btn btn-red" onclick="controlBot('stop')" {{ 'disabled' if not trading_active else '' }}>
+                <button class="btn btn-red" onclick="controlBot('stop')" """ + ("disabled" if not trading_active else "") + """>
                     ⏹️ Parar Bot
                 </button>
                 <button class="btn btn-blue" onclick="executeTrade('buy')">
@@ -395,13 +410,7 @@ def home():
     </body>
     </html>
     """
-    return render_template_string(html, 
-        trading_active=trading_active,
-        current_price=current_price,
-        position_size=position_size,
-        position_side=position_side,
-        trade_history=trade_history
-    )
+    return html
 
 # ============================================================================
 # ENDPOINTS DA API
@@ -417,44 +426,15 @@ def health():
         "trades_count": len(trade_history.trades)
     })
 
-@app.route('/ping-internal-1')
-def ping1():
-    return jsonify({"status": "pong1", "time": datetime.now().isoformat()})
-
-@app.route('/ping-internal-2')
-def ping2():
-    return jsonify({"status": "pong2", "time": datetime.now().isoformat()})
-
 @app.route('/start', methods=['POST'])
 def start_trading():
-    global trading_active, bars_processed
+    global trading_active
     
     if trading_active:
         return jsonify({"status": "error", "message": "Bot já está ativo!"}), 400
     
     trading_active = True
     logger.info("⚡ Bot de SIMULAÇÃO iniciado")
-    
-    # Iniciar keep-alive se estiver no Render
-    if IS_RENDER:
-        try:
-            import threading
-            def keep_alive():
-                while trading_active:
-                    try:
-                        import requests
-                        SERVICE_NAME = os.getenv('RENDER_SERVICE_NAME', 'okx-eth-trading-bot')
-                        requests.get(f"https://{SERVICE_NAME}.onrender.com/health", timeout=10)
-                        logger.info("✅ Keep-alive ping enviado")
-                        time.sleep(240)  # 4 minutos
-                    except:
-                        time.sleep(60)
-            
-            thread = threading.Thread(target=keep_alive, daemon=True)
-            thread.start()
-            logger.info("✅ Keep-alive iniciado")
-        except:
-            pass
     
     return jsonify({
         "status": "success", 
@@ -671,18 +651,24 @@ def history_page():
                 status_icon = '🟢' if trade['status'] == 'open' else '✅' if pnl_percent > 0 else '❌' if pnl_percent < 0 else '➖'
                 row_class = "trade-open" if trade['status'] == 'open' else "trade-closed"
                 
+                # Usar .get() para evitar erros com chaves ausentes
+                exit_time_str = trade.get('exit_time_str', '-')
+                exit_price = trade.get('exit_price')
+                pnl_usdt = trade.get('pnl_usdt')
+                duration = trade.get('duration', '-')
+                
                 html += f"""
                         <tr class="trade-row {row_class}" data-status="{trade['status']}" data-pnl="{pnl_percent}" data-side="{trade['side']}">
                             <td><strong>#{trade['id']}</strong></td>
                             <td>{trade['entry_time_str']}</td>
-                            <td>{trade['exit_time_str'] if trade['exit_time_str'] else '-'}</td>
+                            <td>{exit_time_str}</td>
                             <td class="{side_class}">{trade['side'].upper()}</td>
                             <td>${trade['entry_price']:.2f}</td>
-                            <td>{'$' + f"{trade['exit_price']:.2f}" if trade['exit_price'] else '-'}</td>
+                            <td>{'$' + f"{exit_price:.2f}" if exit_price else '-'}</td>
                             <td>{trade['quantity']:.4f} ETH</td>
-                            <td class="{pnl_class}">{trade['pnl_percent']:.4f}%</td>
-                            <td class="{pnl_class}">{'$' + f"{trade['pnl_usdt']:.2f}" if trade['pnl_usdt'] else '-'}</td>
-                            <td>{trade['duration'] or '-'}</td>
+                            <td class="{pnl_class}">{pnl_percent:.4f}%</td>
+                            <td class="{pnl_class}">{'$' + f"{pnl_usdt:.2f}" if pnl_usdt else '-'}</td>
+                            <td>{duration}</td>
                             <td>{status_icon}</td>
                         </tr>
                 """
@@ -773,6 +759,8 @@ def history_page():
         
     except Exception as e:
         logger.error(f"Erro na página de histórico: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return f"<h1>Erro: {str(e)}</h1>"
 
 @app.route('/stats')
@@ -789,8 +777,8 @@ def stats_page():
     best_trade = None
     worst_trade = None
     if closed_trades:
-        best_trade = max(closed_trades, key=lambda x: x['pnl_percent'])
-        worst_trade = min(closed_trades, key=lambda x: x['pnl_percent'])
+        best_trade = max(closed_trades, key=lambda x: x.get('pnl_percent', 0))
+        worst_trade = min(closed_trades, key=lambda x: x.get('pnl_percent', 0))
     
     html = f"""
     <!DOCTYPE html>
@@ -868,10 +856,10 @@ def stats_page():
                 <div class="stat-card highlight">
                     <div class="stat-title">🏆 MELHOR TRADE</div>
                     <div class="stat-value positive">#{best_trade['id']} - {best_trade['side'].upper()}</div>
-                    <div>Lucro: {best_trade['pnl_percent']:.4f}% (${best_trade['pnl_usdt']:.2f})</div>
+                    <div>Lucro: {best_trade.get('pnl_percent', 0):.4f}% (${best_trade.get('pnl_usdt', 0):.2f})</div>
                     <div>Entrada: ${best_trade['entry_price']:.2f}</div>
-                    <div>Saída: ${best_trade['exit_price']:.2f}</div>
-                    <div>Duração: {best_trade['duration']}</div>
+                    <div>Saída: ${best_trade.get('exit_price', 0):.2f}</div>
+                    <div>Duração: {best_trade.get('duration', '-')}</div>
                 </div>
         """
     
@@ -880,10 +868,10 @@ def stats_page():
                 <div class="stat-card highlight-negative">
                     <div class="stat-title">📉 PIOR TRADE</div>
                     <div class="stat-value negative">#{worst_trade['id']} - {worst_trade['side'].upper()}</div>
-                    <div>Prejuízo: {worst_trade['pnl_percent']:.4f}% (${worst_trade['pnl_usdt']:.2f})</div>
+                    <div>Prejuízo: {worst_trade.get('pnl_percent', 0):.4f}% (${worst_trade.get('pnl_usdt', 0):.2f})</div>
                     <div>Entrada: ${worst_trade['entry_price']:.2f}</div>
-                    <div>Saída: ${worst_trade['exit_price']:.2f}</div>
-                    <div>Duração: {worst_trade['duration']}</div>
+                    <div>Saída: ${worst_trade.get('exit_price', 0):.2f}</div>
+                    <div>Duração: {worst_trade.get('duration', '-')}</div>
                 </div>
         """
     
@@ -899,7 +887,7 @@ def stats_page():
     
     buy_trades = [t for t in trades if t['side'] == 'buy']
     buy_closed = [t for t in buy_trades if t['status'] == 'closed']
-    buy_winning = [t for t in buy_closed if t['pnl_percent'] > 0]
+    buy_winning = [t for t in buy_closed if t.get('pnl_percent', 0) > 0]
     
     html += f"""
                         {len(buy_trades)} trades
@@ -915,7 +903,7 @@ def stats_page():
     
     sell_trades = [t for t in trades if t['side'] == 'sell']
     sell_closed = [t for t in sell_trades if t['status'] == 'closed']
-    sell_winning = [t for t in sell_closed if t['pnl_percent'] > 0]
+    sell_winning = [t for t in sell_closed if t.get('pnl_percent', 0) > 0]
     
     html += f"""
                         {len(sell_trades)} trades
@@ -1000,14 +988,14 @@ def export_history():
             writer.writerow([
                 trade['id'],
                 trade['entry_time_str'],
-                trade['exit_time_str'] if trade['exit_time_str'] else '',
+                trade.get('exit_time_str', ''),
                 trade['side'].upper(),
                 f"{trade['entry_price']:.2f}",
-                f"{trade['exit_price']:.2f}" if trade['exit_price'] else '',
+                f"{trade.get('exit_price', 0):.2f}" if trade.get('exit_price') else '',
                 f"{trade['quantity']:.4f}",
-                f"{trade['pnl_percent']:.4f}",
-                f"{trade['pnl_usdt']:.2f}",
-                trade['duration'] or '',
+                f"{trade.get('pnl_percent', 0):.4f}",
+                f"{trade.get('pnl_usdt', 0):.2f}",
+                trade.get('duration', ''),
                 trade['status']
             ])
         
