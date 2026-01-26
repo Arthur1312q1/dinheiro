@@ -1,5 +1,3 @@
-[file name]: main.py
-[file content begin]
 import os
 import sys
 import logging
@@ -765,4 +763,3 @@ if __name__ == '__main__':
     logger.info(f"🎯 Modo: SIMULAÇÃO (sem ordens reais)")
     
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
-[file content end]
