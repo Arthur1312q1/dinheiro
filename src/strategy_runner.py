@@ -64,7 +64,7 @@ class StrategyRunner:
             logger.error(f"Erro ao ler arquivo Pine Script: {e}")
             return None
     
-    # WebSocket methods (mantenha os existentes)
+    # WebSocket methods
     def _on_ws_message(self, ws, message):
         try:
             data = json.loads(message)
@@ -174,13 +174,15 @@ class StrategyRunner:
         buy_signal_raw = result.get('buy_signal_raw', False)
         sell_signal_raw = result.get('sell_signal_raw', False)
         
-        # Atualizar flags persistentes
+        # CORREÇÃO: Resetar sinais opostos quando um sinal é gerado
         if buy_signal_raw:
             self.pending_buy = True
+            self.pending_sell = False  # Resetar sinal de venda
             logger.info(f"   ✅ pendingBuy ATIVADO (executará na próxima barra)")
         
         if sell_signal_raw:
             self.pending_sell = True
+            self.pending_buy = False  # Resetar sinal de compra
             logger.info(f"   ✅ pendingSell ATIVADO (executará na próxima barra)")
         
         # SIMULAÇÃO: Executar trades baseado nos sinais
@@ -197,6 +199,12 @@ class StrategyRunner:
             quantity = self.okx_client.calculate_position_size()
             logger.info(f"   [SIMULAÇÃO] BUY {quantity:.4f} ETH")
             
+            # Verificar se a quantidade é válida
+            if quantity <= 0:
+                logger.error("❌ Quantidade inválida para BUY")
+                self.pending_buy = False
+                return
+            
             # Registrar nova trade no histórico
             trade_id = self.trade_history.add_trade(
                 side='buy',
@@ -211,7 +219,7 @@ class StrategyRunner:
             # Atualizar estado
             self.position_size = quantity
             self.position_side = 'long'
-            self.pending_buy = False
+            self.pending_buy = False  # Resetar após executar
         
         elif self.pending_sell and self.position_size >= 0:
             logger.info(f"🚀 SIMULAÇÃO: EXECUTANDO SELL")
@@ -224,6 +232,12 @@ class StrategyRunner:
             
             quantity = self.okx_client.calculate_position_size()
             logger.info(f"   [SIMULAÇÃO] SELL {quantity:.4f} ETH")
+            
+            # Verificar se a quantidade é válida
+            if quantity <= 0:
+                logger.error("❌ Quantidade inválida para SELL")
+                self.pending_sell = False
+                return
             
             # Registrar nova trade no histórico
             trade_id = self.trade_history.add_trade(
@@ -239,7 +253,7 @@ class StrategyRunner:
             # Atualizar estado
             self.position_size = -quantity
             self.position_side = 'short'
-            self.pending_sell = False
+            self.pending_sell = False  # Resetar após executar
     
     def start(self):
         """Inicia o strategy runner"""
@@ -270,8 +284,10 @@ class StrategyRunner:
                 result = self.interpreter.process_candle(candle)
                 if result.get('buy_signal_raw'):
                     self.pending_buy = True
+                    self.pending_sell = False  # Resetar sinal oposto
                 if result.get('sell_signal_raw'):
                     self.pending_sell = True
+                    self.pending_buy = False  # Resetar sinal oposto
             
             logger.info("   🔧 Indicadores aquecidos (EMA/EC calculados)")
             
@@ -336,13 +352,9 @@ class StrategyRunner:
         # CORREÇÃO: Verifica se o interpretador tem o atributo candle_count
         candles_processed = 0
         if self.interpreter:
-            # Tenta obter o candle_count de forma segura
             try:
                 if hasattr(self.interpreter, 'candle_count'):
                     candles_processed = self.interpreter.candle_count
-                else:
-                    # Se não tiver o atributo, tenta calcular de outra forma
-                    candles_processed = len(self.interpreter.series_data.get('src', []))
             except:
                 candles_processed = 0
         
