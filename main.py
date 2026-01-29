@@ -273,6 +273,22 @@ def debug_info():
     try:
         strategy_status = {}
         if strategy_runner:
+            # CORREÇÃO: Obtém candle_count de forma segura
+            candle_count_value = 0
+            if strategy_runner.interpreter:
+                try:
+                    # Verifica se o interpretador tem o atributo candle_count
+                    if hasattr(strategy_runner.interpreter, 'candle_count'):
+                        candle_count_value = strategy_runner.interpreter.candle_count
+                    else:
+                        # Alternativa: conta o número de candles processados
+                        if hasattr(strategy_runner.interpreter, 'series_data'):
+                            src_series = strategy_runner.interpreter.series_data.get('src', [])
+                            if hasattr(src_series, 'values'):
+                                candle_count_value = len(src_series.values)
+                except:
+                    candle_count_value = 0
+            
             strategy_status = {
                 "is_running": strategy_runner.is_running,
                 "current_price": strategy_runner.current_price,
@@ -282,7 +298,7 @@ def debug_info():
                 "position_size": strategy_runner.position_size,
                 "position_side": strategy_runner.position_side,
                 "interpreter_initialized": strategy_runner.interpreter is not None,
-                "candle_count": strategy_runner.interpreter.candle_count if strategy_runner.interpreter else 0,
+                "candle_count": candle_count_value,
                 "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if strategy_runner.last_bar_timestamp else None
             }
         
