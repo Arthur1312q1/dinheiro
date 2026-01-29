@@ -333,6 +333,19 @@ class StrategyRunner:
         """Retorna status detalhado para diagnóstico"""
         ws_status = "connected" if self.ws and self.ws.sock and self.ws.sock.connected else "disconnected"
         
+        # CORREÇÃO: Verifica se o interpretador tem o atributo candle_count
+        candles_processed = 0
+        if self.interpreter:
+            # Tenta obter o candle_count de forma segura
+            try:
+                if hasattr(self.interpreter, 'candle_count'):
+                    candles_processed = self.interpreter.candle_count
+                else:
+                    # Se não tiver o atributo, tenta calcular de outra forma
+                    candles_processed = len(self.interpreter.series_data.get('src', []))
+            except:
+                candles_processed = 0
+        
         return {
             "status": "running" if self.is_running else "stopped",
             "websocket": ws_status,
@@ -342,5 +355,5 @@ class StrategyRunner:
             "pending_sell": self.pending_sell,
             "position_size": self.position_size,
             "last_bar_time": self.last_bar_timestamp.strftime('%H:%M:%S') if self.last_bar_timestamp else None,
-            "candles_processed": self.interpreter.candle_count if self.interpreter else 0
+            "candles_processed": candles_processed
         }
