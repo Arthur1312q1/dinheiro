@@ -4,7 +4,9 @@ services:
     runtime: python
     region: singapore
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install -r requirements.txt
+      python init_bot.py
     startCommand: python main.py
     healthCheckPath: /health
     healthCheckInterval: 60s
@@ -20,13 +22,10 @@ services:
         value: "okx-eth-trading-bot"
         sync: false
       - key: OKX_API_KEY
-        value: ""
         sync: false
       - key: OKX_SECRET_KEY
-        value: ""
         sync: false
       - key: OKX_PASSPHRASE
-        value: ""
         sync: false
     disk:
       name: trade-history-data
