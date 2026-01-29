@@ -273,19 +273,13 @@ def debug_info():
     try:
         strategy_status = {}
         if strategy_runner:
-            # CORREÇÃO 1: Obtém candle_count de forma segura
+            # CORREÇÃO: Obtém candle_count de forma segura
             candle_count_value = 0
             if strategy_runner.interpreter:
                 try:
                     # Verifica se o interpretador tem o atributo candle_count
                     if hasattr(strategy_runner.interpreter, 'candle_count'):
                         candle_count_value = strategy_runner.interpreter.candle_count
-                    else:
-                        # Alternativa: conta o número de candles processados
-                        if hasattr(strategy_runner.interpreter, 'series_data'):
-                            src_series = strategy_runner.interpreter.series_data.get('src', [])
-                            if hasattr(src_series, 'values'):
-                                candle_count_value = len(src_series.values)
                 except:
                     candle_count_value = 0
             
@@ -302,20 +296,10 @@ def debug_info():
                 "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if strategy_runner.last_bar_timestamp else None
             }
         
-        # CORREÇÃO 2: Obtém trade_history_count de forma segura
+        # CORREÇÃO: Obtém trade_history_count de forma segura
         trade_history_count = 0
-        if trade_history:
-            try:
-                # Verifica se tem o atributo trades
-                if hasattr(trade_history, 'trades'):
-                    trade_history_count = len(trade_history.trades)
-                else:
-                    # Tenta obter de outra forma
-                    if hasattr(trade_history, 'get_all_trades'):
-                        all_trades = trade_history.get_all_trades()
-                        trade_history_count = len(all_trades) if all_trades else 0
-            except:
-                trade_history_count = 0
+        if trade_history and hasattr(trade_history, 'trades'):
+            trade_history_count = len(trade_history.trades)
         
         return jsonify({
             "trading_active": trading_active,
@@ -400,25 +384,8 @@ def history_page():
         if not trade_history:
             return "Sistema de histórico não inicializado", 500
         
-        # CORREÇÃO: Verifica se o método existe
-        if not hasattr(trade_history, 'get_all_trades'):
-            return "Método get_all_trades não encontrado", 500
-        
         trades = trade_history.get_all_trades(limit=100)
-        
-        # CORREÇÃO: Verifica se o método get_stats existe
-        stats = {}
-        if hasattr(trade_history, 'get_stats'):
-            stats = trade_history.get_stats()
-        else:
-            stats = {
-                'total_trades': 0,
-                'winning_trades': 0,
-                'losing_trades': 0,
-                'win_rate': 0,
-                'total_pnl_percent': 0,
-                'total_pnl_usdt': 0
-            }
+        stats = trade_history.get_stats()
         
         html = """
         <!DOCTYPE html>
@@ -462,32 +429,32 @@ def history_page():
                 <div class="stats">
                     <div class="stat-card">
                         <div>Total de Trades</div>
-                        <div class="stat-value">""" + str(stats.get('total_trades', 0)) + """</div>
+                        <div class="stat-value">""" + str(stats['total_trades']) + """</div>
                     </div>
                     <div class="stat-card">
                         <div>Trades Lucrativas</div>
-                        <div class="stat-value positive">""" + str(stats.get('winning_trades', 0)) + """</div>
+                        <div class="stat-value positive">""" + str(stats['winning_trades']) + """</div>
                     </div>
                     <div class="stat-card">
                         <div>Trades Prejudiciais</div>
-                        <div class="stat-value negative">""" + str(stats.get('losing_trades', 0)) + """</div>
+                        <div class="stat-value negative">""" + str(stats['losing_trades']) + """</div>
                     </div>
                     <div class="stat-card">
                         <div>Taxa de Acerto</div>
-                        <div class="stat-value """ + ("positive" if stats.get('win_rate', 0) > 50 else "negative") + """">
-                            """ + f"{stats.get('win_rate', 0):.1f}%" + """
+                        <div class="stat-value """ + ("positive" if stats['win_rate'] > 50 else "negative") + """">
+                            """ + f"{stats['win_rate']:.1f}%" + """
                         </div>
                     </div>
                     <div class="stat-card">
                         <div>Lucro Total %</div>
-                        <div class="stat-value """ + ("positive" if stats.get('total_pnl_percent', 0) > 0 else "negative") + """">
-                            """ + f"{stats.get('total_pnl_percent', 0):.4f}%" + """
+                        <div class="stat-value """ + ("positive" if stats['total_pnl_percent'] > 0 else "negative") + """">
+                            """ + f"{stats['total_pnl_percent']:.4f}%" + """
                         </div>
                     </div>
                     <div class="stat-card">
                         <div>Lucro Total USDT</div>
-                        <div class="stat-value """ + ("positive" if stats.get('total_pnl_usdt', 0) > 0 else "negative") + """">
-                            $""" + f"{stats.get('total_pnl_usdt', 0):.2f}" + """
+                        <div class="stat-value """ + ("positive" if stats['total_pnl_usdt'] > 0 else "negative") + """">
+                            $""" + f"{stats['total_pnl_usdt']:.2f}" + """
                         </div>
                     </div>
                 </div>
@@ -528,22 +495,21 @@ def history_page():
             """
             
             for trade in trades:
-                side_class = "side-buy" if trade.get('side') == 'buy' else "side-sell"
-                pnl_percent = trade.get('pnl_percent', 0)
-                pnl_class = "positive" if pnl_percent > 0 else "negative" if pnl_percent < 0 else ""
+                side_class = "side-buy" if trade['side'] == 'buy' else "side-sell"
+                pnl_class = "positive" if trade['pnl_percent'] > 0 else "negative" if trade['pnl_percent'] < 0 else ""
                 
                 html += f"""
                         <tr>
-                            <td><strong>#{trade.get('id', '')}</strong></td>
-                            <td>{trade.get('entry_time_str', '')}</td>
-                            <td class="{side_class}">{trade.get('side', '').upper()}</td>
-                            <td>${trade.get('entry_price', 0):.2f}</td>
-                            <td>{'$' + str(trade.get('exit_price', '')) if trade.get('exit_price') else '-'}</td>
-                            <td>{trade.get('quantity', 0):.4f} ETH</td>
-                            <td class="{pnl_class}">{trade.get('pnl_percent', 0):.4f}%</td>
-                            <td class="{pnl_class}">${trade.get('pnl_usdt', 0):.2f}</td>
-                            <td>{trade.get('duration', '-')}</td>
-                            <td>{'🟢' if trade.get('status') == 'open' else '✅' if trade.get('pnl_percent', 0) > 0 else '❌'}</td>
+                            <td><strong>#{trade['id']}</strong></td>
+                            <td>{trade['entry_time_str']}</td>
+                            <td class="{side_class}">{trade['side'].upper()}</td>
+                            <td>${trade['entry_price']:.2f}</td>
+                            <td>{'$' + str(trade['exit_price']) if trade['exit_price'] else '-'}</td>
+                            <td>{trade['quantity']:.4f} ETH</td>
+                            <td class="{pnl_class}">{trade['pnl_percent']:.4f}%</td>
+                            <td class="{pnl_class}">${trade['pnl_usdt']:.2f}</td>
+                            <td>{trade['duration'] or '-'}</td>
+                            <td>{'🟢' if trade['status'] == 'open' else '✅' if trade['pnl_percent'] > 0 else '❌'}</td>
                         </tr>
                 """
             
@@ -589,10 +555,6 @@ def history_page():
 def clear_history():
     if not trade_history:
         return jsonify({"success": False, "message": "Sistema de histórico não inicializado"}), 500
-    
-    # CORREÇÃO: Verifica se o método clear_history existe
-    if not hasattr(trade_history, 'clear_history'):
-        return jsonify({"success": False, "message": "Método clear_history não encontrado"}), 500
     
     trade_history.clear_history()
     return jsonify({"success": True, "message": "Histórico limpo."})
