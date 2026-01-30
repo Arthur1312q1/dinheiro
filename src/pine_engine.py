@@ -29,6 +29,9 @@ class PineSeries:
     
     def current(self) -> float:
         return self.values[-1] if self.values else 0.0
+    
+    def __len__(self):
+        return len(self.values)
 
 class PineScriptInterpreter:
     """Interpreta e executa código Pine Script v3"""
@@ -38,13 +41,8 @@ class PineScriptInterpreter:
         self.symbol_table = {}
         self.series_data = {}
         
-        # ADICIONEI AQUI: Contador de candles
+        # Contador de candles processados
         self.candle_count = 0
-        
-        # Constantes do Pine Script
-        self.symbol_table['PI'] = 3.14159265359
-        self.symbol_table['true'] = True
-        self.symbol_table['false'] = False
         
         # Configurações da estratégia (extraídas do código)
         self.params = self._extract_parameters()
@@ -67,8 +65,9 @@ class PineScriptInterpreter:
         # Inicializa métodos adaptativos
         self._init_adaptive_methods()
         
-        logger.info(f"✅ Pine Script Interpreter inicializado: Period={self.period}, "
-                   f"Threshold={self.threshold}, GainLimit={self.gain_limit}")
+        logger.info(f"✅ Pine Script Interpreter inicializado")
+        logger.info(f"   Period={self.period}, Threshold={self.threshold}, GainLimit={self.gain_limit}")
+        logger.info(f"   Código Pine tamanho: {len(pine_code)} bytes")
     
     def _extract_parameters(self) -> Dict[str, Any]:
         """Extrai parâmetros do código Pine Script"""
@@ -126,7 +125,7 @@ class PineScriptInterpreter:
         
         # Inicializar EC se necessário
         ec_prev = self.series_data['EC'].current()
-        if ec_prev == 0 and len(self.series_data['EC'].values) == 1:
+        if ec_prev == 0 and len(self.series_data['EC']) == 1:
             ec_prev = src
         
         # Buscar melhor ganho
@@ -160,9 +159,7 @@ class PineScriptInterpreter:
         A execução é controlada pelo StrategyRunner.
         candle: {'open': x, 'high': x, 'low': x, 'close': x, 'volume': x}
         """
-        # ADICIONEI AQUI: Incrementa o contador
         self.candle_count += 1
-        
         src = candle['close']
         self.series_data['src'].append(src)
         
@@ -171,8 +168,8 @@ class PineScriptInterpreter:
         
         # 2. Verificar sinais RAW
         # Precisamos de valores anteriores para crossover/crossunder
-        ec_prev = self.series_data['EC'][1] if len(self.series_data['EC'].values) > 1 else ec
-        ema_prev = self.series_data['EMA'][1] if len(self.series_data['EMA'].values) > 1 else ema
+        ec_prev = self.series_data['EC'][1] if len(self.series_data['EC']) > 1 else ec
+        ema_prev = self.series_data['EMA'][1] if len(self.series_data['EMA']) > 1 else ema
         
         # Crossover (EC cruza EMA para cima) - igual a crossover(EC, EMA) no Pine
         crossover_signal = (ec_prev <= ema_prev) and (ec > ema)
@@ -188,26 +185,36 @@ class PineScriptInterpreter:
         buy_signal_raw = crossover_signal and threshold_check
         sell_signal_raw = crossunder_signal and threshold_check
         
-        # 3. Resultado (SOMENTE sinais RAW, sem execução)
+        # Log detalhado para primeiros candles ou quando há sinal
+        if self.candle_count <= 10 or buy_signal_raw or sell_signal_raw:
+            logger.info(f"📊 Candle #{self.candle_count}: Preço=${src:.2f}")
+            logger.info(f"   EMA={ema:.2f}, EC={ec:.2f}, Erro={error_pct:.2f}%")
+            logger.info(f"   EC anterior={ec_prev:.2f}, EMA anterior={ema_prev:.2f}")
+            logger.info(f"   Crossover: {crossover_signal}, Crossunder: {crossunder_signal}")
+            logger.info(f"   Threshold check ({error_pct:.2f}% > {self.threshold}): {threshold_check}")
+            
+            if buy_signal_raw:
+                logger.info(f"   🟢🟢🟢 SINAL BUY RAW DETECTADO! 🟢🟢🟢")
+            elif sell_signal_raw:
+                logger.info(f"   🔴🔴🔴 SINAL SELL RAW DETECTADO! 🔴🔴🔴")
+        
+        # 3. Resultado
         result = {
-            'signal': 'HOLD',  # Sempre HOLD - execução é no StrategyRunner
+            'signal': 'HOLD',
             'strength': 0,
-            'buy_signal_raw': buy_signal_raw,    # Para usar na PRÓXIMA barra
-            'sell_signal_raw': sell_signal_raw,  # Para usar na PRÓXIMA barra
+            'buy_signal_raw': buy_signal_raw,
+            'sell_signal_raw': sell_signal_raw,
             'price': src,
             'ema': ema,
             'ec': ec,
             'least_error': least_error,
             'error_pct': error_pct,
-            'candle_number': self.candle_count,  # ADICIONEI: Número do candle
-            'timestamp': datetime.now().isoformat()
+            'candle_number': self.candle_count,
+            'timestamp': datetime.now().isoformat(),
+            'crossover': crossover_signal,
+            'crossunder': crossunder_signal,
+            'threshold_check': threshold_check
         }
-        
-        # Log detalhado apenas quando há sinal RAW
-        if buy_signal_raw or sell_signal_raw:
-            logger.info(f"📊 Candle {self.candle_count}: Preço=${src:.2f}")
-            logger.info(f"   EMA={ema:.2f}, EC={ec:.2f}, Erro={error_pct:.2f}%")
-            logger.info(f"   Sinal RAW: {'BUY' if buy_signal_raw else 'SELL' if sell_signal_raw else 'NONE'}")
         
         return result
     
@@ -222,7 +229,6 @@ class PineScriptInterpreter:
         self.series_data['buy_signal'] = PineSeries([0.0])
         self.series_data['sell_signal'] = PineSeries([0.0])
         
-        # ADICIONEI AQUI: Reseta o contador
         self.candle_count = 0
         
         logger.info("🔄 Pine Script Interpreter resetado")
