@@ -112,7 +112,7 @@ def start_strategy_automatically():
         return
     
     try:
-        logger.info("🚀 Tentando iniciar estratégia automaticamente...")
+        logger.info("🚀 Iniciando estratégia automaticamente no Render...")
         
         # Iniciar o strategy runner
         if strategy_runner.start():
@@ -123,6 +123,7 @@ def start_strategy_automatically():
                 
                 # Contador para logs periódicos
                 last_status_log = time.time()
+                consecutive_errors = 0
                 
                 while trading_active and strategy_runner:
                     try:
@@ -133,16 +134,22 @@ def start_strategy_automatically():
                         current_time = time.time()
                         if current_time - last_status_log > 60:
                             if strategy_runner.current_price:
-                                logger.info(f"📈 Status: Preço ${strategy_runner.current_price:.2f} | "
-                                          f"Barras: {strategy_runner.bar_count} | "
-                                          f"Pending Buy: {strategy_runner.pending_buy} | "
-                                          f"Pending Sell: {strategy_runner.pending_sell}")
+                                logger.info(f"📈 Status Bot: Preço ${strategy_runner.current_price:.2f}")
+                                logger.info(f"   Barras processadas: {strategy_runner.bar_count}")
+                                logger.info(f"   Pending Buy: {strategy_runner.pending_buy}")
+                                logger.info(f"   Pending Sell: {strategy_runner.pending_sell}")
+                                logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
                             last_status_log = current_time
                         
                         time.sleep(1)  # Loop principal (1 segundo)
+                        consecutive_errors = 0  # Resetar contador de erros
                         
                     except Exception as e:
-                        logger.error(f"💥 Erro no loop de trading: {e}")
+                        consecutive_errors += 1
+                        logger.error(f"💥 Erro no loop de trading ({consecutive_errors}): {e}")
+                        if consecutive_errors > 10:
+                            logger.error("🔴 Muitos erros consecutivos, parando loop...")
+                            break
                         time.sleep(5)  # Aguarda 5 segundos em caso de erro
             
             # Iniciar thread de trading
@@ -217,6 +224,7 @@ def home():
                 <a href="/debug">🐛 Debug</a>
                 <a href="/health">❤️ Saúde</a>
                 <a href="/test-auth">🔐 Testar OKX</a>
+                <a href="/restart">🔄 Reiniciar Estratégia</a>
             </div>
             
             <div class="info">
@@ -259,25 +267,16 @@ def health():
         "environment": "render" if IS_RENDER else "local"
     })
 
-@app.route('/ping-internal-1')
-def ping1():
-    return jsonify({"status": "pong1", "time": datetime.now().isoformat()})
-
-@app.route('/ping-internal-2')
-def ping2():
-    return jsonify({"status": "pong2", "time": datetime.now().isoformat()})
-
 @app.route('/debug')
 def debug_info():
     """Endpoint para diagnóstico"""
     try:
         strategy_status = {}
         if strategy_runner:
-            # CORREÇÃO: Obtém candle_count de forma segura
+            # Obtém candle_count de forma segura
             candle_count_value = 0
             if strategy_runner.interpreter:
                 try:
-                    # Verifica se o interpretador tem o atributo candle_count
                     if hasattr(strategy_runner.interpreter, 'candle_count'):
                         candle_count_value = strategy_runner.interpreter.candle_count
                 except:
@@ -296,7 +295,7 @@ def debug_info():
                 "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if strategy_runner.last_bar_timestamp else None
             }
         
-        # CORREÇÃO: Obtém trade_history_count de forma segura
+        # Obtém trade_history_count de forma segura
         trade_history_count = 0
         if trade_history and hasattr(trade_history, 'trades'):
             trade_history_count = len(trade_history.trades)
@@ -312,6 +311,37 @@ def debug_info():
             "current_time": datetime.now().isoformat()
         })
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/restart')
+def restart_strategy():
+    """Reinicia a estratégia"""
+    global trading_active
+    
+    if not strategy_runner:
+        return jsonify({"error": "Strategy Runner não inicializado"}), 500
+    
+    try:
+        # Parar estratégia atual
+        if trading_active:
+            strategy_runner.stop()
+            trading_active = False
+            time.sleep(2)
+        
+        # Resetar interpretador
+        if strategy_runner.interpreter:
+            strategy_runner.interpreter.reset()
+        
+        # Reiniciar estratégia
+        if strategy_runner.start():
+            trading_active = True
+            logger.info("🔄 Estratégia reiniciada com sucesso")
+            return jsonify({"success": True, "message": "Estratégia reiniciada"})
+        else:
+            return jsonify({"error": "Falha ao reiniciar estratégia"}), 500
+            
+    except Exception as e:
+        logger.error(f"Erro ao reiniciar estratégia: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/start', methods=['POST'])
