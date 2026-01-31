@@ -49,8 +49,11 @@ class PineScriptInterpreter:
         
         # Estado da execução
         self.period = self.params.get('Period', 20)
-        self.gain_limit = self.params.get('GainLimit', 8)
-        self.threshold = self.params.get('Threshold', 0.05)
+        self.gain_limit = self.params.get('GainLimit', 900)  # CORREÇÃO: 900 do Pine Script
+        self.threshold = self.params.get('Threshold', 0.0)   # CORREÇÃO: 0.0 do Pine Script
+        self.fixedSL = self.params.get('fixedSL', 2000)      # NOVO: extrair SL
+        self.fixedTP = self.params.get('fixedTP', 55)        # NOVO: extrair TP
+        self.risk = self.params.get('risk', 0.01)           # NOVO: extrair risk
         
         # Séries temporais
         self.series_data['src'] = PineSeries([])
@@ -67,10 +70,11 @@ class PineScriptInterpreter:
         
         logger.info(f"✅ Pine Script Interpreter inicializado")
         logger.info(f"   Period={self.period}, Threshold={self.threshold}, GainLimit={self.gain_limit}")
+        logger.info(f"   fixedSL={self.fixedSL}, fixedTP={self.fixedTP}, risk={self.risk}")
         logger.info(f"   Código Pine tamanho: {len(pine_code)} bytes")
     
     def _extract_parameters(self) -> Dict[str, Any]:
-        """Extrai parâmetros do código Pine Script"""
+        """Extrai parâmetros do código Pine Script CORRETAMENTE"""
         params = {}
         
         # Padrões para encontrar valores default
@@ -94,6 +98,20 @@ class PineScriptInterpreter:
                     params[key] = float(value)
                 else:
                     params[key] = value
+        
+        # Valores padrão se não encontrar
+        defaults = {
+            'fixedSL': 2000,
+            'fixedTP': 55,
+            'risk': 0.01,
+            'Period': 20,
+            'Threshold': 0.0,  # CORREÇÃO: 0.0 do Pine Script original
+            'GainLimit': 900   # CORREÇÃO: 900 do Pine Script original
+        }
+        
+        for key, default in defaults.items():
+            if key not in params:
+                params[key] = default
         
         return params
     
@@ -133,9 +151,16 @@ class PineScriptInterpreter:
         best_gain = 0.0
         least_error = float('inf')
         
-        # Testar ganhos de -GainLimit a +GainLimit (passo 0.1)
-        for i in range(-self.gain_limit, self.gain_limit + 1):
-            gain = i / 10.0
+        # CORREÇÃO: Testar ganhos de -GainLimit a +GainLimit (passo 0.1)
+        # Como no Pine Script: for i = -GainLimit to GainLimit
+        # Gain := i/10.0
+        gain_step = 0.1
+        start_gain = -self.gain_limit * gain_step
+        end_gain = self.gain_limit * gain_step
+        
+        i = start_gain
+        while i <= end_gain:
+            gain = i
             
             # Calcular EC com este ganho
             ec_test = alpha * (ema + gain * (src - ec_prev)) + (1 - alpha) * ec_prev
@@ -144,6 +169,8 @@ class PineScriptInterpreter:
             if error < least_error:
                 least_error = error
                 best_gain = gain
+            
+            i += gain_step
         
         # Calcular EC final com melhor ganho
         ec = alpha * (ema + best_gain * (src - ec_prev)) + (1 - alpha) * ec_prev
@@ -177,7 +204,8 @@ class PineScriptInterpreter:
         # Crossunder (EC cruza EMA para baixo) - igual a crossunder(EC, EMA) no Pine
         crossunder_signal = (ec_prev >= ema_prev) and (ec < ema)
         
-        # Aplicar threshold (100*LeastError/src > Threshold)
+        # CORREÇÃO: Aplicar threshold (100*LeastError/src > Threshold)
+        # No Pine Script original: 100*LeastError/src > Threshold
         error_pct = 100 * least_error / src if src > 0 else 0
         threshold_check = error_pct > self.threshold
         
