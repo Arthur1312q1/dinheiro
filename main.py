@@ -136,12 +136,16 @@ def start_strategy_automatically():
                             if strategy_runner.current_price:
                                 logger.info(f"📈 Status Bot: Preço ${strategy_runner.current_price:.2f}")
                                 logger.info(f"   Barras processadas: {strategy_runner.bar_count}")
-                                logger.info(f"   Próxima barra - Sinal BUY: {strategy_runner.next_bar_buy_signal}")
-                                logger.info(f"   Próxima barra - Sinal SELL: {strategy_runner.next_bar_sell_signal}")
+                                logger.info(f"   Sinal BUY pendente: {strategy_runner.pending_buy_signal}")
+                                logger.info(f"   Sinal SELL pendente: {strategy_runner.pending_sell_signal}")
                                 logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
                                 logger.info(f"   Lado: {strategy_runner.position_side}")
                                 if strategy_runner.entry_price:
                                     logger.info(f"   Preço entrada: ${strategy_runner.entry_price:.2f}")
+                                if strategy_runner.stop_loss_price:
+                                    logger.info(f"   Stop Loss: ${strategy_runner.stop_loss_price:.2f}")
+                                if strategy_runner.take_profit_price:
+                                    logger.info(f"   Take Profit: ${strategy_runner.take_profit_price:.2f}")
                             last_status_log = current_time
                         
                         time.sleep(1)  # Loop principal (1 segundo)
@@ -289,14 +293,17 @@ def debug_info():
                 "is_running": strategy_runner.is_running,
                 "current_price": strategy_runner.current_price,
                 "bar_count": strategy_runner.bar_count,
-                "next_bar_buy_signal": getattr(strategy_runner, 'next_bar_buy_signal', False),
-                "next_bar_sell_signal": getattr(strategy_runner, 'next_bar_sell_signal', False),
+                "pending_buy_signal": getattr(strategy_runner, 'pending_buy_signal', False),
+                "pending_sell_signal": getattr(strategy_runner, 'pending_sell_signal', False),
                 "position_size": strategy_runner.position_size,
                 "position_side": strategy_runner.position_side,
                 "entry_price": getattr(strategy_runner, 'entry_price', None),
+                "stop_loss_price": getattr(strategy_runner, 'stop_loss_price', None),
+                "take_profit_price": getattr(strategy_runner, 'take_profit_price', None),
                 "interpreter_initialized": strategy_runner.interpreter is not None,
                 "candle_count": candle_count_value,
-                "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if hasattr(strategy_runner, 'last_bar_timestamp') and strategy_runner.last_bar_timestamp else None
+                "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if hasattr(strategy_runner, 'last_bar_timestamp') and strategy_runner.last_bar_timestamp else None,
+                "strategy_params": strategy_runner.interpreter.params if strategy_runner.interpreter else {}
             }
         
         # Obtém trade_history_count de forma segura
@@ -382,12 +389,16 @@ def start_trading():
                         if strategy_runner.current_price:
                             logger.info(f"📈 Status Bot: Preço ${strategy_runner.current_price:.2f}")
                             logger.info(f"   Barras processadas: {strategy_runner.bar_count}")
-                            logger.info(f"   Próxima barra - Sinal BUY: {strategy_runner.next_bar_buy_signal}")
-                            logger.info(f"   Próxima barra - Sinal SELL: {strategy_runner.next_bar_sell_signal}")
+                            logger.info(f"   Sinal BUY pendente: {strategy_runner.pending_buy_signal}")
+                            logger.info(f"   Sinal SELL pendente: {strategy_runner.pending_sell_signal}")
                             logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
                             logger.info(f"   Lado: {strategy_runner.position_side}")
                             if strategy_runner.entry_price:
                                 logger.info(f"   Preço entrada: ${strategy_runner.entry_price:.2f}")
+                            if strategy_runner.stop_loss_price:
+                                logger.info(f"   Stop Loss: ${strategy_runner.stop_loss_price:.2f}")
+                            if strategy_runner.take_profit_price:
+                                logger.info(f"   Take Profit: ${strategy_runner.take_profit_price:.2f}")
                         last_status_log = current_time
                     
                     time.sleep(1)  # Loop principal (1 segundo)
@@ -431,20 +442,26 @@ def status():
     price = strategy_runner.current_price if strategy_runner else None
     balance = okx_client.get_balance() if okx_client else 0
     
-    # Obter sinais da próxima barra
-    next_buy = getattr(strategy_runner, 'next_bar_buy_signal', False) if strategy_runner else False
-    next_sell = getattr(strategy_runner, 'next_bar_sell_signal', False) if strategy_runner else False
+    # Obter sinais pendentes
+    pending_buy = getattr(strategy_runner, 'pending_buy_signal', False) if strategy_runner else False
+    pending_sell = getattr(strategy_runner, 'pending_sell_signal', False) if strategy_runner else False
     entry_price = getattr(strategy_runner, 'entry_price', None) if strategy_runner else None
+    stop_loss = getattr(strategy_runner, 'stop_loss_price', None) if strategy_runner else None
+    take_profit = getattr(strategy_runner, 'take_profit_price', None) if strategy_runner else None
+    position_side = getattr(strategy_runner, 'position_side', None) if strategy_runner else None
+    position_size = getattr(strategy_runner, 'position_size', 0) if strategy_runner else 0
     
     return jsonify({
         "trading_active": trading_active,
         "current_price": price,
         "balance_usdt": balance,
-        "next_bar_buy_signal": next_buy,
-        "next_bar_sell_signal": next_sell,
-        "position_size": strategy_runner.position_size if strategy_runner else 0,
-        "position_side": strategy_runner.position_side if strategy_runner else None,
+        "pending_buy_signal": pending_buy,
+        "pending_sell_signal": pending_sell,
+        "position_size": position_size,
+        "position_side": position_side,
         "entry_price": entry_price,
+        "stop_loss_price": stop_loss,
+        "take_profit_price": take_profit,
         "environment": "render" if IS_RENDER else "local",
         "simulation_mode": True
     })
