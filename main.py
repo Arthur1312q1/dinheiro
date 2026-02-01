@@ -15,7 +15,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, 'src')
 sys.path.insert(0, src_path)
 
-# Configurar logging para Render
+# Configurar logging para Render - MAIS DETALHADO
 if os.getenv('RENDER', '').lower() == 'true':
     logging.basicConfig(
         level=logging.INFO,
@@ -124,28 +124,32 @@ def start_strategy_automatically():
                 # Contador para logs periódicos
                 last_status_log = time.time()
                 consecutive_errors = 0
+                last_bar_logged = None
                 
                 while trading_active and strategy_runner:
                     try:
                         # Executar estratégia
                         status = strategy_runner.run_strategy_realtime()
                         
-                        # Log periódico a cada 60 segundos
+                        # Log detalhado a cada nova barra
+                        if strategy_runner.last_bar_timestamp and strategy_runner.last_bar_timestamp != last_bar_logged:
+                            logger.info("=" * 60)
+                            logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} PROCESSADA")
+                            logger.info(f"   Preço: ${strategy_runner.current_price:.2f}")
+                            logger.info(f"   Sinal BUY pendente: {strategy_runner.pending_buy_signal}")
+                            logger.info(f"   Sinal SELL pendente: {strategy_runner.pending_sell_signal}")
+                            logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
+                            logger.info(f"   Lado: {strategy_runner.position_side}")
+                            if strategy_runner.entry_price:
+                                logger.info(f"   Entrada: ${strategy_runner.entry_price:.2f}")
+                            logger.info("=" * 60)
+                            last_bar_logged = strategy_runner.last_bar_timestamp
+                        
+                        # Log periódico a cada 30 segundos
                         current_time = time.time()
-                        if current_time - last_status_log > 60:
+                        if current_time - last_status_log > 30:
                             if strategy_runner.current_price:
-                                logger.info(f"📈 Status Bot: Preço ${strategy_runner.current_price:.2f}")
-                                logger.info(f"   Barras processadas: {strategy_runner.bar_count}")
-                                logger.info(f"   Sinal BUY pendente: {strategy_runner.pending_buy_signal}")
-                                logger.info(f"   Sinal SELL pendente: {strategy_runner.pending_sell_signal}")
-                                logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
-                                logger.info(f"   Lado: {strategy_runner.position_side}")
-                                if strategy_runner.entry_price:
-                                    logger.info(f"   Preço entrada: ${strategy_runner.entry_price:.2f}")
-                                if strategy_runner.stop_loss_price:
-                                    logger.info(f"   Stop Loss: ${strategy_runner.stop_loss_price:.2f}")
-                                if strategy_runner.take_profit_price:
-                                    logger.info(f"   Take Profit: ${strategy_runner.take_profit_price:.2f}")
+                                logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH")
                             last_status_log = current_time
                         
                         time.sleep(1)  # Loop principal (1 segundo)
@@ -210,10 +214,16 @@ def home():
                 <h1>⚡ Bot Trading ETH/USDT</h1>
                 <p>Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Modo: SIMULAÇÃO</p>
                 <p><strong>Ambiente:</strong> """ + ("🌍 RENDER" if IS_RENDER else "💻 LOCAL") + """</p>
+                <p><strong>Status:</strong> {{ '🟢 ATIVO' if trading_active else '🔴 INATIVO' }}</p>
             </div>
             
-            <div class="status {{ 'active' if trading_active else 'inactive' }}">
-                {{ '🟢 ATIVO - Simulando (sem ordens reais)' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
+            <div class="menu">
+                <a href="/status">📊 Status</a>
+                <a href="/history">📜 Histórico</a>
+                <a href="/debug">🐛 Debug</a>
+                <a href="/health">❤️ Saúde</a>
+                <a href="/test-auth">🔐 Testar OKX</a>
+                <a href="/restart">🔄 Reiniciar</a>
             </div>
             
             <div>
@@ -225,17 +235,9 @@ def home():
                 </button>
             </div>
             
-            <div class="menu">
-                <a href="/status">📊 Status</a>
-                <a href="/history">📜 Histórico</a>
-                <a href="/debug">🐛 Debug</a>
-                <a href="/health">❤️ Saúde</a>
-                <a href="/test-auth">🔐 Testar OKX</a>
-                <a href="/restart">🔄 Reiniciar Estratégia</a>
-            </div>
-            
             <div class="info">
-                <strong>⚠️ MODO SIMULAÇÃO ATIVO:</strong> Nenhuma ordem real será enviada à OKX.
+                <strong>⚠️ MODO SIMULAÇÃO ATIVO:</strong> Nenhuma ordem real será enviada à OKX.<br>
+                <strong>⏰ Timeframe:</strong> 30 minutos • <strong>Horário:</strong> Brasília (BRT)
             </div>
         </div>
         
@@ -271,21 +273,23 @@ def health():
         "service": "OKX ETH Trading Bot",
         "trading_active": trading_active,
         "timestamp": datetime.now().isoformat(),
-        "environment": "render" if IS_RENDER else "local"
+        "environment": "render" if IS_RENDER else "local",
+        "uptime_seconds": round(time.time() - start_time, 2)
     })
 
 @app.route('/debug')
 def debug_info():
-    """Endpoint para diagnóstico"""
+    """Endpoint para diagnóstico DETALHADO"""
     try:
         strategy_status = {}
         if strategy_runner:
             # Obtém candle_count de forma segura
             candle_count_value = 0
+            pine_params = {}
             if strategy_runner.interpreter:
                 try:
-                    if hasattr(strategy_runner.interpreter, 'candle_count'):
-                        candle_count_value = strategy_runner.interpreter.candle_count
+                    candle_count_value = strategy_runner.interpreter.candle_count
+                    pine_params = strategy_runner.interpreter.params
                 except:
                     candle_count_value = 0
             
@@ -303,7 +307,9 @@ def debug_info():
                 "interpreter_initialized": strategy_runner.interpreter is not None,
                 "candle_count": candle_count_value,
                 "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if hasattr(strategy_runner, 'last_bar_timestamp') and strategy_runner.last_bar_timestamp else None,
-                "strategy_params": strategy_runner.interpreter.params if strategy_runner.interpreter else {}
+                "next_bar_time": strategy_runner.get_next_bar_time().isoformat() if hasattr(strategy_runner, 'get_next_bar_time') else None,
+                "pine_params": pine_params,
+                "websocket_connected": getattr(strategy_runner, 'ws', None) and getattr(strategy_runner.ws, 'sock', None) and strategy_runner.ws.sock.connected
             }
         
         # Obtém trade_history_count de forma segura
@@ -319,14 +325,15 @@ def debug_info():
             "okx_initialized": okx_client is not None,
             "trade_history_count": trade_history_count,
             "uptime_seconds": round(time.time() - start_time, 2),
-            "current_time": datetime.now().isoformat()
+            "current_time": datetime.now().isoformat(),
+            "brasilia_time": datetime.now().astimezone(strategy_runner.tz_brazil if strategy_runner else None).isoformat() if strategy_runner else None
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/restart')
 def restart_strategy():
-    """Reinicia a estratégia"""
+    """Reinicia a estratégia completamente"""
     global trading_active
     
     if not strategy_runner:
@@ -339,7 +346,7 @@ def restart_strategy():
             trading_active = False
             time.sleep(2)
         
-        # Resetar interpretador
+        # Resetar completamente
         if strategy_runner.interpreter:
             strategy_runner.interpreter.reset()
         
@@ -347,7 +354,7 @@ def restart_strategy():
         if strategy_runner.start():
             trading_active = True
             logger.info("🔄 Estratégia reiniciada com sucesso")
-            return jsonify({"success": True, "message": "Estratégia reiniciada"})
+            return jsonify({"success": True, "message": "Estratégia reiniciada completamente"})
         else:
             return jsonify({"error": "Falha ao reiniciar estratégia"}), 500
             
@@ -377,32 +384,36 @@ def start_trading():
             # Contador para logs periódicos
             last_status_log = time.time()
             consecutive_errors = 0
+            last_bar_logged = None
             
             while trading_active and strategy_runner:
                 try:
                     # Executar estratégia
                     status = strategy_runner.run_strategy_realtime()
                     
-                    # Log periódico a cada 60 segundos
+                    # Log detalhado a cada nova barra
+                    if strategy_runner.last_bar_timestamp and strategy_runner.last_bar_timestamp != last_bar_logged:
+                        logger.info("=" * 60)
+                        logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} PROCESSADA")
+                        logger.info(f"   Preço: ${strategy_runner.current_price:.2f}")
+                        logger.info(f"   Sinal BUY pendente: {strategy_runner.pending_buy_signal}")
+                        logger.info(f"   Sinal SELL pendente: {strategy_runner.pending_sell_signal}")
+                        logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
+                        logger.info(f"   Lado: {strategy_runner.position_side}")
+                        if strategy_runner.entry_price:
+                            logger.info(f"   Entrada: ${strategy_runner.entry_price:.2f}")
+                        logger.info("=" * 60)
+                        last_bar_logged = strategy_runner.last_bar_timestamp
+                    
+                    # Log periódico a cada 30 segundos
                     current_time = time.time()
-                    if current_time - last_status_log > 60:
+                    if current_time - last_status_log > 30:
                         if strategy_runner.current_price:
-                            logger.info(f"📈 Status Bot: Preço ${strategy_runner.current_price:.2f}")
-                            logger.info(f"   Barras processadas: {strategy_runner.bar_count}")
-                            logger.info(f"   Sinal BUY pendente: {strategy_runner.pending_buy_signal}")
-                            logger.info(f"   Sinal SELL pendente: {strategy_runner.pending_sell_signal}")
-                            logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
-                            logger.info(f"   Lado: {strategy_runner.position_side}")
-                            if strategy_runner.entry_price:
-                                logger.info(f"   Preço entrada: ${strategy_runner.entry_price:.2f}")
-                            if strategy_runner.stop_loss_price:
-                                logger.info(f"   Stop Loss: ${strategy_runner.stop_loss_price:.2f}")
-                            if strategy_runner.take_profit_price:
-                                logger.info(f"   Take Profit: ${strategy_runner.take_profit_price:.2f}")
+                            logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH")
                         last_status_log = current_time
                     
-                    time.sleep(1)  # Loop principal (1 segundo)
-                    consecutive_errors = 0  # Resetar contador de erros
+                    time.sleep(1)
+                    consecutive_errors = 0
                     
                 except Exception as e:
                     consecutive_errors += 1
@@ -410,7 +421,7 @@ def start_trading():
                     if consecutive_errors > 10:
                         logger.error("🔴 Muitos erros consecutivos, parando loop...")
                         break
-                    time.sleep(5)  # Aguarda 5 segundos em caso de erro
+                    time.sleep(5)
         
         trade_thread = threading.Thread(target=trading_loop, daemon=True)
         trade_thread.start()
@@ -450,6 +461,7 @@ def status():
     take_profit = getattr(strategy_runner, 'take_profit_price', None) if strategy_runner else None
     position_side = getattr(strategy_runner, 'position_side', None) if strategy_runner else None
     position_size = getattr(strategy_runner, 'position_size', 0) if strategy_runner else 0
+    last_bar = strategy_runner.last_bar_timestamp.strftime('%H:%M') if strategy_runner and strategy_runner.last_bar_timestamp else None
     
     return jsonify({
         "trading_active": trading_active,
@@ -462,6 +474,7 @@ def status():
         "entry_price": entry_price,
         "stop_loss_price": stop_loss,
         "take_profit_price": take_profit,
+        "last_bar_timestamp": last_bar,
         "environment": "render" if IS_RENDER else "local",
         "simulation_mode": True
     })
