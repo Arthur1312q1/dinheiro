@@ -1,5 +1,5 @@
 """
-Motor de Execução Pine Script v3 - VERSÃO FINAL
+Motor de Execução Pine Script v3 - VERSÃO FINAL OTIMIZADA
 Interpreta e executa estratégias Pine Script diretamente em Python
 """
 import re
@@ -240,17 +240,20 @@ class PineScriptInterpreter:
         self.series_data['pendingSell'].append(pending_sell_new)
         
         # 9. Determinar sinais para execução (baseado nos pendentes)
-        # No Pine: if (pendingBuy and strategy.position_size <= 0)
-        #          if (pendingSell and strategy.position_size >= 0)
         pending_buy_for_execution = pending_buy_new > 0
         pending_sell_for_execution = pending_sell_new > 0
         
-        # 10. Log detalhado (apenas para debugging)
+        # 10. LOGS DETALHADOS - CRÍTICO PARA DEBUG
         if self.candle_count <= 10 or buy_signal_current or sell_signal_current or pending_buy_for_execution or pending_sell_for_execution:
             logger.info(f"📊 Candle #{self.candle_count}: Preço=${src:.2f}")
             logger.info(f"   EMA={ema:.2f}, EC={ec:.2f}, EC_prev={ec_prev:.2f}, EMA_prev={ema_prev:.2f}")
             logger.info(f"   Erro={error_pct:.2f}%, Threshold={self.threshold}")
-            logger.info(f"   Crossover: {crossover_signal}, Crossunder: {crossunder_signal}")
+            
+            # DEBUG EXTRA: Log de crossover/crossunder
+            if crossover_signal:
+                logger.info(f"   🟢 CRUZAMENTO PARA CIMA DETECTADO: EC ({ec:.2f}) > EMA ({ema:.2f})")
+            if crossunder_signal:
+                logger.info(f"   🔴 CRUZAMENTO PARA BAIXO DETECTADO: EC ({ec:.2f}) < EMA ({ema:.2f})")
             
             if buy_signal_current:
                 logger.info(f"   🟢 SINAL BUY NA BARRA ATUAL (executará na próxima)")
@@ -287,6 +290,10 @@ class PineScriptInterpreter:
             'ec_prev': ec_prev,
             'ema_prev': ema_prev,
             
+            # Sinais cruzados
+            'crossover': crossover_signal,
+            'crossunder': crossunder_signal,
+            
             # Estado interno (debug)
             'buy_signal_prev': buy_signal_prev,
             'sell_signal_prev': sell_signal_prev
@@ -308,3 +315,18 @@ class PineScriptInterpreter:
         self.candle_count = 0
         
         logger.info("🔄 Pine Script Interpreter resetado")
+    
+    def get_diagnostic_info(self):
+        """Retorna informações de diagnóstico"""
+        return {
+            'candle_count': self.candle_count,
+            'params': self.params,
+            'ec_current': self.series_data['EC'].current() if 'EC' in self.series_data else 0,
+            'ema_current': self.series_data['EMA'].current() if 'EMA' in self.series_data else 0,
+            'ec_prev': self.series_data['EC'][1] if 'EC' in self.series_data and len(self.series_data['EC']) > 1 else 0,
+            'ema_prev': self.series_data['EMA'][1] if 'EMA' in self.series_data and len(self.series_data['EMA']) > 1 else 0,
+            'pending_buy': self.series_data['pendingBuy'].current() if 'pendingBuy' in self.series_data else 0,
+            'pending_sell': self.series_data['pendingSell'].current() if 'pendingSell' in self.series_data else 0,
+            'buy_signal_prev': self.series_data['buy_signal'].current() if 'buy_signal' in self.series_data else 0,
+            'sell_signal_prev': self.series_data['sell_signal'].current() if 'sell_signal' in self.series_data else 0
+        }
