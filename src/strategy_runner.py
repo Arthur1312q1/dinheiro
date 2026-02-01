@@ -1,5 +1,5 @@
 """
-strategy_runner.py - VERSÃO FINAL COM DIAGNÓSTICO DETALHADO
+strategy_runner.py - CORREÇÃO CRÍTICA PARA SINCRONIA COM TRADINGVIEW
 """
 import os
 import logging
@@ -55,43 +55,33 @@ class StrategyRunner:
         self.last_log_time = time.time()
         
         # Timezone
-        self.tz_utc = pytz.UTC
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
         
-        # DIAGNÓSTICO
-        self.last_signal_check = None
-        self.signal_history = []
+        # Histórico para debug
+        self.signal_log = []
         
         # Carregar Pine Script
         pine_code = self._load_pine_script()
         if pine_code:
             self.interpreter = PineScriptInterpreter(pine_code)
-            logger.info("✅ Strategy Runner inicializado com interpretador Pine Script")
+            logger.info("✅ Strategy Runner inicializado")
         else:
             logger.error("❌ Não foi possível carregar o código Pine Script")
     
     def _load_pine_script(self):
         """Carrega o código Pine Script do arquivo"""
         try:
-            # Procurar arquivo em vários locais
-            possible_paths = [
-                "strategy/Adaptive_Zero_Lag_EMA_v2.pine",
-                "Adaptive_Zero_Lag_EMA_v2.pine",
-                "src/strategy/Adaptive_Zero_Lag_EMA_v2.pine",
-                "../strategy/Adaptive_Zero_Lag_EMA_v2.pine"
-            ]
-            
-            for path in possible_paths:
-                if os.path.exists(path):
-                    with open(path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        logger.info(f"✅ Arquivo Pine Script encontrado: {path} ({len(content)} bytes)")
-                        return content
-            
-            logger.error("❌ Arquivo Pine Script não encontrado")
-            return None
+            path = "strategy/Adaptive_Zero_Lag_EMA_v2.pine"
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    logger.info(f"✅ Pine Script carregado: {len(content)} bytes")
+                    return content
+            else:
+                logger.error(f"❌ Arquivo não encontrado: {path}")
+                return None
         except Exception as e:
-            logger.error(f"❌ Erro ao ler arquivo Pine Script: {e}")
+            logger.error(f"❌ Erro ao ler Pine Script: {e}")
             return None
     
     def _calculate_position_size(self, entry_price):
@@ -106,7 +96,7 @@ class StrategyRunner:
             
             quantity = risk_amount / stop_loss_usdt
             
-            # Limitar ao saldo disponível
+            # Limitar ao saldo
             max_quantity = balance / entry_price * 0.95
             if quantity > max_quantity:
                 quantity = max_quantity
@@ -117,12 +107,27 @@ class StrategyRunner:
             return 0
     
     def _open_position(self, side, entry_price):
-        """Abre uma nova posição"""
+        """Abre uma nova posição - COM VERIFICAÇÃO DE POSIÇÃO ATUAL"""
         try:
-            # Verificar se já está na mesma posição
-            if (side == 'buy' and self.position_side == 'long') or (side == 'sell' and self.position_side == 'short'):
-                logger.info(f"⏭️  Já está na posição {side.upper()}, ignorando")
-                return False
+            # LOG CRÍTICO
+            logger.info(f"🔍 VERIFICANDO ABERTURA DE POSIÇÃO {side.upper()}")
+            logger.info(f"   Preço: ${entry_price:.2f}")
+            logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
+            logger.info(f"   Sinal BUY pendente: {self.pending_buy_signal}")
+            logger.info(f"   Sinal SELL pendente: {self.pending_sell_signal}")
+            
+            # REGRA DO PINE SCRIPT: 
+            # BUY só se position_size <= 0 (flat ou short)
+            # SELL só se position_size >= 0 (flat ou long)
+            
+            if side == 'buy':
+                if self.position_size > 0:
+                    logger.info(f"⏭️  IGNORANDO BUY - já está em LONG")
+                    return False
+            else:  # sell
+                if self.position_size < 0:
+                    logger.info(f"⏭️  IGNORANDO SELL - já está em SHORT")
+                    return False
             
             # Se já tem posição oposta, fechar primeiro
             if self.position_size != 0:
@@ -152,13 +157,19 @@ class StrategyRunner:
                 if side == 'buy':
                     self.stop_loss_price = entry_price - (self.fixedSL * self.mintick)
                     self.take_profit_price = entry_price + (self.fixedTP * self.mintick)
-                else:
+                else:  # sell
                     self.stop_loss_price = entry_price + (self.fixedSL * self.mintick)
                     self.take_profit_price = entry_price - (self.fixedTP * self.mintick)
                 
                 logger.info(f"🚀 POSIÇÃO ABERTA: {side.upper()} {abs(quantity):.4f} ETH @ ${entry_price:.2f}")
                 logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
                 logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+                
+                # Resetar sinais pendentes após abrir posição
+                if side == 'buy':
+                    self.pending_buy_signal = False
+                else:
+                    self.pending_sell_signal = False
                 
                 return True
             
@@ -173,6 +184,22 @@ class StrategyRunner:
             return False
         
         try:
+            logger.info(f"🔍 VERIFICANDO FECHAMENTO DE POSIÇÃO")
+            logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
+            logger.info(f"   Preço entrada: ${self.entry_price:.2f}")
+            logger.info(f"   Preço atual: ${exit_price:.2f}")
+            logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
+            logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+            logger.info(f"   Motivo: {reason}")
+            
+            # Calcular PnL para debug
+            if self.entry_price:
+                if self.position_side == 'long':
+                    pnl_pct = ((exit_price - self.entry_price) / self.entry_price) * 100
+                else:
+                    pnl_pct = ((self.entry_price - exit_price) / self.entry_price) * 100
+                logger.info(f"   PnL estimado: {pnl_pct:.2f}%")
+            
             success = self.trade_history.close_trade(self.trade_id, exit_price)
             if success:
                 logger.info(f"✅ POSIÇÃO FECHADA: {self.position_side.upper()} @ ${exit_price:.2f} ({reason})")
@@ -183,6 +210,7 @@ class StrategyRunner:
                 self.stop_loss_price = None
                 self.take_profit_price = None
                 return True
+            
             return False
         except Exception as e:
             logger.error(f"Erro ao fechar posição: {e}")
@@ -194,6 +222,12 @@ class StrategyRunner:
             return
         
         try:
+            logger.info(f"🔍 VERIFICANDO STOP/TAKE")
+            logger.info(f"   Posição: {self.position_side}")
+            logger.info(f"   Preço atual: ${self.current_price:.2f}")
+            logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
+            logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+            
             if self.position_side == 'long':
                 if self.stop_loss_price and self.current_price <= self.stop_loss_price:
                     logger.info(f"🛑 STOP LOSS ATINGIDO (LONG): ${self.current_price:.2f} <= ${self.stop_loss_price:.2f}")
@@ -224,30 +258,20 @@ class StrategyRunner:
         if not self.current_price:
             return
         
-        logger.info(f"🔍 Processando sinais pendentes...")
+        logger.info(f"🔍 PROCESSANDO SINAIS PENDENTES")
         logger.info(f"   Preço atual: ${self.current_price:.2f}")
-        logger.info(f"   Sinais: BUY={self.pending_buy_signal}, SELL={self.pending_sell_signal}")
+        logger.info(f"   Sinais pendentes: BUY={self.pending_buy_signal}, SELL={self.pending_sell_signal}")
         logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
         
         # BUY: só executa se position_size <= 0 (flat ou short)
         if self.pending_buy_signal:
-            if self.position_size <= 0:
-                logger.info(f"🎯 EXECUTANDO BUY (sinal da barra anterior)")
-                self._open_position('buy', self.current_price)
-            else:
-                logger.info(f"⏭️  BUY ignorado (já em LONG)")
-            
-            self.pending_buy_signal = False
+            logger.info(f"🎯 TENTANDO EXECUTAR BUY (sinal da barra anterior)")
+            self._open_position('buy', self.current_price)
         
         # SELL: só executa se position_size >= 0 (flat ou long)
         elif self.pending_sell_signal:
-            if self.position_size >= 0:
-                logger.info(f"🎯 EXECUTANDO SELL (sinal da barra anterior)")
-                self._open_position('sell', self.current_price)
-            else:
-                logger.info(f"⏭️  SELL ignorado (já em SHORT)")
-            
-            self.pending_sell_signal = False
+            logger.info(f"🎯 TENTANDO EXECUTAR SELL (sinal da barra anterior)")
+            self._open_position('sell', self.current_price)
     
     # WebSocket methods
     def _on_ws_message(self, ws, message):
@@ -280,7 +304,7 @@ class StrategyRunner:
             }]
         }
         ws.send(json.dumps(subscribe_msg))
-        logger.info("📊 Inscrito no canal 'tickers' (tempo real)")
+        logger.info("📊 Inscrito no canal 'tickers'")
     
     def _start_websocket(self):
         websocket_url = "wss://ws.okx.com:8443/ws/v5/public"
@@ -304,7 +328,7 @@ class StrategyRunner:
     def _check_and_update_bar(self):
         """Verifica se uma nova barra de 30 minutos começou"""
         if not self.current_price:
-            logger.warning("⚠️ Sem preço atual para verificar barra")
+            logger.warning("⚠️ Sem preço atual")
             return False
         
         now_brazil = datetime.now(self.tz_brazil)
@@ -327,14 +351,15 @@ class StrategyRunner:
                 'close': self.current_price,
                 'volume': 0
             }
-            logger.info(f"⏰ Primeira barra definida (BRT): {current_bar_start.strftime('%H:%M')}")
+            logger.info(f"⏰ Primeira barra: {current_bar_start.strftime('%H:%M')}")
             return False
         
         # Se uma nova barra começou
         if current_bar_start > self.last_bar_timestamp:
             logger.info("=" * 60)
-            logger.info(f"📊 NOVA BARRA 30m INICIADA (BRT): {current_bar_start.strftime('%H:%M')}")
+            logger.info(f"📊 NOVA BARRA 30m: {current_bar_start.strftime('%H:%M')}")
             logger.info(f"   Preço de abertura: ${self.current_price:.2f}")
+            logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
             
             # 1. PRIMEIRO: Executar sinais da barra ANTERIOR
             self._process_pending_signals()
@@ -370,7 +395,7 @@ class StrategyRunner:
     def _process_completed_bar(self):
         """Processa uma barra completa para detectar sinais"""
         if not self.current_bar_data:
-            logger.warning("⚠️ Nenhum dado de barra para processar")
+            logger.warning("⚠️ Nenhum dado de barra")
             return
         
         logger.info(f"📈 Processando barra #{self.bar_count}...")
@@ -384,46 +409,28 @@ class StrategyRunner:
             logger.info(f"   EMA: {result['ema']:.2f}, EC: {result['ec']:.2f}")
             logger.info(f"   EC anterior: {result.get('ec_prev', 0):.2f}")
             logger.info(f"   EMA anterior: {result.get('ema_prev', 0):.2f}")
-            logger.info(f"   Erro: {result['error_pct']:.2f}%")
             
             # Verificar sinais do interpretador
-            pending_buy = result.get('pending_buy', False)
-            pending_sell = result.get('pending_sell', False)
             buy_signal_current = result.get('buy_signal_current', False)
             sell_signal_current = result.get('sell_signal_current', False)
             
             logger.info(f"   Sinais na barra atual: BUY={buy_signal_current}, SELL={sell_signal_current}")
-            logger.info(f"   Sinais pendentes: BUY={pending_buy}, SELL={pending_sell}")
             
-            # Registrar para diagnóstico
-            signal_info = {
-                'timestamp': datetime.now().isoformat(),
-                'bar_count': self.bar_count,
-                'price': self.current_bar_data['close'],
-                'ema': result['ema'],
-                'ec': result['ec'],
-                'buy_signal_current': buy_signal_current,
-                'sell_signal_current': sell_signal_current,
-                'pending_buy': pending_buy,
-                'pending_sell': pending_sell
-            }
-            self.signal_history.append(signal_info)
-            if len(self.signal_history) > 10:
-                self.signal_history.pop(0)
+            # REGRA DO PINE SCRIPT: O sinal da barra atual será executado na PRÓXIMA barra
+            # Mas só se não houver sinal oposto ativo
             
-            # Atualizar sinais pendentes para a PRÓXIMA barra
-            if pending_buy:
+            if buy_signal_current:
                 self.pending_buy_signal = True
                 self.pending_sell_signal = False  # Resetar sinal oposto
-                logger.info(f"   🟢 SINAL BUY PENDENTE DETECTADO! (executará na próxima barra)")
+                logger.info(f"   🟢 SINAL BUY DETECTADO! (executará na próxima barra)")
             
-            if pending_sell:
+            if sell_signal_current:
                 self.pending_sell_signal = True
                 self.pending_buy_signal = False  # Resetar sinal oposto
-                logger.info(f"   🔴 SINAL SELL PENDENTE DETECTADO! (executará na próxima barra)")
+                logger.info(f"   🔴 SINAL SELL DETECTADO! (executará na próxima barra)")
             
-            if not pending_buy and not pending_sell:
-                logger.info(f"   ⚪ Nenhum sinal pendente detectado")
+            if not buy_signal_current and not sell_signal_current:
+                logger.info(f"   ⚪ Nenhum sinal detectado")
                 
         except Exception as e:
             logger.error(f"💥 Erro ao processar barra: {e}")
@@ -431,17 +438,16 @@ class StrategyRunner:
     def start(self):
         """Inicia o strategy runner"""
         if not self.interpreter:
-            logger.error("❌ Interpretador Pine Script não inicializado")
+            logger.error("❌ Interpretador não inicializado")
             return False
         
         logger.info("🚀 Iniciando Strategy Runner...")
-        logger.info("📊 Estratégia: Adaptive Zero Lag EMA v2")
         
         # Iniciar WebSocket
         self._start_websocket()
         
         # Aguardar preço atual
-        logger.info("⏳ Aguardando preço atual do WebSocket...")
+        logger.info("⏳ Aguardando preço atual...")
         for _ in range(30):
             if self.current_price is not None:
                 break
@@ -451,14 +457,13 @@ class StrategyRunner:
             logger.error("❌ Não foi possível obter preço atual")
             return False
         
-        logger.info(f"✅ Preço atual obtido: ${self.current_price:.2f}")
+        logger.info(f"✅ Preço atual: ${self.current_price:.2f}")
         
         # Inicializar com candles históricos
         self._initialize_candle_buffer()
         
         self.is_running = True
-        logger.info("✅ Strategy Runner iniciado (MODO BARRAS 30m)")
-        logger.info("⚠️  EXECUÇÃO EM MODO SIMULAÇÃO - Sem ordens reais")
+        logger.info("✅ Strategy Runner iniciado")
         return True
     
     def _initialize_candle_buffer(self):
@@ -469,20 +474,13 @@ class StrategyRunner:
             historical_candles = self.okx_client.get_candles(limit=100)
             
             if len(historical_candles) >= 30:
-                logger.info(f"✅ {len(historical_candles)} candles históricos obtidos")
+                logger.info(f"✅ {len(historical_candles)} candles históricos")
                 
                 # Processar candles para aquecer indicadores
-                processed_count = 0
                 for candle in historical_candles:
-                    result = self.interpreter.process_candle(candle)
-                    processed_count += 1
-                    
-                    # Log dos primeiros e últimos candles
-                    if processed_count <= 5 or processed_count >= len(historical_candles) - 5:
-                        logger.info(f"   Candle {processed_count}: Preço=${candle['close']:.2f}, "
-                                  f"EMA={result['ema']:.2f}, EC={result['ec']:.2f}")
+                    self.interpreter.process_candle(candle)
                 
-                logger.info(f"   🔧 {processed_count} candles processados para aquecimento")
+                logger.info(f"   🔧 {len(historical_candles)} candles processados")
                 
                 # Definir último timestamp
                 if historical_candles:
@@ -498,13 +496,13 @@ class StrategyRunner:
                     )
                     
                     self.bar_count = len(historical_candles)
-                    logger.info(f"   ⏰ Última barra histórica (BRT): {self.last_bar_timestamp.strftime('%H:%M')}")
+                    logger.info(f"   ⏰ Última barra histórica: {self.last_bar_timestamp.strftime('%H:%M')}")
                     
             else:
-                logger.warning(f"⚠️ Apenas {len(historical_candles)} candles históricos obtidos")
+                logger.warning(f"⚠️ Apenas {len(historical_candles)} candles")
                 
         except Exception as e:
-            logger.error(f"❌ Erro ao inicializar candles históricos: {e}")
+            logger.error(f"❌ Erro ao inicializar candles: {e}")
     
     def stop(self):
         """Para o strategy runner"""
@@ -525,7 +523,7 @@ class StrategyRunner:
             # Verificar e atualizar barra
             new_bar = self._check_and_update_bar()
             
-            # Log periódico a cada 30 segundos
+            # Log periódico
             current_time = time.time()
             if current_time - self.last_log_time > 30:
                 if self.current_price:
@@ -557,7 +555,7 @@ class StrategyRunner:
             next_bar = self.last_bar_timestamp + timedelta(minutes=self.timeframe_minutes)
             next_bar_time = next_bar.strftime('%H:%M:%S')
             
-            # Calcular tempo restante para próxima barra (BRT)
+            # Calcular tempo restante
             now_brazil = datetime.now(self.tz_brazil)
             time_to_next_bar = (next_bar - now_brazil).total_seconds()
             if time_to_next_bar < 0:
@@ -577,38 +575,5 @@ class StrategyRunner:
             "position_side": self.position_side,
             "entry_price": self.entry_price,
             "stop_loss": self.stop_loss_price,
-            "take_profit": self.take_profit_price,
-            "signal_history": self.signal_history[-5:] if self.signal_history else []
+            "take_profit": self.take_profit_price
         }
-    
-    def get_detailed_diagnostic(self):
-        """Retorna diagnóstico detalhado"""
-        diagnostic = {
-            "current_price": self.current_price,
-            "last_bar_timestamp": self.last_bar_timestamp.isoformat() if self.last_bar_timestamp else None,
-            "bar_count": self.bar_count,
-            "interpreter_initialized": self.interpreter is not None,
-            "candle_count": self.interpreter.candle_count if self.interpreter else 0,
-            "pending_buy_signal": self.pending_buy_signal,
-            "pending_sell_signal": self.pending_sell_signal,
-            "position_size": self.position_size,
-            "position_side": self.position_side,
-            "entry_price": self.entry_price,
-            "stop_loss_price": self.stop_loss_price,
-            "take_profit_price": self.take_profit_price,
-            "websocket_connected": self.ws is not None,
-            "current_time_brazil": datetime.now(self.tz_brazil).isoformat()
-        }
-        
-        # Adicionar informações do interpretador se disponível
-        if self.interpreter:
-            diagnostic.update({
-                "interpreter_params": self.interpreter.params,
-                "interpreter_series_count": len(self.interpreter.series_data),
-                "ec_current": self.interpreter.series_data['EC'].current() if 'EC' in self.interpreter.series_data else 0,
-                "ema_current": self.interpreter.series_data['EMA'].current() if 'EMA' in self.interpreter.series_data else 0,
-                "ec_prev": self.interpreter.series_data['EC'][1] if 'EC' in self.interpreter.series_data and len(self.interpreter.series_data['EC']) > 1 else 0,
-                "ema_prev": self.interpreter.series_data['EMA'][1] if 'EMA' in self.interpreter.series_data and len(self.interpreter.series_data['EMA']) > 1 else 0
-            })
-        
-        return diagnostic
