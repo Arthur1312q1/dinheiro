@@ -1,5 +1,5 @@
 """
-strategy_runner.py - VERSÃO CORRIGIDA PARA ESTRATÉGIA NÃO-INVERSORA
+strategy_runner.py - VERSÃO FINAL COM DIAGNÓSTICO DETALHADO
 """
 import os
 import logging
@@ -29,55 +29,56 @@ class StrategyRunner:
         self.current_bar_data = None
         self.bar_count = 0
         
-        # CORREÇÃO: Sinais com delay de 1 barra (como no Pine Script)
-        self.pending_buy_signal = False  # Sinal BUY detectado na barra anterior
-        self.pending_sell_signal = False  # Sinal SELL detectado na barra anterior
+        # Sinais pendentes
+        self.pending_buy_signal = False
+        self.pending_sell_signal = False
         
         # Estado da posição atual
         self.position_size = 0
-        self.position_side = None  # 'long', 'short', ou None
+        self.position_side = None
         self.entry_price = None
         self.trade_id = None
         
-        # Parâmetros da estratégia (extraídos do Pine)
+        # Parâmetros da estratégia
         self.fixedSL = 2000  # pontos
         self.fixedTP = 55    # pontos
         self.risk = 0.01     # 1%
         self.mintick = 0.01  # tick mínimo do ETH/USDT
         
-        # Stop Loss e Take Profit ativos
+        # Stop Loss e Take Profit
         self.stop_loss_price = None
         self.take_profit_price = None
-        self.trailing_active = False
-        self.trailing_stop_price = None
-        self.trail_offset = 15  # pontos para ativar trailing
         
         # WebSocket
         self.ws = None
         self.ws_thread = None
         self.last_log_time = time.time()
         
-        # Timezone do Brasil
+        # Timezone
+        self.tz_utc = pytz.UTC
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
+        
+        # DIAGNÓSTICO
+        self.last_signal_check = None
+        self.signal_history = []
         
         # Carregar Pine Script
         pine_code = self._load_pine_script()
         if pine_code:
             self.interpreter = PineScriptInterpreter(pine_code)
-            # Extrair parâmetros do Pine
-            self._extract_pine_parameters()
-            logger.info("✅ Strategy Runner inicializado com estratégia NÃO-INVERSORA")
+            logger.info("✅ Strategy Runner inicializado com interpretador Pine Script")
         else:
             logger.error("❌ Não foi possível carregar o código Pine Script")
     
     def _load_pine_script(self):
+        """Carrega o código Pine Script do arquivo"""
         try:
             # Procurar arquivo em vários locais
             possible_paths = [
                 "strategy/Adaptive_Zero_Lag_EMA_v2.pine",
+                "Adaptive_Zero_Lag_EMA_v2.pine",
                 "src/strategy/Adaptive_Zero_Lag_EMA_v2.pine",
-                "../strategy/Adaptive_Zero_Lag_EMA_v2.pine",
-                "Adaptive_Zero_Lag_EMA_v2.pine"
+                "../strategy/Adaptive_Zero_Lag_EMA_v2.pine"
             ]
             
             for path in possible_paths:
@@ -87,135 +88,43 @@ class StrategyRunner:
                         logger.info(f"✅ Arquivo Pine Script encontrado: {path} ({len(content)} bytes)")
                         return content
             
-            logger.error("Arquivo Pine Script não encontrado em nenhum dos locais:")
-            for path in possible_paths:
-                logger.error(f"  - {path}")
+            logger.error("❌ Arquivo Pine Script não encontrado")
             return None
         except Exception as e:
-            logger.error(f"Erro ao ler arquivo Pine Script: {e}")
+            logger.error(f"❌ Erro ao ler arquivo Pine Script: {e}")
             return None
-    
-    def _extract_pine_parameters(self):
-        """Extrai parâmetros do código Pine Script"""
-        if not self.interpreter:
-            return
-        
-        try:
-            # Extrair parâmetros do interpretador
-            if hasattr(self.interpreter, 'params'):
-                self.fixedSL = self.interpreter.params.get('fixedSL', 2000)
-                self.fixedTP = self.interpreter.params.get('fixedTP', 55)
-                self.risk = self.interpreter.params.get('risk', 0.01)
-                logger.info(f"📊 Parâmetros extraídos: SL={self.fixedSL}p, TP={self.fixedTP}p, Risk={self.risk*100}%")
-        except Exception as e:
-            logger.error(f"Erro ao extrair parâmetros: {e}")
     
     def _calculate_position_size(self, entry_price):
-        """Calcula tamanho da posição baseado no risco (igual Pine Script)"""
+        """Calcula tamanho da posição baseado no risco"""
         try:
             balance = self.okx_client.get_balance()
             risk_amount = self.risk * balance
             stop_loss_usdt = self.fixedSL * self.mintick
+            
             if stop_loss_usdt <= 0:
                 return 0
             
-            lots = risk_amount / stop_loss_usdt
+            quantity = risk_amount / stop_loss_usdt
             
             # Limitar ao saldo disponível
-            max_quantity = balance / entry_price * 0.95  # 95% do saldo
-            if lots > max_quantity:
-                lots = max_quantity
+            max_quantity = balance / entry_price * 0.95
+            if quantity > max_quantity:
+                quantity = max_quantity
             
-            # Arredondar para 4 casas decimais (tamanho mínimo da OKX)
-            return round(lots, 4)
-            
+            return round(quantity, 4)
         except Exception as e:
             logger.error(f"Erro ao calcular tamanho da posição: {e}")
             return 0
     
-    def _calculate_stop_take_prices(self, side, entry_price):
-        """Calcula preços de Stop Loss e Take Profit (em pontos)"""
-        if side == 'buy':
-            stop_loss = entry_price - (self.fixedSL * self.mintick)
-            take_profit = entry_price + (self.fixedTP * self.mintick)
-        else:  # sell
-            stop_loss = entry_price + (self.fixedSL * self.mintick)
-            take_profit = entry_price - (self.fixedTP * self.mintick)
-        
-        return stop_loss, take_profit
-    
-    def _check_stop_take(self):
-        """Verifica se Stop Loss ou Take Profit foram atingidos"""
-        if not self.position_size or not self.current_price:
-            return
-        
-        try:
-            if self.position_side == 'long':
-                # Verificar Stop Loss
-                if self.stop_loss_price and self.current_price <= self.stop_loss_price:
-                    logger.info(f"🛑 STOP LOSS ATINGIDO (LONG): {self.current_price:.2f} <= {self.stop_loss_price:.2f}")
-                    self._close_position(self.current_price, "stop_loss")
-                    return
-                
-                # Verificar Take Profit
-                if self.take_profit_price and self.current_price >= self.take_profit_price:
-                    logger.info(f"🎯 TAKE PROFIT ATINGIDO (LONG): {self.current_price:.2f} >= {self.take_profit_price:.2f}")
-                    self._close_position(self.current_price, "take_profit")
-                    return
-                
-                # Verificar trailing stop (se ativo)
-                if self.trailing_active and self.trailing_stop_price:
-                    # Atualizar trailing stop se preço subiu
-                    new_trailing_stop = self.current_price - (self.trail_offset * self.mintick)
-                    if new_trailing_stop > self.trailing_stop_price:
-                        self.trailing_stop_price = new_trailing_stop
-                        logger.info(f"📈 Trailing Stop atualizado: {self.trailing_stop_price:.2f}")
-                    
-                    # Verificar se trailing stop foi atingido
-                    if self.current_price <= self.trailing_stop_price:
-                        logger.info(f"📉 TRAILING STOP ATINGIDO: {self.current_price:.2f} <= {self.trailing_stop_price:.2f}")
-                        self._close_position(self.current_price, "trailing_stop")
-                        return
-            
-            elif self.position_side == 'short':
-                # Verificar Stop Loss
-                if self.stop_loss_price and self.current_price >= self.stop_loss_price:
-                    logger.info(f"🛑 STOP LOSS ATINGIDO (SHORT): {self.current_price:.2f} >= {self.stop_loss_price:.2f}")
-                    self._close_position(self.current_price, "stop_loss")
-                    return
-                
-                # Verificar Take Profit
-                if self.take_profit_price and self.current_price <= self.take_profit_price:
-                    logger.info(f"🎯 TAKE PROFIT ATINGIDO (SHORT): {self.current_price:.2f} <= {self.take_profit_price:.2f}")
-                    self._close_position(self.current_price, "take_profit")
-                    return
-                
-                # Verificar trailing stop (se ativo)
-                if self.trailing_active and self.trailing_stop_price:
-                    # Atualizar trailing stop se preço desceu
-                    new_trailing_stop = self.current_price + (self.trail_offset * self.mintick)
-                    if new_trailing_stop < self.trailing_stop_price:
-                        self.trailing_stop_price = new_trailing_stop
-                        logger.info(f"📈 Trailing Stop atualizado: {self.trailing_stop_price:.2f}")
-                    
-                    # Verificar se trailing stop foi atingido
-                    if self.current_price >= self.trailing_stop_price:
-                        logger.info(f"📉 TRAILING STOP ATINGIDO: {self.current_price:.2f} >= {self.trailing_stop_price:.2f}")
-                        self._close_position(self.current_price, "trailing_stop")
-                        return
-                        
-        except Exception as e:
-            logger.error(f"Erro ao verificar stop/take: {e}")
-    
     def _open_position(self, side, entry_price):
         """Abre uma nova posição"""
         try:
-            # CORREÇÃO: Verificar se já está na mesma posição
+            # Verificar se já está na mesma posição
             if (side == 'buy' and self.position_side == 'long') or (side == 'sell' and self.position_side == 'short'):
                 logger.info(f"⏭️  Já está na posição {side.upper()}, ignorando")
                 return False
             
-            # Fechar posição oposta se existir (apenas se for inversão necessária)
+            # Se já tem posição oposta, fechar primeiro
             if self.position_size != 0:
                 logger.info(f"🔀 Fechando posição {self.position_side} para abrir {side}")
                 self._close_position(entry_price, "inversao")
@@ -240,25 +149,20 @@ class StrategyRunner:
                 self.entry_price = entry_price
                 
                 # Calcular Stop Loss e Take Profit
-                self.stop_loss_price, self.take_profit_price = self._calculate_stop_take_prices(side, entry_price)
-                
-                # Inicializar trailing stop
                 if side == 'buy':
-                    self.trailing_stop_price = entry_price - (self.trail_offset * self.mintick)
+                    self.stop_loss_price = entry_price - (self.fixedSL * self.mintick)
+                    self.take_profit_price = entry_price + (self.fixedTP * self.mintick)
                 else:
-                    self.trailing_stop_price = entry_price + (self.trail_offset * self.mintick)
-                
-                self.trailing_active = False
+                    self.stop_loss_price = entry_price + (self.fixedSL * self.mintick)
+                    self.take_profit_price = entry_price - (self.fixedTP * self.mintick)
                 
                 logger.info(f"🚀 POSIÇÃO ABERTA: {side.upper()} {abs(quantity):.4f} ETH @ ${entry_price:.2f}")
                 logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
                 logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
-                logger.info(f"   Trailing Stop inicial: ${self.trailing_stop_price:.2f}")
                 
                 return True
             
             return False
-            
         except Exception as e:
             logger.error(f"Erro ao abrir posição: {e}")
             return False
@@ -278,40 +182,71 @@ class StrategyRunner:
                 self.trade_id = None
                 self.stop_loss_price = None
                 self.take_profit_price = None
-                self.trailing_active = False
-                self.trailing_stop_price = None
                 return True
             return False
         except Exception as e:
             logger.error(f"Erro ao fechar posição: {e}")
             return False
     
+    def _check_stop_take(self):
+        """Verifica se Stop Loss ou Take Profit foram atingidos"""
+        if not self.position_size or not self.current_price:
+            return
+        
+        try:
+            if self.position_side == 'long':
+                if self.stop_loss_price and self.current_price <= self.stop_loss_price:
+                    logger.info(f"🛑 STOP LOSS ATINGIDO (LONG): ${self.current_price:.2f} <= ${self.stop_loss_price:.2f}")
+                    self._close_position(self.current_price, "stop_loss")
+                    return
+                
+                if self.take_profit_price and self.current_price >= self.take_profit_price:
+                    logger.info(f"🎯 TAKE PROFIT ATINGIDO (LONG): ${self.current_price:.2f} >= ${self.take_profit_price:.2f}")
+                    self._close_position(self.current_price, "take_profit")
+                    return
+            
+            elif self.position_side == 'short':
+                if self.stop_loss_price and self.current_price >= self.stop_loss_price:
+                    logger.info(f"🛑 STOP LOSS ATINGIDO (SHORT): ${self.current_price:.2f} >= ${self.stop_loss_price:.2f}")
+                    self._close_position(self.current_price, "stop_loss")
+                    return
+                
+                if self.take_profit_price and self.current_price <= self.take_profit_price:
+                    logger.info(f"🎯 TAKE PROFIT ATINGIDO (SHORT): ${self.current_price:.2f} <= ${self.take_profit_price:.2f}")
+                    self._close_position(self.current_price, "take_profit")
+                    return
+                    
+        except Exception as e:
+            logger.error(f"Erro ao verificar stop/take: {e}")
+    
     def _process_pending_signals(self):
-        """Processa sinais pendentes com delay de 1 barra (igual Pine Script)"""
+        """Processa sinais pendentes com delay de 1 barra"""
         if not self.current_price:
             return
         
-        # CORREÇÃO: Verificar condições exatas do Pine Script
-        # BUY só se: pending_buy_signal AND position_size <= 0 (flat ou short)
+        logger.info(f"🔍 Processando sinais pendentes...")
+        logger.info(f"   Preço atual: ${self.current_price:.2f}")
+        logger.info(f"   Sinais: BUY={self.pending_buy_signal}, SELL={self.pending_sell_signal}")
+        logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
+        
+        # BUY: só executa se position_size <= 0 (flat ou short)
         if self.pending_buy_signal:
-            if self.position_size <= 0:  # Flat ou short
+            if self.position_size <= 0:
                 logger.info(f"🎯 EXECUTANDO BUY (sinal da barra anterior)")
                 self._open_position('buy', self.current_price)
             else:
                 logger.info(f"⏭️  BUY ignorado (já em LONG)")
             
-            # Resetar sinal
             self.pending_buy_signal = False
         
-        # SELL só se: pending_sell_signal AND position_size >= 0 (flat ou long)
+        # SELL: só executa se position_size >= 0 (flat ou long)
         elif self.pending_sell_signal:
-            if self.position_size >= 0:  # Flat ou long
+            if self.position_size >= 0:
                 logger.info(f"🎯 EXECUTANDO SELL (sinal da barra anterior)")
                 self._open_position('sell', self.current_price)
             else:
                 logger.info(f"⏭️  SELL ignorado (já em SHORT)")
             
-            # Resetar sinal
             self.pending_sell_signal = False
     
     # WebSocket methods
@@ -322,7 +257,7 @@ class StrategyRunner:
                 ticker_data = data.get('data', [{}])[0]
                 self.current_price = float(ticker_data.get('last', 0))
                 
-                # Verificar Stop Loss/Take Profit a cada preço novo
+                # Verificar Stop Loss/Take Profit
                 self._check_stop_take()
                 
         except Exception as e:
@@ -359,7 +294,7 @@ class StrategyRunner:
         self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
         self.ws_thread.start()
         logger.info("Thread WebSocket iniciada")
-        time.sleep(3)  # Aguardar conexão
+        time.sleep(3)
     
     def _stop_websocket(self):
         if self.ws:
@@ -367,7 +302,7 @@ class StrategyRunner:
         self.ws = None
     
     def _check_and_update_bar(self):
-        """Verifica se uma nova barra de 30 minutos começou - CORRIGIDO"""
+        """Verifica se uma nova barra de 30 minutos começou"""
         if not self.current_price:
             logger.warning("⚠️ Sem preço atual para verificar barra")
             return False
@@ -401,7 +336,7 @@ class StrategyRunner:
             logger.info(f"📊 NOVA BARRA 30m INICIADA (BRT): {current_bar_start.strftime('%H:%M')}")
             logger.info(f"   Preço de abertura: ${self.current_price:.2f}")
             
-            # 1. PRIMEIRO: Executar sinais da barra ANTERIOR (delay de 1 barra)
+            # 1. PRIMEIRO: Executar sinais da barra ANTERIOR
             self._process_pending_signals()
             
             # 2. SEGUNDO: Processar barra anterior para detectar NOVOS sinais
@@ -421,12 +356,10 @@ class StrategyRunner:
             self.bar_count += 1
             
             logger.info(f"   Barra #{self.bar_count} iniciada")
-            logger.info(f"   Estado: {self.position_side or 'FLAT'} | Size: {abs(self.position_size):.4f} ETH")
-            logger.info(f"   Sinais pendentes: BUY={self.pending_buy_signal}, SELL={self.pending_sell_signal}")
             logger.info("=" * 60)
             return True
         
-        # Atualizar dados da barra atual (high, low, close)
+        # Atualizar dados da barra atual
         if self.current_bar_data:
             self.current_bar_data['high'] = max(self.current_bar_data['high'], self.current_price)
             self.current_bar_data['low'] = min(self.current_bar_data['low'], self.current_price)
@@ -447,22 +380,50 @@ class StrategyRunner:
             # Processar através do interpretador
             result = self.interpreter.process_candle(self.current_bar_data)
             
-            buy_signal_raw = result.get('buy_signal_raw', False)
-            sell_signal_raw = result.get('sell_signal_raw', False)
+            # DIAGNÓSTICO DETALHADO
+            logger.info(f"   EMA: {result['ema']:.2f}, EC: {result['ec']:.2f}")
+            logger.info(f"   EC anterior: {result.get('ec_prev', 0):.2f}")
+            logger.info(f"   EMA anterior: {result.get('ema_prev', 0):.2f}")
+            logger.info(f"   Erro: {result['error_pct']:.2f}%")
             
-            logger.info(f"   EMA: {result['ema']:.2f}, EC: {result['ec']:.2f}, Erro: {result['error_pct']:.2f}%")
+            # Verificar sinais do interpretador
+            pending_buy = result.get('pending_buy', False)
+            pending_sell = result.get('pending_sell', False)
+            buy_signal_current = result.get('buy_signal_current', False)
+            sell_signal_current = result.get('sell_signal_current', False)
             
-            # CORREÇÃO: Marcar sinais para execução na PRÓXIMA barra (delay de 1 barra)
-            if buy_signal_raw:
+            logger.info(f"   Sinais na barra atual: BUY={buy_signal_current}, SELL={sell_signal_current}")
+            logger.info(f"   Sinais pendentes: BUY={pending_buy}, SELL={pending_sell}")
+            
+            # Registrar para diagnóstico
+            signal_info = {
+                'timestamp': datetime.now().isoformat(),
+                'bar_count': self.bar_count,
+                'price': self.current_bar_data['close'],
+                'ema': result['ema'],
+                'ec': result['ec'],
+                'buy_signal_current': buy_signal_current,
+                'sell_signal_current': sell_signal_current,
+                'pending_buy': pending_buy,
+                'pending_sell': pending_sell
+            }
+            self.signal_history.append(signal_info)
+            if len(self.signal_history) > 10:
+                self.signal_history.pop(0)
+            
+            # Atualizar sinais pendentes para a PRÓXIMA barra
+            if pending_buy:
                 self.pending_buy_signal = True
-                logger.info(f"   🟢 SINAL BUY DETECTADO! (executará na PRÓXIMA barra)")
+                self.pending_sell_signal = False  # Resetar sinal oposto
+                logger.info(f"   🟢 SINAL BUY PENDENTE DETECTADO! (executará na próxima barra)")
             
-            if sell_signal_raw:
+            if pending_sell:
                 self.pending_sell_signal = True
-                logger.info(f"   🔴 SINAL SELL DETECTADO! (executará na PRÓXIMA barra)")
+                self.pending_buy_signal = False  # Resetar sinal oposto
+                logger.info(f"   🔴 SINAL SELL PENDENTE DETECTADO! (executará na próxima barra)")
             
-            if not buy_signal_raw and not sell_signal_raw:
-                logger.info(f"   ⚪ Nenhum sinal detectado nesta barra")
+            if not pending_buy and not pending_sell:
+                logger.info(f"   ⚪ Nenhum sinal pendente detectado")
                 
         except Exception as e:
             logger.error(f"💥 Erro ao processar barra: {e}")
@@ -474,13 +435,23 @@ class StrategyRunner:
             return False
         
         logger.info("🚀 Iniciando Strategy Runner...")
-        logger.info("📊 Estratégia: NÃO-INVERSORA com Stop Loss/Take Profit")
-        
-        # Inicializar variável de log
-        self.last_log_time = time.time()
+        logger.info("📊 Estratégia: Adaptive Zero Lag EMA v2")
         
         # Iniciar WebSocket
         self._start_websocket()
+        
+        # Aguardar preço atual
+        logger.info("⏳ Aguardando preço atual do WebSocket...")
+        for _ in range(30):
+            if self.current_price is not None:
+                break
+            time.sleep(1)
+        
+        if self.current_price is None:
+            logger.error("❌ Não foi possível obter preço atual")
+            return False
+        
+        logger.info(f"✅ Preço atual obtido: ${self.current_price:.2f}")
         
         # Inicializar com candles históricos
         self._initialize_candle_buffer()
@@ -507,21 +478,20 @@ class StrategyRunner:
                     processed_count += 1
                     
                     # Log dos primeiros e últimos candles
-                    if processed_count <= 3 or processed_count >= len(historical_candles) - 2:
+                    if processed_count <= 5 or processed_count >= len(historical_candles) - 5:
                         logger.info(f"   Candle {processed_count}: Preço=${candle['close']:.2f}, "
                                   f"EMA={result['ema']:.2f}, EC={result['ec']:.2f}")
                 
                 logger.info(f"   🔧 {processed_count} candles processados para aquecimento")
                 
-                # Definir último timestamp (convertendo para BRT)
+                # Definir último timestamp
                 if historical_candles:
                     last_ts = historical_candles[-1]['timestamp'] / 1000
-                    last_dt_utc = datetime.utcfromtimestamp(last_ts)
-                    last_dt_brazil = last_dt_utc.replace(tzinfo=pytz.utc).astimezone(self.tz_brazil)
+                    last_dt = datetime.fromtimestamp(last_ts, self.tz_brazil)
                     
                     # Arredondar para início da barra de 30m
-                    minute = (last_dt_brazil.minute // 30) * 30
-                    self.last_bar_timestamp = last_dt_brazil.replace(
+                    minute = (last_dt.minute // 30) * 30
+                    self.last_bar_timestamp = last_dt.replace(
                         minute=minute, 
                         second=0, 
                         microsecond=0
@@ -555,14 +525,12 @@ class StrategyRunner:
             # Verificar e atualizar barra
             new_bar = self._check_and_update_bar()
             
-            # Log periódico a cada 60 segundos
+            # Log periódico a cada 30 segundos
             current_time = time.time()
-            if current_time - self.last_log_time > 60:
+            if current_time - self.last_log_time > 30:
                 if self.current_price:
-                    logger.info(f"📊 STATUS ATUAL: Preço ${self.current_price:.2f}")
-                    logger.info(f"   Posição: {self.position_side or 'FLAT'} {abs(self.position_size):.4f} ETH")
-                    logger.info(f"   Entrada: ${self.entry_price or 0:.2f}")
-                    logger.info(f"   SL: ${self.stop_loss_price or 0:.2f}, TP: ${self.take_profit_price or 0:.2f}")
+                    logger.info(f"📈 Status: ${self.current_price:.2f} | "
+                              f"Posição: {self.position_side or 'FLAT'} {abs(self.position_size):.4f} ETH")
                 self.last_log_time = current_time
             
             return {
@@ -610,5 +578,37 @@ class StrategyRunner:
             "entry_price": self.entry_price,
             "stop_loss": self.stop_loss_price,
             "take_profit": self.take_profit_price,
-            "trailing_stop": self.trailing_stop_price
+            "signal_history": self.signal_history[-5:] if self.signal_history else []
         }
+    
+    def get_detailed_diagnostic(self):
+        """Retorna diagnóstico detalhado"""
+        diagnostic = {
+            "current_price": self.current_price,
+            "last_bar_timestamp": self.last_bar_timestamp.isoformat() if self.last_bar_timestamp else None,
+            "bar_count": self.bar_count,
+            "interpreter_initialized": self.interpreter is not None,
+            "candle_count": self.interpreter.candle_count if self.interpreter else 0,
+            "pending_buy_signal": self.pending_buy_signal,
+            "pending_sell_signal": self.pending_sell_signal,
+            "position_size": self.position_size,
+            "position_side": self.position_side,
+            "entry_price": self.entry_price,
+            "stop_loss_price": self.stop_loss_price,
+            "take_profit_price": self.take_profit_price,
+            "websocket_connected": self.ws is not None,
+            "current_time_brazil": datetime.now(self.tz_brazil).isoformat()
+        }
+        
+        # Adicionar informações do interpretador se disponível
+        if self.interpreter:
+            diagnostic.update({
+                "interpreter_params": self.interpreter.params,
+                "interpreter_series_count": len(self.interpreter.series_data),
+                "ec_current": self.interpreter.series_data['EC'].current() if 'EC' in self.interpreter.series_data else 0,
+                "ema_current": self.interpreter.series_data['EMA'].current() if 'EMA' in self.interpreter.series_data else 0,
+                "ec_prev": self.interpreter.series_data['EC'][1] if 'EC' in self.interpreter.series_data and len(self.interpreter.series_data['EC']) > 1 else 0,
+                "ema_prev": self.interpreter.series_data['EMA'][1] if 'EMA' in self.interpreter.series_data and len(self.interpreter.series_data['EMA']) > 1 else 0
+            })
+        
+        return diagnostic
