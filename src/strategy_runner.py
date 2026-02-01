@@ -1,5 +1,5 @@
 """
-strategy_runner.py - CORREÇÃO CRÍTICA PARA SINCRONIA COM TRADINGVIEW
+strategy_runner.py - VERSÃO COM CORREÇÃO DE FECHAMENTO DE TRADES
 """
 import os
 import logging
@@ -53,12 +53,14 @@ class StrategyRunner:
         self.ws = None
         self.ws_thread = None
         self.last_log_time = time.time()
+        self.last_price_update = time.time()
         
         # Timezone
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
         
-        # Histórico para debug
-        self.signal_log = []
+        # Controle de execução
+        self.last_check_time = 0
+        self.check_interval = 2  # Verificar stop/take a cada 2 segundos
         
         # Carregar Pine Script
         pine_code = self._load_pine_script()
@@ -109,7 +111,7 @@ class StrategyRunner:
     def _open_position(self, side, entry_price):
         """Abre uma nova posição - COM VERIFICAÇÃO DE POSIÇÃO ATUAL"""
         try:
-            # LOG CRÍTICO
+            logger.info("=" * 60)
             logger.info(f"🔍 VERIFICANDO ABERTURA DE POSIÇÃO {side.upper()}")
             logger.info(f"   Preço: ${entry_price:.2f}")
             logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
@@ -123,10 +125,12 @@ class StrategyRunner:
             if side == 'buy':
                 if self.position_size > 0:
                     logger.info(f"⏭️  IGNORANDO BUY - já está em LONG")
+                    logger.info("=" * 60)
                     return False
             else:  # sell
                 if self.position_size < 0:
                     logger.info(f"⏭️  IGNORANDO SELL - já está em SHORT")
+                    logger.info("=" * 60)
                     return False
             
             # Se já tem posição oposta, fechar primeiro
@@ -138,6 +142,7 @@ class StrategyRunner:
             quantity = self._calculate_position_size(entry_price)
             if quantity <= 0:
                 logger.error("❌ Quantidade inválida")
+                logger.info("=" * 60)
                 return False
             
             # Registrar trade
@@ -153,7 +158,7 @@ class StrategyRunner:
                 self.position_size = quantity if side == 'buy' else -quantity
                 self.entry_price = entry_price
                 
-                # Calcular Stop Loss e Take Profit
+                # Calcular Stop Loss e Take Profit EM USDT
                 if side == 'buy':
                     self.stop_loss_price = entry_price - (self.fixedSL * self.mintick)
                     self.take_profit_price = entry_price + (self.fixedTP * self.mintick)
@@ -164,6 +169,7 @@ class StrategyRunner:
                 logger.info(f"🚀 POSIÇÃO ABERTA: {side.upper()} {abs(quantity):.4f} ETH @ ${entry_price:.2f}")
                 logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
                 logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+                logger.info(f"   Entrada: ${entry_price:.2f}")
                 
                 # Resetar sinais pendentes após abrir posição
                 if side == 'buy':
@@ -171,55 +177,74 @@ class StrategyRunner:
                 else:
                     self.pending_sell_signal = False
                 
+                logger.info("=" * 60)
                 return True
             
+            logger.info("=" * 60)
             return False
         except Exception as e:
             logger.error(f"Erro ao abrir posição: {e}")
             return False
     
     def _close_position(self, exit_price, reason=""):
-        """Fecha a posição atual"""
+        """Fecha a posição atual - CORREÇÃO CRÍTICA"""
         if not self.trade_id or self.position_size == 0:
+            logger.warning(f"⚠️  Tentativa de fechar posição inexistente")
             return False
         
         try:
+            logger.info("=" * 60)
             logger.info(f"🔍 VERIFICANDO FECHAMENTO DE POSIÇÃO")
             logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
             logger.info(f"   Preço entrada: ${self.entry_price:.2f}")
-            logger.info(f"   Preço atual: ${exit_price:.2f}")
+            logger.info(f"   Preço saída: ${exit_price:.2f}")
             logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
             logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
             logger.info(f"   Motivo: {reason}")
             
-            # Calcular PnL para debug
+            # Calcular PnL
             if self.entry_price:
                 if self.position_side == 'long':
                     pnl_pct = ((exit_price - self.entry_price) / self.entry_price) * 100
+                    pnl_usdt = (exit_price - self.entry_price) * abs(self.position_size)
                 else:
                     pnl_pct = ((self.entry_price - exit_price) / self.entry_price) * 100
-                logger.info(f"   PnL estimado: {pnl_pct:.2f}%")
+                    pnl_usdt = (self.entry_price - exit_price) * abs(self.position_size)
+                logger.info(f"   PnL: {pnl_pct:.2f}% (${pnl_usdt:.2f})")
             
+            # Fechar trade no histórico
             success = self.trade_history.close_trade(self.trade_id, exit_price)
             if success:
                 logger.info(f"✅ POSIÇÃO FECHADA: {self.position_side.upper()} @ ${exit_price:.2f} ({reason})")
+                
+                # Resetar estado
                 self.position_size = 0
                 self.position_side = None
                 self.entry_price = None
                 self.trade_id = None
                 self.stop_loss_price = None
                 self.take_profit_price = None
+                
+                logger.info("=" * 60)
                 return True
-            
-            return False
+            else:
+                logger.error(f"❌ Falha ao fechar trade no histórico")
+                logger.info("=" * 60)
+                return False
+                
         except Exception as e:
             logger.error(f"Erro ao fechar posição: {e}")
             return False
     
     def _check_stop_take(self):
-        """Verifica se Stop Loss ou Take Profit foram atingidos"""
+        """Verifica se Stop Loss ou Take Profit foram atingidos - CORREÇÃO"""
         if not self.position_size or not self.current_price:
             return
+        
+        current_time = time.time()
+        if current_time - self.last_check_time < self.check_interval:
+            return
+        self.last_check_time = current_time
         
         try:
             logger.info(f"🔍 VERIFICANDO STOP/TAKE")
@@ -227,8 +252,10 @@ class StrategyRunner:
             logger.info(f"   Preço atual: ${self.current_price:.2f}")
             logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
             logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+            logger.info(f"   Entrada: ${self.entry_price:.2f}")
             
             if self.position_side == 'long':
+                # LOGICA PARA LONG
                 if self.stop_loss_price and self.current_price <= self.stop_loss_price:
                     logger.info(f"🛑 STOP LOSS ATINGIDO (LONG): ${self.current_price:.2f} <= ${self.stop_loss_price:.2f}")
                     self._close_position(self.current_price, "stop_loss")
@@ -240,6 +267,7 @@ class StrategyRunner:
                     return
             
             elif self.position_side == 'short':
+                # LOGICA PARA SHORT (CRÍTICO)
                 if self.stop_loss_price and self.current_price >= self.stop_loss_price:
                     logger.info(f"🛑 STOP LOSS ATINGIDO (SHORT): ${self.current_price:.2f} >= ${self.stop_loss_price:.2f}")
                     self._close_position(self.current_price, "stop_loss")
@@ -252,6 +280,35 @@ class StrategyRunner:
                     
         except Exception as e:
             logger.error(f"Erro ao verificar stop/take: {e}")
+    
+    def _force_close_position(self):
+        """Força o fechamento da posição atual se as condições forem atendidas"""
+        if not self.position_size or not self.current_price:
+            return
+        
+        try:
+            logger.info(f"🔧 VERIFICANDO FECHAMENTO FORÇADO")
+            logger.info(f"   Preço: ${self.current_price:.2f}")
+            logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+            
+            # Verificar condição manualmente
+            if self.position_side == 'short':
+                if self.take_profit_price and self.current_price <= self.take_profit_price:
+                    logger.info(f"🎯 CONDIÇÃO DE TAKE PROFIT ATINGIDA (SHORT)")
+                    logger.info(f"   Preço atual (${self.current_price:.2f}) <= Take Profit (${self.take_profit_price:.2f})")
+                    self._close_position(self.current_price, "take_profit_force")
+                    return True
+            elif self.position_side == 'long':
+                if self.take_profit_price and self.current_price >= self.take_profit_price:
+                    logger.info(f"🎯 CONDIÇÃO DE TAKE PROFIT ATINGIDA (LONG)")
+                    logger.info(f"   Preço atual (${self.current_price:.2f}) >= Take Profit (${self.take_profit_price:.2f})")
+                    self._close_position(self.current_price, "take_profit_force")
+                    return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"Erro no fechamento forçado: {e}")
+            return False
     
     def _process_pending_signals(self):
         """Processa sinais pendentes com delay de 1 barra"""
@@ -279,11 +336,24 @@ class StrategyRunner:
             data = json.loads(message)
             if 'arg' in data and data['arg'].get('channel') == 'tickers':
                 ticker_data = data.get('data', [{}])[0]
-                self.current_price = float(ticker_data.get('last', 0))
+                new_price = float(ticker_data.get('last', 0))
+                
+                # Atualizar preço
+                self.current_price = new_price
+                
+                # Log de atualização de preço
+                current_time = time.time()
+                if current_time - self.last_price_update > 10:  # Log a cada 10 segundos
+                    logger.info(f"📈 Preço atualizado: ${self.current_price:.2f}")
+                    self.last_price_update = current_time
                 
                 # Verificar Stop Loss/Take Profit
                 self._check_stop_take()
                 
+                # Verificação extra de segurança
+                if self.position_size != 0:
+                    self._force_close_position()
+                    
         except Exception as e:
             logger.error(f"Erro ao processar mensagem WS: {e}")
 
@@ -529,6 +599,16 @@ class StrategyRunner:
                 if self.current_price:
                     logger.info(f"📈 Status: ${self.current_price:.2f} | "
                               f"Posição: {self.position_side or 'FLAT'} {abs(self.position_size):.4f} ETH")
+                    
+                    # Verificação extra de segurança
+                    if self.position_size != 0:
+                        logger.info(f"   Entrada: ${self.entry_price:.2f}")
+                        logger.info(f"   Stop Loss: ${self.stop_loss_price:.2f}")
+                        logger.info(f"   Take Profit: ${self.take_profit_price:.2f}")
+                        
+                        # Forçar verificação
+                        self._force_close_position()
+                
                 self.last_log_time = current_time
             
             return {
@@ -545,6 +625,20 @@ class StrategyRunner:
         except Exception as e:
             logger.error(f"Erro em run_strategy_realtime: {e}")
             return {"signal": "HOLD", "error": str(e)}
+    
+    def force_close_current_position(self):
+        """Força o fechamento da posição atual (endpoint API)"""
+        if not self.position_size or not self.current_price:
+            return {"success": False, "message": "Sem posição aberta"}
+        
+        try:
+            success = self._close_position(self.current_price, "force_close_api")
+            if success:
+                return {"success": True, "message": f"Posição fechada @ ${self.current_price:.2f}"}
+            else:
+                return {"success": False, "message": "Falha ao fechar posição"}
+        except Exception as e:
+            return {"success": False, "message": f"Erro: {str(e)}"}
     
     def get_strategy_status(self):
         """Retorna status da estratégia"""
@@ -575,5 +669,18 @@ class StrategyRunner:
             "position_side": self.position_side,
             "entry_price": self.entry_price,
             "stop_loss": self.stop_loss_price,
-            "take_profit": self.take_profit_price
+            "take_profit": self.take_profit_price,
+            "should_close": self._should_close_position() if self.position_size else False
         }
+    
+    def _should_close_position(self):
+        """Verifica se a posição deveria estar fechada"""
+        if not self.position_size or not self.current_price or not self.take_profit_price:
+            return False
+        
+        if self.position_side == 'short':
+            return self.current_price <= self.take_profit_price
+        elif self.position_side == 'long':
+            return self.current_price >= self.take_profit_price
+        
+        return False
