@@ -149,7 +149,8 @@ def start_strategy_automatically():
                         current_time = time.time()
                         if current_time - last_status_log > 30:
                             if strategy_runner.current_price:
-                                logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH")
+                                logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | "
+                                          f"Posição: {strategy_runner.position_side or 'FLAT'} {abs(strategy_runner.position_size):.4f} ETH")
                             last_status_log = current_time
                         
                         time.sleep(1)  # Loop principal (1 segundo)
@@ -183,6 +184,19 @@ if IS_RENDER:
 # ============================================================================
 @app.route('/')
 def home():
+    # Obter informações da posição atual
+    position_info = {}
+    if strategy_runner:
+        position_info = {
+            'has_position': strategy_runner.position_size != 0,
+            'position_side': strategy_runner.position_side,
+            'position_size': abs(strategy_runner.position_size),
+            'entry_price': strategy_runner.entry_price,
+            'current_price': strategy_runner.current_price,
+            'stop_loss': strategy_runner.stop_loss_price,
+            'take_profit': strategy_runner.take_profit_price
+        }
+    
     html = """
     <!DOCTYPE html>
     <html>
@@ -199,11 +213,14 @@ def home():
             .btn { padding: 12px 24px; margin: 10px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: bold; }
             .start-btn { background: #00ff88; color: #000; }
             .stop-btn { background: #ff4444; color: white; }
+            .force-close-btn { background: #ffaa00; color: #000; }
             .btn:disabled { opacity: 0.5; cursor: not-allowed; }
             .menu { margin: 30px 0; }
             .menu a { color: #00ff88; text-decoration: none; margin: 0 15px; font-size: 16px; }
             .menu a:hover { text-decoration: underline; }
             .info { color: #aaa; font-size: 14px; margin-top: 20px; }
+            .position-info { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; }
+            .position-info h3 { color: #00ff88; margin-top: 0; }
             .debug { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin: 20px 0; text-align: left; }
             .debug pre { overflow: auto; max-height: 300px; }
         </style>
@@ -217,14 +234,31 @@ def home():
                 <p><strong>Status:</strong> {{ '🟢 ATIVO' if trading_active else '🔴 INATIVO' }}</p>
             </div>
             
-            <div class="menu">
-                <a href="/status">📊 Status</a>
-                <a href="/history">📜 Histórico</a>
-                <a href="/debug">🐛 Debug</a>
-                <a href="/health">❤️ Saúde</a>
-                <a href="/test-auth">🔐 Testar OKX</a>
-                <a href="/restart">🔄 Reiniciar</a>
+            <div class="status {{ 'active' if trading_active else 'inactive' }}">
+                {{ '🟢 ATIVO - Simulando (sem ordens reais)' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
             </div>
+            
+            <!-- Informações da posição atual -->
+            {% if position_info.has_position %}
+            <div class="position-info">
+                <h3>📊 Posição Atual</h3>
+                <p><strong>Lado:</strong> {{ position_info.position_side|upper }}</p>
+                <p><strong>Tamanho:</strong> {{ "%.4f"|format(position_info.position_size) }} ETH</p>
+                <p><strong>Entrada:</strong> ${{ "%.2f"|format(position_info.entry_price) }}</p>
+                <p><strong>Preço Atual:</strong> ${{ "%.2f"|format(position_info.current_price) }}</p>
+                <p><strong>Stop Loss:</strong> ${{ "%.2f"|format(position_info.stop_loss) }}</p>
+                <p><strong>Take Profit:</strong> ${{ "%.2f"|format(position_info.take_profit) }}</p>
+                <p><strong>PnL Estimado:</strong> 
+                    {% if position_info.position_side == 'long' %}
+                        ${{ "%.2f"|format((position_info.current_price - position_info.entry_price) * position_info.position_size) }}
+                        ({{ "%.2f"|format(((position_info.current_price - position_info.entry_price) / position_info.entry_price * 100)) }}%)
+                    {% else %}
+                        ${{ "%.2f"|format((position_info.entry_price - position_info.current_price) * position_info.position_size) }}
+                        ({{ "%.2f"|format(((position_info.entry_price - position_info.current_price) / position_info.entry_price * 100)) }}%)
+                    {% endif %}
+                </p>
+            </div>
+            {% endif %}
             
             <div>
                 <button class="btn start-btn" onclick="controlBot('start')" {{ 'disabled' if trading_active else '' }}>
@@ -233,6 +267,21 @@ def home():
                 <button class="btn stop-btn" onclick="controlBot('stop')" {{ 'disabled' if not trading_active else '' }}>
                     ⏹️ Parar Bot
                 </button>
+                {% if position_info.has_position %}
+                <button class="btn force-close-btn" onclick="forceClosePosition()">
+                    🔴 Fechar Posição Forçado
+                </button>
+                {% endif %}
+            </div>
+            
+            <div class="menu">
+                <a href="/status">📊 Status</a>
+                <a href="/history">📜 Histórico</a>
+                <a href="/debug">🐛 Debug</a>
+                <a href="/health">❤️ Saúde</a>
+                <a href="/test-auth">🔐 Testar OKX</a>
+                <a href="/restart">🔄 Reiniciar</a>
+                <a href="/force-close">🔴 Fechar Posição</a>
             </div>
             
             <div class="info">
@@ -257,11 +306,32 @@ def home():
                 alert('❌ ' + data.message);
             }
         }
+        
+        async function forceClosePosition() {
+            if (confirm('⚠️ Tem certeza que deseja FORÇAR o fechamento da posição atual?')) {
+                const response = await fetch('/force-close', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    alert('✅ ' + data.message);
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    alert('❌ ' + data.message);
+                }
+            }
+        }
         </script>
     </body>
     </html>
     """
-    return render_template_string(html, trading_active=trading_active, IS_RENDER=IS_RENDER)
+    return render_template_string(html, 
+                                 trading_active=trading_active, 
+                                 IS_RENDER=IS_RENDER,
+                                 position_info=position_info)
 
 # ============================================================================
 # 8. ENDPOINTS DA API
@@ -293,6 +363,14 @@ def debug_info():
                 except:
                     candle_count_value = 0
             
+            # Verificar se deve fechar posição
+            should_close = False
+            if strategy_runner.position_size != 0 and strategy_runner.current_price and strategy_runner.take_profit_price:
+                if strategy_runner.position_side == 'short':
+                    should_close = strategy_runner.current_price <= strategy_runner.take_profit_price
+                elif strategy_runner.position_side == 'long':
+                    should_close = strategy_runner.current_price >= strategy_runner.take_profit_price
+            
             strategy_status = {
                 "is_running": strategy_runner.is_running,
                 "current_price": strategy_runner.current_price,
@@ -307,9 +385,9 @@ def debug_info():
                 "interpreter_initialized": strategy_runner.interpreter is not None,
                 "candle_count": candle_count_value,
                 "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if hasattr(strategy_runner, 'last_bar_timestamp') and strategy_runner.last_bar_timestamp else None,
-                "next_bar_time": strategy_runner.get_next_bar_time().isoformat() if hasattr(strategy_runner, 'get_next_bar_time') else None,
                 "pine_params": pine_params,
-                "websocket_connected": getattr(strategy_runner, 'ws', None) and getattr(strategy_runner.ws, 'sock', None) and strategy_runner.ws.sock.connected
+                "websocket_connected": getattr(strategy_runner, 'ws', None) and getattr(strategy_runner.ws, 'sock', None) and strategy_runner.ws.sock.connected,
+                "should_close_position": should_close
             }
         
         # Obtém trade_history_count de forma segura
@@ -409,7 +487,8 @@ def start_trading():
                     current_time = time.time()
                     if current_time - last_status_log > 30:
                         if strategy_runner.current_price:
-                            logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH")
+                            logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | "
+                                      f"Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH")
                         last_status_log = current_time
                     
                     time.sleep(1)
@@ -448,6 +527,84 @@ def stop_trading():
     logger.info("⏹️ BOT PARADO")
     return jsonify({"status": "success", "message": "Bot parado."})
 
+@app.route('/force-close', methods=['GET', 'POST'])
+def force_close_position():
+    """Força o fechamento da posição atual"""
+    if not strategy_runner:
+        return jsonify({"error": "Strategy Runner não inicializado"}), 500
+    
+    try:
+        if request.method == 'GET':
+            # Página HTML para fechamento manual
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Forçar Fechamento de Posição</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body { font-family: Arial, sans-serif; background: #1a1a2e; color: white; text-align: center; padding: 50px; }
+                    .container { max-width: 500px; margin: 0 auto; }
+                    .warning { background: rgba(255, 68, 68, 0.2); border: 2px solid #ff4444; padding: 20px; border-radius: 10px; margin: 20px 0; }
+                    .btn { padding: 12px 24px; margin: 10px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: bold; }
+                    .force-btn { background: #ffaa00; color: #000; }
+                    .back-btn { background: #555; color: white; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🔴 Forçar Fechamento de Posição</h1>
+                    <div class="warning">
+                        <h3>⚠️ ATENÇÃO</h3>
+                        <p>Esta ação irá FORÇAR o fechamento da posição atual.</p>
+                        <p><strong>Use apenas se a posição não estiver fechando automaticamente.</strong></p>
+                    </div>
+                    <div>
+                        <button class="btn force-btn" onclick="forceClose()">🔴 FORÇAR FECHAMENTO</button>
+                        <button class="btn back-btn" onclick="window.location.href='/'">↩️ Voltar</button>
+                    </div>
+                    <div id="result" style="margin-top: 20px;"></div>
+                </div>
+                
+                <script>
+                async function forceClose() {
+                    if (!confirm('⚠️ TEM CERTEZA ABSOLUTA que deseja FORÇAR o fechamento?')) {
+                        return;
+                    }
+                    
+                    const response = await fetch('/force-close', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    
+                    const data = await response.json();
+                    const resultDiv = document.getElementById('result');
+                    
+                    if (response.ok) {
+                        resultDiv.innerHTML = '<div style="color: #00ff88; font-weight: bold;">✅ ' + data.message + '</div>';
+                        setTimeout(() => window.location.href = '/', 2000);
+                    } else {
+                        resultDiv.innerHTML = '<div style="color: #ff4444; font-weight: bold;">❌ ' + data.message + '</div>';
+                    }
+                }
+                </script>
+            </body>
+            </html>
+            """
+            return html
+        
+        # Método POST - Executar fechamento forçado
+        result = strategy_runner.force_close_current_position()
+        if result.get('success'):
+            logger.info("🔴 POSIÇÃO FECHADA FORÇADAMENTE via API")
+            return jsonify(result)
+        else:
+            return jsonify(result), 400
+            
+    except Exception as e:
+        logger.error(f"Erro ao forçar fechamento: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/status')
 def status():
     price = strategy_runner.current_price if strategy_runner else None
@@ -463,6 +620,17 @@ def status():
     position_size = getattr(strategy_runner, 'position_size', 0) if strategy_runner else 0
     last_bar = strategy_runner.last_bar_timestamp.strftime('%H:%M') if strategy_runner and strategy_runner.last_bar_timestamp else None
     
+    # Calcular PnL se houver posição
+    pnl_usdt = 0
+    pnl_percent = 0
+    if position_side and entry_price and price:
+        if position_side == 'long':
+            pnl_usdt = (price - entry_price) * position_size
+            pnl_percent = ((price - entry_price) / entry_price) * 100
+        elif position_side == 'short':
+            pnl_usdt = (entry_price - price) * abs(position_size)
+            pnl_percent = ((entry_price - price) / entry_price) * 100
+    
     return jsonify({
         "trading_active": trading_active,
         "current_price": price,
@@ -474,6 +642,8 @@ def status():
         "entry_price": entry_price,
         "stop_loss_price": stop_loss,
         "take_profit_price": take_profit,
+        "pnl_usdt": round(pnl_usdt, 2),
+        "pnl_percent": round(pnl_percent, 2),
         "last_bar_timestamp": last_bar,
         "environment": "render" if IS_RENDER else "local",
         "simulation_mode": True
