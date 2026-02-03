@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MAIN.PY - Bot Trading ETH/USDT com execução por tick e trailing stop
-Refatorado para replicar exatamente a estratégia Pine Script
+MAIN.PY - Bot Trading ETH/USDT com execução TOTALMENTE por tick
+Replicação EXATA da estratégia Pine Script do TradingView
 """
 import os
 import sys
@@ -57,7 +57,6 @@ try:
     from src.keep_alive import KeepAliveSystem
     from src.strategy_runner import StrategyRunner
     from src.trade_history import TradeHistory
-    from src.trailing_stop import TrailingStopManager
     
     logger.info("✅ Módulos importados com sucesso")
     
@@ -74,12 +73,13 @@ try:
     
     keep_alive = KeepAliveSystem(base_url=base_url)
     
-    # Inicializar strategy runner (agora com trailing stop)
+    # Inicializar strategy runner (AGORA COM EXECUÇÃO TOTAL POR TICK)
     strategy_runner = StrategyRunner(okx_client, trade_history)
     
     logger.info("✅ Sistema inicializado com sucesso")
-    logger.info("📊 Modo: EXECUÇÃO POR TICK (replicação exata Pine Script)")
-    logger.info("🎯 Trailing Stop: Ativado (offset=15p, trail=55p)")
+    logger.info("⚡ Modo: EXECUÇÃO TOTALMENTE POR TICK")
+    logger.info("🎯 Entradas/Saídas a qualquer momento (intra-bar)")
+    logger.info("📊 Replicação EXATA do Pine Script")
     
 except Exception as e:
     logger.error(f"❌ Erro na inicialização: {e}")
@@ -121,60 +121,72 @@ def start_strategy_automatically():
     
     try:
         logger.info("🚀 Iniciando estratégia automaticamente no Render...")
-        logger.info("📈 Modo: Processamento por tick em tempo real")
+        logger.info("⚡ Modo: EXECUÇÃO TOTAL POR TICK (igual TradingView)")
         
         # Iniciar o strategy runner
         if strategy_runner.start():
             trading_active = True
             
             def monitoring_loop():
-                """Loop de monitoramento (não processa ticks, apenas monitora)"""
+                """Loop de monitoramento LEVE (processamento é feito no WebSocket)"""
                 logger.info("👁️  Loop de monitoramento iniciado")
                 
                 last_status_log = time.time()
-                last_trailing_log = time.time()
+                last_bar_log = time.time()
                 
                 while trading_active and strategy_runner:
                     try:
-                        # Apenas monitorar status (os ticks são processados pelo WebSocket)
                         current_time = time.time()
                         
-                        # Log de status a cada 30 segundos
-                        if current_time - last_status_log > 30:
+                        # Log de status a cada 10 segundos
+                        if current_time - last_status_log > 10:
                             if strategy_runner.current_price:
-                                status_msg = f"📈 Status: ${strategy_runner.current_price:.2f}"
+                                status_msg = f"📊 Tick: ${strategy_runner.current_price:.2f}"
                                 
                                 if strategy_runner.position_side:
-                                    status_msg += f" | Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH"
+                                    status_msg += f" | {strategy_runner.position_side.upper()} {abs(strategy_runner.position_size):.4f} ETH"
                                     
-                                    # Mostrar trailing stop atual
+                                    # Mostrar trailing stop
                                     trailing_price = strategy_runner.trailing_stop.get_stop_price()
                                     if trailing_price:
-                                        status_msg += f" | Trailing Stop: ${trailing_price:.2f}"
-                                        
-                                        # Log detalhado do trailing stop a cada 60 segundos
-                                        if current_time - last_trailing_log > 60:
-                                            trailing_status = strategy_runner.trailing_stop.get_status()
-                                            logger.info(f"🎯 Trailing Stop Status:")
-                                            logger.info(f"   Ativado: {trailing_status['activated']}")
-                                            logger.info(f"   Melhor preço: ${trailing_status['best_price']:.2f}")
-                                            logger.info(f"   Stop atual: ${trailing_status['current_stop']:.2f}")
-                                            last_trailing_log = current_time
+                                        if strategy_runner.position_side == 'long':
+                                            distance = strategy_runner.current_price - trailing_price
+                                        else:
+                                            distance = trailing_price - strategy_runner.current_price
+                                        status_msg += f" | Trail: ${trailing_price:.2f} (dist: ${distance:.2f})"
+                                    
+                                    # Mostrar sinais pendentes
+                                    if strategy_runner.pending_buy_signal:
+                                        status_msg += " | 🟢 BUY PENDENTE"
+                                    if strategy_runner.pending_sell_signal:
+                                        status_msg += " | 🔴 SELL PENDENTE"
                                 
                                 logger.info(status_msg)
                             last_status_log = current_time
                         
-                        time.sleep(1)  # Monitoramento leve
+                        # Log de barra a cada 30 segundos (apenas para informação)
+                        if current_time - last_bar_log > 30:
+                            if strategy_runner.last_bar_timestamp:
+                                now_brazil = datetime.now(strategy_runner.tz_brazil)
+                                next_bar = strategy_runner.last_bar_timestamp + strategy_runner.timedelta(minutes=30)
+                                time_to_next = (next_bar - now_brazil).total_seconds()
+                                
+                                if time_to_next > 0:
+                                    logger.info(f"⏰ Próxima barra em {int(time_to_next/60)}:{int(time_to_next%60):02d} minutos")
+                                
+                                last_bar_log = current_time
+                        
+                        time.sleep(0.5)  # Loop leve
                         
                     except Exception as e:
                         logger.error(f"💥 Erro no loop de monitoramento: {e}")
-                        time.sleep(5)
+                        time.sleep(2)
             
             # Iniciar thread de monitoramento
             trade_thread = threading.Thread(target=monitoring_loop, daemon=True)
             trade_thread.start()
             logger.info("✅ Estratégia iniciada automaticamente no Render")
-            logger.info("📊 Os ticks são processados em tempo real via WebSocket")
+            logger.info("📈 Cada tick do WebSocket é processado em tempo real")
         else:
             logger.error("❌ Falha ao iniciar a estratégia automaticamente")
             
@@ -203,7 +215,9 @@ def home():
             'entry_price': strategy_runner.entry_price,
             'current_price': strategy_runner.current_price,
             'stop_loss': strategy_runner.stop_loss_price,
-            'take_profit': strategy_runner.take_profit_price
+            'take_profit': strategy_runner.take_profit_price,
+            'pending_buy': strategy_runner.pending_buy_signal,
+            'pending_sell': strategy_runner.pending_sell_signal
         }
         
         # Obter informações do trailing stop
@@ -217,11 +231,26 @@ def home():
                 'trail_offset': trailing_status['trail_offset']
             }
     
+    # Calcular tempo até próxima barra
+    next_bar_info = ""
+    if strategy_runner and strategy_runner.last_bar_timestamp:
+        try:
+            now_brazil = datetime.now(strategy_runner.tz_brazil)
+            next_bar = strategy_runner.last_bar_timestamp + strategy_runner.timedelta(minutes=30)
+            time_to_next = (next_bar - now_brazil).total_seconds()
+            
+            if time_to_next > 0:
+                minutes = int(time_to_next / 60)
+                seconds = int(time_to_next % 60)
+                next_bar_info = f"Próxima barra em: {minutes}:{seconds:02d}"
+        except:
+            pass
+    
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Bot Trading ETH/USDT - EXECUÇÃO POR TICK</title>
+        <title>Bot Trading ETH/USDT - EXECUÇÃO POR TICK TOTAL</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: Arial, sans-serif; background: #1a1a2e; color: white; text-align: center; padding: 20px; }
@@ -243,24 +272,55 @@ def home():
             .position-info h3 { color: #00ff88; margin-top: 0; }
             .trailing-info { background: rgba(255,215,0,0.1); padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; border: 1px solid #ffd700; }
             .trailing-info h3 { color: #ffd700; margin-top: 0; }
+            .signals-info { background: rgba(0,150,255,0.1); padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; border: 1px solid #0096ff; }
+            .signals-info h3 { color: #0096ff; margin-top: 0; }
             .debug { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin: 20px 0; text-align: left; }
             .debug pre { overflow: auto; max-height: 300px; }
             .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }
             @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+            .signal-active { color: #00ff88; font-weight: bold; }
+            .signal-inactive { color: #888; }
+            .next-bar { background: rgba(100,100,255,0.1); padding: 10px; border-radius: 5px; margin: 10px 0; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>⚡ Bot Trading ETH/USDT - EXECUÇÃO POR TICK</h1>
+                <h1>⚡ Bot Trading ETH/USDT - EXECUÇÃO POR TICK TOTAL</h1>
                 <p>Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Modo: SIMULAÇÃO</p>
                 <p><strong>Ambiente:</strong> """ + ("🌍 RENDER" if IS_RENDER else "💻 LOCAL") + """</p>
                 <p><strong>Status:</strong> {{ '🟢 ATIVO' if trading_active else '🔴 INATIVO' }}</p>
-                <p><strong>Modo:</strong> Processamento por Tick (Trailing Stop Ativo)</p>
+                <p><strong>Modo:</strong> Processamento TOTAL por Tick (Entradas/Saídas intra-bar)</p>
+                {% if next_bar_info %}
+                <div class="next-bar">
+                    ⏰ {{ next_bar_info }}
+                </div>
+                {% endif %}
             </div>
             
             <div class="status {{ 'active' if trading_active else 'inactive' }}">
-                {{ '🟢 ATIVO - Processando ticks em tempo real' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
+                {{ '🟢 ATIVO - Processando CADA TICK em tempo real' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
+            </div>
+            
+            <div class="signals-info">
+                <h3>📡 SINAIS ATUAIS</h3>
+                <p><strong>Sinal BUY pendente:</strong> 
+                    <span class="{{ 'signal-active' if position_info.pending_buy else 'signal-inactive' }}">
+                        {{ '🟢 ATIVO' if position_info.pending_buy else '⚪ INATIVO' }}
+                    </span>
+                </p>
+                <p><strong>Sinal SELL pendente:</strong> 
+                    <span class="{{ 'signal-active' if position_info.pending_sell else 'signal-inactive' }}">
+                        {{ '🔴 ATIVO' if position_info.pending_sell else '⚪ INATIVO' }}
+                    </span>
+                </p>
+                <p><strong>Posição atual:</strong> 
+                    {% if position_info.has_position %}
+                        {{ position_info.position_side|upper }} {{ position_info.position_size }} ETH
+                    {% else %}
+                        FLAT (sem posição)
+                    {% endif %}
+                </p>
             </div>
             
             <div class="grid">
@@ -296,8 +356,10 @@ def home():
                     <p><strong>Distância até Stop:</strong> 
                         {% if position_info.position_side == 'long' %}
                             ${{ "%.2f"|format(position_info.current_price - trailing_info.current_stop) }}
+                            ({{ "%.1f"|format((position_info.current_price - trailing_info.current_stop) / position_info.current_price * 100) }}%)
                         {% else %}
                             ${{ "%.2f"|format(trailing_info.current_stop - position_info.current_price) }}
+                            ({{ "%.1f"|format((trailing_info.current_stop - position_info.current_price) / position_info.current_price * 100) }}%)
                         {% endif %}
                     </p>
                 </div>
@@ -327,12 +389,15 @@ def home():
                 <a href="/restart">🔄 Reiniciar</a>
                 <a href="/force-close">🔴 Fechar Posição</a>
                 <a href="/trailing-status">🎯 Trailing Status</a>
+                <a href="/tick-log">⚡ Últimos Ticks</a>
             </div>
             
             <div class="info">
-                <strong>⚡ MODO TICK ATIVADO:</strong> Processando cada novo preço em tempo real<br>
-                <strong>🎯 TRAILING STOP:</strong> Offset=15p, Trail=55p (exatamente como Pine Script)<br>
-                <strong>⏰ Timeframe:</strong> 30 minutos • <strong>Horário:</strong> Brasília (BRT)<br>
+                <strong>⚡ MODO TICK TOTAL:</strong> Cada preço do WebSocket é processado IMEDIATAMENTE<br>
+                <strong>🎯 TRAILING STOP ATIVO:</strong> Offset=15p, Trail=55p (exato Pine Script)<br>
+                <strong>⏰ Timeframe:</strong> 30 minutos (apenas referência)<br>
+                <strong>📈 Entradas:</strong> A qualquer momento (sinal confirmado)<br>
+                <strong>📉 Saídas:</strong> A qualquer momento (trailing stop intra-bar)<br>
                 <strong>⚠️ MODO SIMULAÇÃO:</strong> Nenhuma ordem real será enviada à OKX
             </div>
         </div>
@@ -371,6 +436,11 @@ def home():
                 }
             }
         }
+        
+        // Auto-refresh a cada 30 segundos
+        setTimeout(() => {
+            location.reload();
+        }, 30000);
         </script>
     </body>
     </html>
@@ -379,7 +449,8 @@ def home():
                                  trading_active=trading_active, 
                                  IS_RENDER=IS_RENDER,
                                  position_info=position_info,
-                                 trailing_info=trailing_info)
+                                 trailing_info=trailing_info,
+                                 next_bar_info=next_bar_info)
 
 # ============================================================================
 # 8. ENDPOINTS DA API
@@ -390,8 +461,9 @@ def health():
         "status": "healthy",
         "service": "OKX ETH Trading Bot (Tick Mode)",
         "trading_active": trading_active,
-        "mode": "tick_processing",
+        "mode": "full_tick_processing",
         "trailing_stop": True,
+        "intra_bar_trading": True,
         "timestamp": datetime.now().isoformat(),
         "environment": "render" if IS_RENDER else "local",
         "uptime_seconds": round(time.time() - start_time, 2)
@@ -403,11 +475,20 @@ def debug_info():
     try:
         strategy_status = {}
         if strategy_runner:
-            # Obtém informações do interpretador
-            interpreter_info = strategy_runner.interpreter.get_diagnostic_info() if strategy_runner.interpreter else {}
+            # Obter informações do interpretador
+            interpreter_info = {}
+            if strategy_runner.interpreter:
+                interpreter_info = {
+                    'period': strategy_runner.interpreter.period,
+                    'gain_limit': strategy_runner.interpreter.gain_limit,
+                    'threshold': strategy_runner.interpreter.threshold,
+                    'adaptive': strategy_runner.interpreter.adaptive
+                }
             
-            # Obtém status do trailing stop
-            trailing_status = strategy_runner.trailing_stop.get_status() if strategy_runner.position_size else {}
+            # Obter status do trailing stop
+            trailing_status = {}
+            if strategy_runner.position_size != 0:
+                trailing_status = strategy_runner.trailing_stop.get_status()
             
             # Verificar se deve fechar posição
             should_close = False
@@ -425,16 +506,16 @@ def debug_info():
                 "entry_price": strategy_runner.entry_price,
                 "stop_loss_price": strategy_runner.stop_loss_price,
                 "take_profit_price": strategy_runner.take_profit_price,
-                "interpreter_initialized": strategy_runner.interpreter is not None,
                 "interpreter_info": interpreter_info,
                 "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if strategy_runner.last_bar_timestamp else None,
                 "websocket_connected": getattr(strategy_runner, 'ws', None) and getattr(strategy_runner.ws, 'sock', None) and strategy_runner.ws.sock.connected,
                 "should_close_position": should_close,
                 "trailing_stop": trailing_status,
-                "trailing_stop_price": strategy_runner.trailing_stop.get_stop_price() if strategy_runner.position_size else None
+                "trailing_stop_price": strategy_runner.trailing_stop.get_stop_price() if strategy_runner.position_size else None,
+                "processing_mode": "full_tick_realtime"
             }
         
-        # Obtém trade_history_count
+        # Obter trade_history_count
         trade_history_count = 0
         if trade_history and hasattr(trade_history, 'trades'):
             trade_history_count = len(trade_history.trades)
@@ -443,7 +524,8 @@ def debug_info():
             "trading_active": trading_active,
             "environment": "render" if IS_RENDER else "local",
             "simulation_mode": True,
-            "processing_mode": "tick_realtime",
+            "processing_mode": "full_tick_realtime",
+            "intra_bar_execution": True,
             "strategy_runner": strategy_status,
             "okx_initialized": okx_client is not None,
             "trade_history_count": trade_history_count,
@@ -468,19 +550,83 @@ def trailing_status():
             })
         
         trailing_status = strategy_runner.trailing_stop.get_status()
+        current_price = strategy_runner.current_price
+        
+        # Calcular distância
+        distance_to_stop = 0
+        if trailing_status['current_stop'] and current_price:
+            if strategy_runner.position_side == 'long':
+                distance_to_stop = current_price - trailing_status['current_stop']
+            else:
+                distance_to_stop = trailing_status['current_stop'] - current_price
         
         return jsonify({
             "has_position": True,
             "position_side": strategy_runner.position_side,
             "position_size": abs(strategy_runner.position_size),
             "entry_price": strategy_runner.entry_price,
-            "current_price": strategy_runner.current_price,
+            "current_price": current_price,
             "trailing_stop": trailing_status,
-            "distance_to_stop": strategy_runner.current_price - trailing_status['current_stop'] if strategy_runner.position_side == 'long' else trailing_status['current_stop'] - strategy_runner.current_price,
-            "should_close": strategy_runner.trailing_stop.should_close(strategy_runner.current_price)
+            "distance_to_stop": distance_to_stop,
+            "distance_percent": (distance_to_stop / current_price * 100) if current_price > 0 else 0,
+            "should_close": strategy_runner.trailing_stop.should_close(current_price),
+            "time_since_entry": time.time() - start_time if strategy_runner.entry_price else 0
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/tick-log')
+def tick_log():
+    """Endpoint para ver últimos ticks processados"""
+    if not strategy_runner:
+        return jsonify({"error": "Strategy Runner não inicializado"}), 500
+    
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Últimos Ticks Processados</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; background: #1a1a2e; color: white; padding: 20px; }
+            .container { max-width: 1200px; margin: 0 auto; }
+            .header { text-align: center; margin-bottom: 30px; }
+            h1 { color: #00ff88; margin-bottom: 10px; }
+            .back-btn { padding: 10px 20px; background: #555; color: white; border: none; border-radius: 5px; cursor: pointer; margin: 20px 0; }
+            .info { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin: 20px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>⚡ Últimos Ticks Processados</h1>
+                <p>Modo: Processamento TOTAL por Tick</p>
+            </div>
+            
+            <div class="info">
+                <h3>Informações do Sistema</h3>
+                <p><strong>Preço Atual:</strong> $""" + (f"{strategy_runner.current_price:.2f}" if strategy_runner and strategy_runner.current_price else "N/A") + """</p>
+                <p><strong>Último Processamento:</strong> """ + (f"{datetime.now().strftime('%H:%M:%S')}" if strategy_runner else "N/A") + """</p>
+                <p><strong>WebSocket Conectado:</strong> """ + ("✅ Sim" if strategy_runner and strategy_runner.ws and strategy_runner.ws.sock and strategy_runner.ws.sock.connected else "❌ Não") + """</p>
+                <p><strong>Modo:</strong> Cada tick é processado em tempo real</p>
+            </div>
+            
+            <button class="back-btn" onclick="window.location.href='/'">🏠 Voltar</button>
+            
+            <div class="info">
+                <h3>Como funciona:</h3>
+                <p>1. Cada novo preço do WebSocket é processado IMEDIATAMENTE</p>
+                <p>2. O indicador EC/EMA é calculado a cada tick</p>
+                <p>3. Sinais são detectados no momento que ocorrem</p>
+                <p>4. Entradas ocorrem no PRIMEIRO TICK após confirmação do sinal</p>
+                <p>5. Saídas ocorrem a QUALQUER MOMENTO via trailing stop</p>
+                <p>6. NÃO há espera pelo fechamento da barra de 30 minutos</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 @app.route('/restart')
 def restart_strategy():
@@ -504,8 +650,8 @@ def restart_strategy():
         # Reiniciar estratégia
         if strategy_runner.start():
             trading_active = True
-            logger.info("🔄 Estratégia reiniciada com sucesso (modo tick)")
-            return jsonify({"success": True, "message": "Estratégia reiniciada completamente (modo tick)"})
+            logger.info("🔄 Estratégia reiniciada com sucesso (MODO TICK TOTAL)")
+            return jsonify({"success": True, "message": "Estratégia reiniciada completamente (MODO TICK TOTAL)"})
         else:
             return jsonify({"error": "Falha ao reiniciar estratégia"}), 500
             
@@ -530,57 +676,57 @@ def start_trading():
         trading_active = True
         
         def monitoring_loop():
-            """Loop de monitoramento (os ticks são processados pelo WebSocket)"""
+            """Loop de monitoramento LEVE"""
             logger.info("👁️  Loop de monitoramento iniciado manualmente")
             
             last_status_log = time.time()
-            last_trailing_log = time.time()
             
             while trading_active and strategy_runner:
                 try:
-                    # Apenas monitorar (os ticks são processados no WebSocket callback)
                     current_time = time.time()
                     
-                    # Log de status a cada 30 segundos
-                    if current_time - last_status_log > 30:
+                    # Log de status a cada 10 segundos
+                    if current_time - last_status_log > 10:
                         if strategy_runner.current_price:
-                            status_msg = f"📈 Status: ${strategy_runner.current_price:.2f}"
+                            status_msg = f"📊 Tick: ${strategy_runner.current_price:.2f}"
                             
                             if strategy_runner.position_side:
-                                status_msg += f" | Posição: {strategy_runner.position_side} {abs(strategy_runner.position_size):.4f} ETH"
+                                status_msg += f" | {strategy_runner.position_side.upper()} {abs(strategy_runner.position_size):.4f} ETH"
                                 
-                                # Mostrar trailing stop atual
+                                # Mostrar trailing stop
                                 trailing_price = strategy_runner.trailing_stop.get_stop_price()
                                 if trailing_price:
-                                    status_msg += f" | Trailing Stop: ${trailing_price:.2f}"
-                                    
-                                    # Log detalhado do trailing stop a cada 60 segundos
-                                    if current_time - last_trailing_log > 60:
-                                        trailing_status = strategy_runner.trailing_stop.get_status()
-                                        logger.info(f"🎯 Trailing Stop Status:")
-                                        logger.info(f"   Ativado: {trailing_status['activated']}")
-                                        logger.info(f"   Melhor preço: ${trailing_status['best_price']:.2f}")
-                                        logger.info(f"   Stop atual: ${trailing_status['current_stop']:.2f}")
-                                        last_trailing_log = current_time
+                                    if strategy_runner.position_side == 'long':
+                                        distance = strategy_runner.current_price - trailing_price
+                                    else:
+                                        distance = trailing_price - strategy_runner.current_price
+                                    status_msg += f" | Trail: ${trailing_price:.2f} (dist: ${distance:.2f})"
+                                
+                                # Mostrar sinais pendentes
+                                if strategy_runner.pending_buy_signal:
+                                    status_msg += " | 🟢 BUY PENDENTE"
+                                if strategy_runner.pending_sell_signal:
+                                    status_msg += " | 🔴 SELL PENDENTE"
                             
                             logger.info(status_msg)
                         last_status_log = current_time
                     
-                    time.sleep(1)  # Monitoramento leve
+                    time.sleep(0.5)  # Loop leve
                     
                 except Exception as e:
                     logger.error(f"💥 Erro no loop de monitoramento: {e}")
-                    time.sleep(5)
+                    time.sleep(2)
         
         # Iniciar thread de monitoramento
         trade_thread = threading.Thread(target=monitoring_loop, daemon=True)
         trade_thread.start()
         
-        logger.info("⚡ BOT LIGADO em modo TICK PROCESSING!")
-        logger.info("📊 Os ticks são processados em tempo real via WebSocket")
+        logger.info("⚡ BOT LIGADO em modo TICK TOTAL!")
+        logger.info("📈 Cada tick do WebSocket é processado em tempo real")
+        logger.info("🎯 Entradas/Saídas ocorrem a qualquer momento (intra-bar)")
         return jsonify({
             "status": "success", 
-            "message": "Bot iniciado em modo TICK PROCESSING com trailing stop!"
+            "message": "Bot iniciado em modo TICK TOTAL com execução intra-bar!"
         })
         
     except Exception as e:
@@ -596,7 +742,7 @@ def stop_trading():
     
     trading_active = False
     
-    logger.info("⏹️ BOT PARADO (modo tick)")
+    logger.info("⏹️ BOT PARADO (modo tick total)")
     return jsonify({"status": "success", "message": "Bot parado."})
 
 @app.route('/force-close', methods=['GET', 'POST'])
@@ -629,7 +775,8 @@ def force_close_position():
                     <div class="warning">
                         <h3>⚠️ ATENÇÃO</h3>
                         <p>Esta ação irá FORÇAR o fechamento da posição atual.</p>
-                        <p><strong>Ignorará trailing stop e fechará imediatamente.</strong></p>
+                        <p><strong>Ignorará trailing stop e fechará IMEDIATAMENTE.</strong></p>
+                        <p><strong>Modo TICK:</strong> Fechamento ocorre no preço atual.</p>
                     </div>
                     <div>
                         <button class="btn force-btn" onclick="forceClose()">🔴 FORÇAR FECHAMENTO</button>
@@ -683,29 +830,40 @@ def status():
     balance = okx_client.get_balance() if okx_client else 0
     
     # Obter informações da estratégia
-    pending_buy = strategy_runner.pending_buy_signal if strategy_runner else False
-    pending_sell = strategy_runner.pending_sell_signal if strategy_runner else False
-    entry_price = strategy_runner.entry_price if strategy_runner else None
-    stop_loss = strategy_runner.stop_loss_price if strategy_runner else None
-    take_profit = strategy_runner.take_profit_price if strategy_runner else None
-    position_side = strategy_runner.position_side if strategy_runner else None
-    position_size = strategy_runner.position_size if strategy_runner else 0
-    last_bar = strategy_runner.last_bar_timestamp.strftime('%H:%M') if strategy_runner and strategy_runner.last_bar_timestamp else None
+    if strategy_runner:
+        pending_buy = strategy_runner.pending_buy_signal
+        pending_sell = strategy_runner.pending_sell_signal
+        entry_price = strategy_runner.entry_price
+        stop_loss = strategy_runner.stop_loss_price
+        take_profit = strategy_runner.take_profit_price
+        position_side = strategy_runner.position_side
+        position_size = strategy_runner.position_size
+        last_bar = strategy_runner.last_bar_timestamp.strftime('%H:%M') if strategy_runner.last_bar_timestamp else None
+        bar_count = strategy_runner.bar_count
+    else:
+        pending_buy = pending_sell = False
+        entry_price = stop_loss = take_profit = None
+        position_side = None
+        position_size = 0
+        last_bar = None
+        bar_count = 0
     
     # Obter informações do trailing stop
     trailing_stop_price = None
     trailing_activated = False
+    best_price = None
     if strategy_runner and strategy_runner.position_size != 0:
         trailing_status = strategy_runner.trailing_stop.get_status()
         trailing_stop_price = trailing_status.get('current_stop')
         trailing_activated = trailing_status.get('activated', False)
+        best_price = trailing_status.get('best_price')
     
     # Calcular PnL se houver posição
     pnl_usdt = 0
     pnl_percent = 0
     if position_side and entry_price and price:
         if position_side == 'long':
-            pnl_usdt = (price - entry_price) * position_size
+            pnl_usdt = (price - entry_price) * abs(position_size)
             pnl_percent = ((price - entry_price) / entry_price) * 100
         elif position_side == 'short':
             pnl_usdt = (entry_price - price) * abs(position_size)
@@ -724,12 +882,15 @@ def status():
         "take_profit_price": take_profit,
         "trailing_stop_price": trailing_stop_price,
         "trailing_activated": trailing_activated,
+        "trailing_best_price": best_price,
         "pnl_usdt": round(pnl_usdt, 2),
         "pnl_percent": round(pnl_percent, 2),
         "last_bar_timestamp": last_bar,
+        "bar_count": bar_count,
         "environment": "render" if IS_RENDER else "local",
         "simulation_mode": True,
-        "processing_mode": "tick_realtime"
+        "processing_mode": "full_tick_realtime",
+        "intra_bar_trading": True
     })
 
 @app.route('/history')
@@ -745,7 +906,7 @@ def history_page():
         <!DOCTYPE html>
         <html>
         <head>
-            <title>📜 Histórico de Operações - Modo Tick</title>
+            <title>📜 Histórico de Operações - Modo Tick Total</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
                 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -771,14 +932,13 @@ def history_page():
                 .side-sell { color: #ff4444; font-weight: bold; }
                 .empty { text-align: center; padding: 50px; color: #888; }
                 .footer { text-align: center; margin-top: 30px; color: #888; font-size: 14px; }
-                .trailing-badge { background: #ffd700; color: #000; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin-left: 5px; }
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>📜 Histórico de Operações - MODO TICK</h1>
-                    <p>ETH/USDT - Processamento por Tick • Trailing Stop Ativo</p>
+                    <h1>📜 Histórico de Operações - MODO TICK TOTAL</h1>
+                    <p>ETH/USDT - Processamento TOTAL por Tick • Entradas/Saídas intra-bar</p>
                 </div>
                 
                 <div class="stats">
@@ -827,7 +987,7 @@ def history_page():
                     <div style="font-size: 50px; margin-bottom: 20px;">📭</div>
                     <h3>Nenhuma operação registrada</h3>
                     <p>Quando o bot executar trades, elas aparecerão aqui.</p>
-                    <p><em>Modo: Execução por Tick com Trailing Stop</em></p>
+                    <p><em>Modo: Execução TOTAL por Tick com Trailing Stop</em></p>
                 </div>
             """
         else:
@@ -854,16 +1014,17 @@ def history_page():
                 side_class = "side-buy" if trade['side'] == 'buy' else "side-sell"
                 pnl_class = "positive" if trade['pnl_percent'] > 0 else "negative" if trade['pnl_percent'] < 0 else ""
                 
-                # Identificar se foi fechamento por trailing stop
-                reason_icon = '✅'
+                # Identificar motivo do fechamento
+                reason_icon = '⚡'  # Padrão para execução por tick
                 if trade.get('status') == 'closed':
-                    # Verificar pelo motivo se foi trailing stop
                     if 'trailing' in trade.get('reason', '').lower():
                         reason_icon = '🎯'
                     elif 'stop' in trade.get('reason', '').lower():
                         reason_icon = '🛑'
                     elif 'profit' in trade.get('reason', '').lower():
                         reason_icon = '💰'
+                    elif 'inversao' in trade.get('reason', '').lower():
+                        reason_icon = '🔄'
                 
                 html += f"""
                         <tr>
@@ -887,10 +1048,10 @@ def history_page():
         
         html += """
                 <div class="footer">
-                    <p><strong>⚡ MODO TICK ATIVADO:</strong> Processamento por tick com trailing stop dinâmico</p>
-                    <p><strong>🎯 TRAILING STOP:</strong> Offset=15p, Trail=55p (exatamente como Pine Script)</p>
+                    <p><strong>⚡ MODO TICK TOTAL:</strong> Entradas e saídas ocorrem a QUALQUER MOMENTO</p>
+                    <p><strong>🎯 TRAILING STOP ATIVO:</strong> Fechamentos intra-bar via trailing stop dinâmico</p>
                     <p><strong>⚠️ MODO SIMULAÇÃO:</strong> Nenhuma ordem real foi executada na OKX.</p>
-                    <p>Horário de Brasília (BRT) • Processamento em tempo real</p>
+                    <p>Horário de Brasília (BRT) • Processamento em tempo real por tick</p>
                 </div>
             </div>
             
@@ -944,8 +1105,9 @@ def test_auth():
             "api_key_exists": bool(okx_client.api_key),
             "secret_key_exists": bool(okx_client.secret_key),
             "passphrase_exists": bool(okx_client.passphrase),
-            "mode": "tick_processing",
-            "trailing_stop": True
+            "mode": "full_tick_processing",
+            "trailing_stop": True,
+            "intra_bar_trading": True
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -955,8 +1117,9 @@ def test_auth():
 # ============================================================================
 if __name__ == '__main__':
     logger.info(f"🚀 Iniciando servidor na porta {PORT}...")
-    logger.info(f"📊 Modo de operação: EXECUÇÃO POR TICK")
-    logger.info(f"🎯 Trailing Stop: Ativado (exatamente como Pine Script)")
+    logger.info(f"⚡ Modo de operação: EXECUÇÃO TOTAL POR TICK")
+    logger.info(f"🎯 Trailing Stop: Ativado (execução intra-bar)")
+    logger.info(f"📈 Entradas/Saídas: A QUALQUER MOMENTO (igual TradingView)")
     
     # Iniciar estratégia automaticamente se estiver em ambiente local
     if not IS_RENDER:
