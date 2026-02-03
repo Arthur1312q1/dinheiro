@@ -1,5 +1,6 @@
 """
-Motor de Execução Pine Script v3 - VERSÃO COM EXECUÇÃO POR TICK
+Motor de Execução Pine Script v3 - VERSÃO FINAL OTIMIZADA
+Interpreta e executa estratégias Pine Script diretamente em Python
 """
 import re
 import math
@@ -23,7 +24,7 @@ class PineSeries:
     
     def append(self, value: float):
         self.values.append(value)
-        if len(self.values) > 5000:
+        if len(self.values) > 5000:  # Mantém histórico suficiente
             self.values.pop(0)
     
     def current(self) -> float:
@@ -33,43 +34,59 @@ class PineSeries:
         return len(self.values)
 
 class PineScriptInterpreter:
-    """Interpreta código Pine Script v3 EXATAMENTE como TradingView"""
+    """Interpreta e executa código Pine Script v3 EXATAMENTE como TradingView"""
     
     def __init__(self, pine_code: str):
         self.pine_code = pine_code
         self.symbol_table = {}
         self.series_data = {}
         
-        # Configurações da estratégia
+        # Contador de candles processados
+        self.candle_count = 0
+        
+        # Configurações da estratégia (extraídas do código)
         self.params = self._extract_parameters()
         
         # Estado da execução - VALORES EXATOS do Pine Script
         self.period = self.params.get('Period', 20)
-        self.gain_limit = self.params.get('GainLimit', 900)
-        self.threshold = self.params.get('Threshold', 0.0)
-        self.fixedSL = self.params.get('fixedSL', 2000)
-        self.fixedTP = self.params.get('fixedTP', 55)
-        self.risk = self.params.get('risk', 0.01)
-        self.adaptive = self.params.get('adaptive', 'Cos IFM')
+        self.gain_limit = self.params.get('GainLimit', 900)  # CORREÇÃO: 900 do Pine Script
+        self.threshold = self.params.get('Threshold', 0.0)   # CORREÇÃO: 0.0 do Pine Script (desabilitado)
+        self.fixedSL = self.params.get('fixedSL', 2000)      # Stop Loss em pontos
+        self.fixedTP = self.params.get('fixedTP', 55)        # Take Profit em pontos
+        self.risk = self.params.get('risk', 0.01)           # Risco 1%
+        self.adaptive = self.params.get('adaptive', 'Cos IFM')  # Método adaptativo
         
-        # Configuração do cálculo
+        # Configuração do cálculo adaptativo
         self.alpha = 2.0 / (self.period + 1)
         
-        # CONSTANTES
-        self.PI = 3.14159265359
-        self.range_val = 50
+        # Séries temporais
+        self.series_data['src'] = PineSeries([])
+        self.series_data['EC'] = PineSeries([])
+        self.series_data['EMA'] = PineSeries([])
+        self.series_data['LeastError'] = PineSeries([])
         
-        # Inicializar todas as séries
-        self._initialize_series()
+        # SINAIS CRÍTICOS: Estes são calculados na barra atual mas executados na próxima
+        self.series_data['buy_signal'] = PineSeries([0.0])  # Crossover detectado
+        self.series_data['sell_signal'] = PineSeries([0.0])  # Crossunder detectado
         
-        logger.info(f"✅ Pine Script Interpreter (Tick Mode)")
-        logger.info(f"   Period={self.period}, GainLimit={self.gain_limit}")
+        # Flags persistentes (como no Pine: pendingBuy, pendingSell)
+        self.series_data['pendingBuy'] = PineSeries([0.0])
+        self.series_data['pendingSell'] = PineSeries([0.0])
+        
+        # Inicializa métodos adaptativos
+        self._init_adaptive_methods()
+        
+        logger.info(f"✅ Pine Script Interpreter inicializado")
+        logger.info(f"   Period={self.period}, GainLimit={self.gain_limit}, Threshold={self.threshold}")
         logger.info(f"   SL={self.fixedSL}p, TP={self.fixedTP}p, Risk={self.risk*100}%")
+        logger.info(f"   Adaptive Method: {self.adaptive}")
+        logger.info(f"   Código Pine tamanho: {len(pine_code)} bytes")
     
     def _extract_parameters(self) -> Dict[str, Any]:
-        """Extrai parâmetros do código Pine Script"""
+        """Extrai parâmetros do código Pine Script EXATAMENTE como estão"""
         params = {}
         
+        # Padrões para encontrar valores default - CORRIGIDOS
         patterns = {
             'Period': r'Period.*defval\s*=\s*(\d+)',
             'GainLimit': r'GainLimit.*defval\s*=\s*(\d+)',
@@ -91,12 +108,17 @@ class PineScriptInterpreter:
                         params[key] = float(value)
                     else:
                         params[key] = value
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"⚠️ Não consegui extrair parâmetro {key}: {e}")
         
+        # Valores padrão EXATOS do Pine Script original
         defaults = {
-            'fixedSL': 2000, 'fixedTP': 55, 'risk': 0.01,
-            'Period': 20, 'Threshold': 0.0, 'GainLimit': 900,
+            'fixedSL': 2000,
+            'fixedTP': 55,
+            'risk': 0.01,
+            'Period': 20,
+            'Threshold': 0.0,  # 0.0 no Pine original (threshold desabilitado)
+            'GainLimit': 900,
             'adaptive': 'Cos IFM'
         }
         
@@ -106,25 +128,26 @@ class PineScriptInterpreter:
         
         return params
     
-    def _initialize_series(self):
-        """Inicializa todas as séries temporais"""
-        series_list = [
-            'src', 'EC', 'EMA', 'LeastError',
-            'buy_signal', 'sell_signal',
-            'pendingBuy', 'pendingSell'
-        ]
-        
-        for series in series_list:
-            self.series_data[series] = PineSeries([0.0])
+    def _init_adaptive_methods(self):
+        """Inicializa variáveis para métodos adaptativos"""
+        self.series_data['lenIQ'] = PineSeries([0.0])
+        self.series_data['lenC'] = PineSeries([0.0])
+        self.series_data['re'] = PineSeries([0.0])
+        self.series_data['im'] = PineSeries([0.0])
+        self.series_data['s2'] = PineSeries([0.0])
+        self.series_data['s3'] = PineSeries([0.0])
     
     def calculate_ema(self, src: float, prev_ema: Optional[float]) -> float:
-        """Calcula EMA: alpha*src + (1-alpha)*nz(EMA[1])"""
-        if prev_ema is None or prev_ema == 0:
+        """Calcula EMA exatamente como no Pine Script"""
+        if prev_ema is None:
             return src
         return self.alpha * src + (1 - self.alpha) * prev_ema
     
     def calculate_zero_lag_ema(self, src: float) -> Tuple[float, float, float]:
-        """Implementa o algoritmo Zero Lag EMA"""
+        """
+        Implementa o algoritmo Zero Lag EMA do Pine Script EXATAMENTE
+        Retorna: (EMA, EC, LeastError)
+        """
         # Calcular EMA
         ema_prev = self.series_data['EMA'].current()
         ema = self.calculate_ema(src, ema_prev)
@@ -133,14 +156,18 @@ class PineScriptInterpreter:
         # Obter EC anterior
         ec_prev = self.series_data['EC'].current()
         if ec_prev == 0 and len(self.series_data['EC']) == 1:
-            ec_prev = src
+            ec_prev = src  # Primeira iteração
         
-        # Buscar melhor ganho
+        # Buscar melhor ganho (exatamente como no Pine)
         best_gain = 0.0
         least_error = float('inf')
         
+        # CORREÇÃO: Loop de -GainLimit a +GainLimit com passo 0.1
+        # No Pine: for i = -GainLimit to GainLimit, Gain := i/10.0
         for i in range(-self.gain_limit, self.gain_limit + 1):
             gain = i / 10.0
+            
+            # Calcular EC com este ganho
             ec_test = self.alpha * (ema + gain * (src - ec_prev)) + (1 - self.alpha) * ec_prev
             error = abs(src - ec_test)
             
@@ -155,82 +182,151 @@ class PineScriptInterpreter:
         
         return ema, ec, least_error
     
-    def process_tick(self, price: float, timestamp: datetime) -> Dict[str, Any]:
+    def process_candle(self, candle: Dict[str, float]) -> Dict[str, Any]:
         """
-        Processa um TICK em tempo real (chamado a cada novo preço)
-        Implementação EXATA do Pine Script:
-        - calc_on_every_tick=false (padrão) no Pine significa que o script roda no FECHAMENTO da barra
-        - Mas no TradingView, quando há trailing stop, ele monitora a cada tick para SAÍDAS
+        Processa um candle através da estratégia Pine Script EXATAMENTE como TradingView
+        Retorna sinais com delay de 1 barra (buy_signal[1]).
         """
-        self.series_data['src'].append(price)
+        self.candle_count += 1
+        src = candle['close']
+        self.series_data['src'].append(src)
         
-        # Calcular Zero Lag EMA
-        ema, ec, least_error = self.calculate_zero_lag_ema(price)
+        # 1. Calcular EMA e EC (Zero Lag)
+        ema, ec, least_error = self.calculate_zero_lag_ema(src)
         
-        # Obter valores anteriores
+        # 2. Obter valores anteriores para crossover/crossunder
         ec_prev = self.series_data['EC'][1] if len(self.series_data['EC']) > 1 else ec
         ema_prev = self.series_data['EMA'][1] if len(self.series_data['EMA']) > 1 else ema
         
-        # Calcular sinais CRUZAIS
-        crossover = (ec_prev <= ema_prev) and (ec > ema)
-        crossunder = (ec_prev >= ema_prev) and (ec < ema)
+        # 3. Calcular sinais na barra atual (como no Pine)
+        crossover_signal = (ec_prev <= ema_prev) and (ec > ema)
+        crossunder_signal = (ec_prev >= ema_prev) and (ec < ema)
         
-        # Aplicar threshold
-        error_pct = 100 * least_error / price if price > 0 else 0
+        # 4. Aplicar threshold (no Pine: 100*LeastError/src > Threshold)
+        error_pct = 100 * least_error / src if src > 0 else 0
         threshold_check = error_pct > self.threshold
         
-        # Sinais da barra atual (RAW) - SÓ NO FECHAMENTO NO PINE, mas aqui processamos a cada tick
-        buy_signal_current = crossover and threshold_check
-        sell_signal_current = crossunder and threshold_check
+        # 5. Sinais da barra atual (RAW)
+        buy_signal_current = crossover_signal and threshold_check
+        sell_signal_current = crossunder_signal and threshold_check
         
-        # Obter sinais da barra anterior
-        buy_signal_prev = self.series_data['buy_signal'].current()
-        sell_signal_prev = self.series_data['sell_signal'].current()
+        # 6. CRÍTICO: Implementar delay de 1 barra (buy_signal[1] no Pine)
+        # O sinal da barra anterior [1] é que determina a execução
+        buy_signal_prev = self.series_data['buy_signal'].current() if len(self.series_data['buy_signal']) > 0 else 0
+        sell_signal_prev = self.series_data['sell_signal'].current() if len(self.series_data['sell_signal']) > 0 else 0
         
-        # Atualizar sinais da barra atual
+        # 7. Atualizar séries de sinais (para uso na próxima barra)
         self.series_data['buy_signal'].append(1.0 if buy_signal_current else 0.0)
         self.series_data['sell_signal'].append(1.0 if sell_signal_current else 0.0)
         
-        # Lógica de flags pendentes EXATA como no Pine
-        pending_buy_prev = self.series_data['pendingBuy'].current()
-        pending_sell_prev = self.series_data['pendingSell'].current()
+        # 8. IMPLEMENTAÇÃO CORRETA do pendingBuy/pendingSell (como no Pine)
+        pending_buy_prev = self.series_data['pendingBuy'].current() if len(self.series_data['pendingBuy']) > 0 else 0
+        pending_sell_prev = self.series_data['pendingSell'].current() if len(self.series_data['pendingSell']) > 0 else 0
         
+        # Resetar flags pendentes (nz(pendingBuy[1]) no Pine)
         pending_buy_new = pending_buy_prev
         pending_sell_new = pending_sell_prev
         
         # Se houver sinal na barra ANTERIOR, marcar como pendente
-        # NO PINE: if (buy_signal[1]) pendingBuy := true
         if buy_signal_prev > 0:
             pending_buy_new = 1.0
-            pending_sell_new = 0.0  # Resetar oposto
+            pending_sell_new = 0.0  # Resetar oposto (como no Pine)
         
         if sell_signal_prev > 0:
             pending_sell_new = 1.0
-            pending_buy_new = 0.0  # Resetar oposto
+            pending_buy_new = 0.0  # Resetar oposto (como no Pine)
         
         self.series_data['pendingBuy'].append(pending_buy_new)
         self.series_data['pendingSell'].append(pending_sell_new)
         
-        return {
-            'timestamp': timestamp,
-            'price': price,
+        # 9. Determinar sinais para execução (baseado nos pendentes)
+        pending_buy_for_execution = pending_buy_new > 0
+        pending_sell_for_execution = pending_sell_new > 0
+        
+        # 10. LOGS DETALHADOS - CRÍTICO PARA DEBUG
+        if self.candle_count <= 10 or buy_signal_current or sell_signal_current or pending_buy_for_execution or pending_sell_for_execution:
+            logger.info(f"📊 Candle #{self.candle_count}: Preço=${src:.2f}")
+            logger.info(f"   EMA={ema:.2f}, EC={ec:.2f}, EC_prev={ec_prev:.2f}, EMA_prev={ema_prev:.2f}")
+            logger.info(f"   Erro={error_pct:.2f}%, Threshold={self.threshold}")
+            
+            # DEBUG EXTRA: Log de crossover/crossunder
+            if crossover_signal:
+                logger.info(f"   🟢 CRUZAMENTO PARA CIMA DETECTADO: EC ({ec:.2f}) > EMA ({ema:.2f})")
+            if crossunder_signal:
+                logger.info(f"   🔴 CRUZAMENTO PARA BAIXO DETECTADO: EC ({ec:.2f}) < EMA ({ema:.2f})")
+            
+            if buy_signal_current:
+                logger.info(f"   🟢 SINAL BUY NA BARRA ATUAL (executará na próxima)")
+            
+            if sell_signal_current:
+                logger.info(f"   🔴 SINAL SELL NA BARRA ATUAL (executará na próxima)")
+            
+            if pending_buy_for_execution:
+                logger.info(f"   ⚡ PENDING BUY ATIVO (aguardando execução)")
+            
+            if pending_sell_for_execution:
+                logger.info(f"   ⚡ PENDING SELL ATIVO (aguardando execução)")
+        
+        # 11. Resultado
+        result = {
+            # Sinais da barra atual (para debug)
+            'buy_signal_current': buy_signal_current,
+            'sell_signal_current': sell_signal_current,
+            
+            # Sinais PENDENTES para execução (estes são os que importam)
+            'pending_buy': pending_buy_for_execution,
+            'pending_sell': pending_sell_for_execution,
+            
+            # Dados técnicos
+            'price': src,
             'ema': ema,
             'ec': ec,
             'least_error': least_error,
             'error_pct': error_pct,
-            'crossover': crossover,
-            'crossunder': crossunder,
-            'buy_signal_current': buy_signal_current,
-            'sell_signal_current': sell_signal_current,
-            'buy_signal_prev': buy_signal_prev > 0,  # Sinal da barra anterior
-            'sell_signal_prev': sell_signal_prev > 0, # Sinal da barra anterior
-            'pending_buy': pending_buy_new > 0,       # Flag para execução
-            'pending_sell': pending_sell_new > 0,     # Flag para execução
-            'period': self.period
+            'candle_number': self.candle_count,
+            'timestamp': datetime.now().isoformat(),
+            
+            # Valores anteriores (para cálculo de crossover)
+            'ec_prev': ec_prev,
+            'ema_prev': ema_prev,
+            
+            # Sinais cruzados
+            'crossover': crossover_signal,
+            'crossunder': crossunder_signal,
+            
+            # Estado interno (debug)
+            'buy_signal_prev': buy_signal_prev,
+            'sell_signal_prev': sell_signal_prev
         }
+        
+        return result
     
     def reset(self):
         """Reseta o estado do interpretador"""
         for series in self.series_data.values():
             series.values.clear()
-        self._initialize_series()
+        
+        # Reinicializa com valores padrão
+        self.series_data['pendingBuy'] = PineSeries([0.0])
+        self.series_data['pendingSell'] = PineSeries([0.0])
+        self.series_data['buy_signal'] = PineSeries([0.0])
+        self.series_data['sell_signal'] = PineSeries([0.0])
+        
+        self.candle_count = 0
+        
+        logger.info("🔄 Pine Script Interpreter resetado")
+    
+    def get_diagnostic_info(self):
+        """Retorna informações de diagnóstico"""
+        return {
+            'candle_count': self.candle_count,
+            'params': self.params,
+            'ec_current': self.series_data['EC'].current() if 'EC' in self.series_data else 0,
+            'ema_current': self.series_data['EMA'].current() if 'EMA' in self.series_data else 0,
+            'ec_prev': self.series_data['EC'][1] if 'EC' in self.series_data and len(self.series_data['EC']) > 1 else 0,
+            'ema_prev': self.series_data['EMA'][1] if 'EMA' in self.series_data and len(self.series_data['EMA']) > 1 else 0,
+            'pending_buy': self.series_data['pendingBuy'].current() if 'pendingBuy' in self.series_data else 0,
+            'pending_sell': self.series_data['pendingSell'].current() if 'pendingSell' in self.series_data else 0,
+            'buy_signal_prev': self.series_data['buy_signal'].current() if 'buy_signal' in self.series_data else 0,
+            'sell_signal_prev': self.series_data['sell_signal'].current() if 'sell_signal' in self.series_data else 0
+        }
