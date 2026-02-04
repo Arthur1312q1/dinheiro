@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-STRATEGY RUNNER EXACT - VERSÃO CORRIGIDA COM FECHAMENTO PRECISO
+STRATEGY RUNNER EXACT - VERSÃO FINAL COM TODAS AS CORREÇÕES
 100% IDÊNTICO AO TRADINGVIEW
 """
 import os
@@ -19,7 +19,7 @@ from .okx_client import OKXClient
 logger = logging.getLogger(__name__)
 
 class TrailingStopManager:
-    """Gerencia trailing stop EXATO como TradingView - VERSÃO PRECISA"""
+    """Gerencia trailing stop EXATO como TradingView"""
     
     def __init__(self, side: str, entry_price: float, 
                  fixed_sl: int, fixed_tp: int, 
@@ -30,10 +30,6 @@ class TrailingStopManager:
         self.fixed_tp = fixed_tp
         self.trail_offset = trail_offset
         self.mintick = mintick
-        
-        # IMPORTANTE: TradingView usa syminfo.mintick para ETH/USDT = 0.01
-        # 1 ponto = $0.01
-        logger.info(f"🔍 Mintick configurado: {mintick} (1 ponto = ${mintick:.4f})")
         
         # Estado do trailing
         self.trailing_activated = False
@@ -46,19 +42,11 @@ class TrailingStopManager:
         else:
             self.tp_trigger = entry_price - (fixed_tp * mintick)
         
-        # Para logging
-        self.last_log_time = time.time()
-        self.initial_logged = False
-        
-        if not self.initial_logged:
-            logger.info("=" * 60)
-            logger.info(f"🎯 TRAILING STOP CONFIGURADO ({side.upper()}):")
-            logger.info(f"   Entrada: ${entry_price:.2f}")
-            logger.info(f"   Stop inicial: ${self.current_stop:.2f} (SL={fixed_sl}p = ${fixed_sl * mintick:.2f})")
-            logger.info(f"   TP Trigger: ${self.tp_trigger:.2f} (TP={fixed_tp}p = ${fixed_tp * mintick:.2f})")
-            logger.info(f"   Trail Offset: {trail_offset}p = ${trail_offset * mintick:.2f}")
-            logger.info("=" * 60)
-            self.initial_logged = True
+        logger.info(f"🎯 TRAILING STOP INICIALIZADO ({side.upper()}):")
+        logger.info(f"   Entrada: ${entry_price:.2f}")
+        logger.info(f"   Stop inicial: ${self.current_stop:.2f}")
+        logger.info(f"   TP Trigger: ${self.tp_trigger:.2f}")
+        logger.info(f"   Trail Offset: {trail_offset}p = ${trail_offset * mintick:.2f}")
     
     def _calculate_initial_stop(self):
         """Calcula stop loss inicial EM USD"""
@@ -79,19 +67,12 @@ class TrailingStopManager:
                 # Calcular novo stop baseado no trail_offset
                 new_stop = current_price - (self.trail_offset * self.mintick)
                 
-                # IMPORTANTE: O stop NUNCA pode ser pior que o inicial (só protege lucros)
+                # O stop NUNCA pode ser pior que o inicial
                 if new_stop < self._calculate_initial_stop():
                     new_stop = self._calculate_initial_stop()
                 
                 self.current_stop = new_stop
-                
-                current_time = time.time()
-                if current_time - self.last_log_time > 1:  # Evitar logs excessivos
-                    logger.info("🎯 TRAILING ATIVADO (LONG):")
-                    logger.info(f"   Preço atual: ${current_price:.2f}")
-                    logger.info(f"   TP Trigger: ${self.tp_trigger:.2f}")
-                    logger.info(f"   Novo stop: ${self.current_stop:.2f}")
-                    self.last_log_time = current_time
+                logger.info(f"   🎯 TRAILING ATIVADO (LONG): ${current_price:.2f} >= ${self.tp_trigger:.2f}")
                 
             elif self.side == 'short' and current_price <= self.tp_trigger:
                 self.trailing_activated = True
@@ -100,19 +81,12 @@ class TrailingStopManager:
                 # Calcular novo stop baseado no trail_offset
                 new_stop = current_price + (self.trail_offset * self.mintick)
                 
-                # IMPORTANTE: O stop NUNCA pode ser pior que o inicial
+                # O stop NUNCA pode ser pior que o inicial
                 if new_stop > self._calculate_initial_stop():
                     new_stop = self._calculate_initial_stop()
                 
                 self.current_stop = new_stop
-                
-                current_time = time.time()
-                if current_time - self.last_log_time > 1:
-                    logger.info("🎯 TRAILING ATIVADO (SHORT):")
-                    logger.info(f"   Preço atual: ${current_price:.2f}")
-                    logger.info(f"   TP Trigger: ${self.tp_trigger:.2f}")
-                    logger.info(f"   Novo stop: ${self.current_stop:.2f}")
-                    self.last_log_time = current_time
+                logger.info(f"   🎯 TRAILING ATIVADO (SHORT): ${current_price:.2f} <= ${self.tp_trigger:.2f}")
         
         # Se trailing ativado, atualizar
         if self.trailing_activated:
@@ -125,16 +99,10 @@ class TrailingStopManager:
                     # Calcular novo stop
                     new_stop = current_price - (self.trail_offset * self.mintick)
                     
-                    # IMPORTANTE: Stop só move para CIMA (nunca para baixo)
+                    # Stop só move para CIMA (nunca para baixo)
                     if new_stop > self.current_stop:
                         self.current_stop = new_stop
-                        
-                        current_time = time.time()
-                        if current_time - self.last_log_time > 5:  # Log a cada 5s
-                            logger.debug(f"📈 Trailing atualizado (LONG):")
-                            logger.debug(f"   Best price: ${old_best:.2f} → ${self.best_price:.2f}")
-                            logger.debug(f"   Stop: ${self.current_stop:.2f}")
-                            self.last_log_time = current_time
+                        logger.debug(f"   📈 Trailing atualizado: ${self.current_stop:.2f}")
                 
             else:  # short
                 # Atualizar best price (preço mais BAIXO)
@@ -145,48 +113,22 @@ class TrailingStopManager:
                     # Calcular novo stop
                     new_stop = current_price + (self.trail_offset * self.mintick)
                     
-                    # IMPORTANTE: Stop só move para BAIXO (nunca para cima)
+                    # Stop só move para BAIXO (nunca para cima)
                     if new_stop < self.current_stop:
                         self.current_stop = new_stop
-                        
-                        current_time = time.time()
-                        if current_time - self.last_log_time > 5:
-                            logger.debug(f"📉 Trailing atualizado (SHORT):")
-                            logger.debug(f"   Best price: ${old_best:.2f} → ${self.best_price:.2f}")
-                            logger.debug(f"   Stop: ${self.current_stop:.2f}")
-                            self.last_log_time = current_time
+                        logger.debug(f"   📉 Trailing atualizado: ${self.current_stop:.2f}")
         
         return self.current_stop
     
     def should_close(self, current_price: float) -> bool:
-        """Verifica se deve fechar posição - EXATO como TradingView"""
+        """Verifica se deve fechar posição"""
         if self.side == 'long':
-            # LONG: Fecha quando preço CAI para ou abaixo do stop
-            should_close = current_price <= self.current_stop
-            if should_close:
-                current_time = time.time()
-                if current_time - self.last_log_time > 1:
-                    logger.info("🔴 CONDIÇÃO DE FECHAMENTO (LONG):")
-                    logger.info(f"   Preço atual: ${current_price:.2f}")
-                    logger.info(f"   Stop atual: ${self.current_stop:.2f}")
-                    logger.info(f"   Diferença: {current_price - self.current_stop:.2f}")
-                    self.last_log_time = current_time
-            return should_close
+            return current_price <= self.current_stop
         else:
-            # SHORT: Fecha quando preço SOBE para ou acima do stop
-            should_close = current_price >= self.current_stop
-            if should_close:
-                current_time = time.time()
-                if current_time - self.last_log_time > 1:
-                    logger.info("🔴 CONDIÇÃO DE FECHAMENTO (SHORT):")
-                    logger.info(f"   Preço atual: ${current_price:.2f}")
-                    logger.info(f"   Stop atual: ${self.current_stop:.2f}")
-                    logger.info(f"   Diferença: {self.current_stop - current_price:.2f}")
-                    self.last_log_time = current_time
-            return should_close
+            return current_price >= self.current_stop
 
 class StrategyRunnerExact:
-    """Executa estratégia EXATAMENTE como TradingView - TIMING CORRIGIDO"""
+    """Executa estratégia EXATAMENTE como TradingView"""
     
     def __init__(self, okx_client: OKXClient, trade_history):
         self.okx_client = okx_client
@@ -202,7 +144,7 @@ class StrategyRunnerExact:
         
         # Configurações
         self.timeframe_minutes = 30
-        self.mintick = 0.01  # PARA ETH/USDT NO TRADINGVIEW: 1 ponto = $0.01
+        self.mintick = 0.01  # ETH/USDT NO TRADINGVIEW
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
         
         # Estado da execução
@@ -212,11 +154,11 @@ class StrategyRunnerExact:
         self.current_bar_data = None
         self.bar_count = 0
         
-        # Sinais pendentes (do TradingView) - CORRIGIDO: Delay de 1 barra
-        self.signal_buy_detected_at_bar_close = False
-        self.signal_sell_detected_at_bar_close = False
-        self.pending_buy_for_next_bar = False
-        self.pending_sell_for_next_bar = False
+        # Sinais pendentes (CRÍTICO: TradingView usa delay de 1 barra)
+        self.pending_buy = False  # Sinal BUY da barra anterior (para executar agora)
+        self.pending_sell = False  # Sinal SELL da barra anterior (para executar agora)
+        self.new_buy_signal = False  # Sinal BUY detectado nesta barra (executará na próxima)
+        self.new_sell_signal = False  # Sinal SELL detectado nesta barra (executará na próxima)
         
         # Posição atual
         self.position_size = 0
@@ -235,9 +177,8 @@ class StrategyRunnerExact:
         self.last_check_time = 0
         self.check_interval = 1
         self.last_log_time = time.time()
-        self.last_trailing_check = time.time()
         
-        logger.info("✅ StrategyRunnerExact inicializado (TIMING CORRIGIDO)")
+        logger.info("✅ StrategyRunnerExact inicializado (DELAY 1 BARRA CORRETO)")
     
     def _load_pine_script(self):
         """Carrega código Pine Script do arquivo"""
@@ -287,15 +228,15 @@ class StrategyRunnerExact:
             if quantity > max_qty:
                 quantity = max_qty
             
-            # Arredondar para 4 casas decimais (padrão ETH)
+            # Arredondar para 4 casas decimais (ETH)
             quantity = round(quantity, 4)
             
             if quantity > 0:
-                logger.info(f"📊 Cálculo de posição:")
-                logger.info(f"   Balance: ${balance:.2f}")
-                logger.info(f"   Risk: {self.engine.risk*100}% = ${risk_amount:.2f}")
-                logger.info(f"   Stop Loss: {self.engine.fixedSL}p = ${stop_loss_usdt:.2f}")
-                logger.info(f"   Quantidade: {quantity:.4f} ETH")
+                logger.info(f"   Cálculo de posição:")
+                logger.info(f"     Balance: ${balance:.2f}")
+                logger.info(f"     Risk: {self.engine.risk*100}% = ${risk_amount:.2f}")
+                logger.info(f"     Stop Loss: {self.engine.fixedSL}p = ${stop_loss_usdt:.2f}")
+                logger.info(f"     Quantidade: {quantity:.4f} ETH")
             
             return quantity
             
@@ -307,7 +248,7 @@ class StrategyRunnerExact:
         """Abre posição EXATAMENTE como TradingView"""
         logger.info("=" * 60)
         logger.info(f"🔍 VERIFICANDO ABERTURA {side.upper()}")
-        logger.info(f"   Preço atual: ${entry_price:.2f}")
+        logger.info(f"   Preço: ${entry_price:.2f}")
         logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
         
         # REGRA EXATA DO PINE SCRIPT:
@@ -325,7 +266,7 @@ class StrategyRunnerExact:
             return False
         
         # Se tem posição oposta, fecha primeiro
-        if self.position_size != 0:
+        if self.position_size != 0 and self.position_side != side:
             logger.info(f"🔄 Fechando posição {self.position_side} para inverter")
             self._close_position(entry_price, "inversão")
         
@@ -354,9 +295,7 @@ class StrategyRunnerExact:
         self.position_size = quantity if side == 'buy' else -quantity
         self.entry_price = entry_price
         
-        # Inicializar Trailing Stop Manager com valores EXATOS
-        trailing_info = self.engine.get_trailing_stop_info(side, entry_price)
-        
+        # Inicializar Trailing Stop Manager
         self.trailing_manager = TrailingStopManager(
             side=side,
             entry_price=entry_price,
@@ -373,17 +312,17 @@ class StrategyRunnerExact:
         logger.info(f"   TP Trigger: ${self.trailing_manager.tp_trigger:.2f}")
         logger.info(f"   Trailing Offset: 15p = ${15 * self.mintick:.2f}")
         
-        # IMPORTANTE: Resetar sinais pendentes APÓS execução
+        # Resetar sinais pendentes APÓS execução (como no Pine)
         if side == 'buy':
-            self.pending_buy_for_next_bar = False
+            self.pending_buy = False
         else:
-            self.pending_sell_for_next_bar = False
+            self.pending_sell = False
         
         logger.info("=" * 60)
         return True
     
     def _close_position(self, exit_price: float, reason: str = "") -> bool:
-        """Fecha posição EXATAMENTE como TradingView - COM PREÇO PRECISO"""
+        """Fecha posição EXATAMENTE como TradingView"""
         if not self.trade_id or self.position_size == 0:
             logger.warning("⚠️  Nenhuma posição para fechar")
             return False
@@ -394,23 +333,21 @@ class StrategyRunnerExact:
         logger.info(f"   Preço entrada: ${self.entry_price:.2f}")
         logger.info(f"   Preço saída proposto: ${exit_price:.2f}")
         
-        # CRÍTICO: Obter preço PRECISO para fechamento
-        # Para trailing stop, precisamos do preço exato que atingiu o stop
+        # Obter preço PRECISO para fechamento
         precise_exit_price = exit_price
         
         if reason == "trailing_stop" and self.trailing_manager:
-            # Usar método especial do OKXClient para preço preciso
-            # Isso simula o spread do mercado real
+            # Usar método especial para preço preciso (considera spread)
             precise_exit_price = self.okx_client.get_precise_price_for_close(
                 self.position_side,
                 self.trailing_manager.current_stop
             )
             logger.info(f"   Preço preciso calculado: ${precise_exit_price:.2f}")
         
-        # Garantir que preço seja arredondado para 2 casas decimais
+        # Garantir arredondamento para 2 casas decimais
         precise_exit_price = round(precise_exit_price, 2)
         
-        # Calcular PnL com preço preciso
+        # Calcular PnL
         if self.entry_price:
             if self.position_side == 'long':
                 pnl_pct = ((precise_exit_price - self.entry_price) / self.entry_price) * 100
@@ -419,13 +356,13 @@ class StrategyRunnerExact:
                 pnl_pct = ((self.entry_price - precise_exit_price) / self.entry_price) * 100
                 pnl_usdt = (self.entry_price - precise_exit_price) * abs(self.position_size)
             
-            # Formatar PnL para 2 casas decimais
+            # Formatar para 2 casas decimais
             pnl_pct = round(pnl_pct, 2)
             pnl_usdt = round(pnl_usdt, 2)
             
             logger.info(f"   PnL: {pnl_pct}% (${pnl_usdt})")
         
-        # Fechar no histórico com preço preciso
+        # Fechar no histórico
         success = self.trade_history.close_trade(self.trade_id, precise_exit_price)
         
         if success:
@@ -450,14 +387,6 @@ class StrategyRunnerExact:
         if not self.position_size or not self.current_price or not self.trailing_manager:
             return
         
-        current_time = time.time()
-        
-        # Verificar apenas a cada 1 segundo (para performance)
-        if current_time - self.last_trailing_check < self.check_interval:
-            return
-        
-        self.last_trailing_check = current_time
-        
         # Atualizar trailing stop com preço atual
         current_stop = self.trailing_manager.update(self.current_price)
         
@@ -469,11 +398,11 @@ class StrategyRunnerExact:
             logger.info(f"   Stop calculado: ${current_stop:.2f}")
             logger.info(f"   Entrada: ${self.entry_price:.2f}")
             
-            # Fechar com preço atual (será ajustado para preciso no _close_position)
+            # Fechar posição
             self._close_position(self.current_price, "trailing_stop")
     
     def _check_and_update_bar(self):
-        """Verifica se uma nova barra de 30m começou - TIMING 100% CORRETO"""
+        """Verifica se uma nova barra de 30m começou - TIMING CORRETO"""
         if not self.current_price:
             return False
         
@@ -509,15 +438,15 @@ class StrategyRunnerExact:
             logger.info(f"📊 NOVA BARRA 30m: {current_bar_start.strftime('%H:%M')}")
             logger.info(f"   Preço abertura: ${self.current_price:.2f}")
             
-            # ⚠️ TIMING CRÍTICO: TradingView executa na ABERTURA da nova barra
-            # 1. Primeiro: Executar sinais pendentes da barra ANTERIOR
-            self._execute_pending_signals_at_bar_open()
+            # ⚠️ CRÍTICO: TIMING EXATO DO TRADINGVIEW
+            # 1. Primeiro executar sinais pendentes da barra ANTERIOR
+            self._execute_pending_signals()
             
-            # 2. Segundo: Processar barra ANTERIOR para gerar NOVOS sinais
+            # 2. Depois processar barra ANTERIOR para gerar NOVOS sinais
             if self.current_bar_data:
-                self._process_completed_bar_for_signals()
+                self._process_completed_bar()
             
-            # 3. Terceiro: Iniciar nova barra
+            # 3. Iniciar nova barra
             self.last_bar_timestamp = current_bar_start
             self.current_bar_data = {
                 'timestamp': int(current_bar_start.timestamp() * 1000),
@@ -541,32 +470,32 @@ class StrategyRunnerExact:
         
         return False
     
-    def _execute_pending_signals_at_bar_open(self):
-        """Executa sinais pendentes na ABERTURA da barra"""
+    def _execute_pending_signals(self):
+        """Executa sinais pendentes na ABERTURA da nova barra"""
         if not self.current_price:
             return
         
         logger.info(f"🔍 EXECUTANDO SINAIS PENDENTES (abertura da barra):")
-        logger.info(f"   Preço atual (abertura): ${self.current_price:.2f}")
-        logger.info(f"   Pending BUY: {self.pending_buy_for_next_bar}")
-        logger.info(f"   Pending SELL: {self.pending_sell_for_next_bar}")
+        logger.info(f"   Preço: ${self.current_price:.2f}")
+        logger.info(f"   Pending BUY: {self.pending_buy}")
+        logger.info(f"   Pending SELL: {self.pending_sell}")
         logger.info(f"   Posição atual: {self.position_side} {abs(self.position_size):.4f} ETH")
         
         # REGRA EXATA DO PINE SCRIPT
-        if self.pending_buy_for_next_bar and self.position_size <= 0:
+        if self.pending_buy and self.position_size <= 0:
             logger.info(f"🎯 EXECUTANDO BUY (sinal da barra anterior)")
             self._open_position('buy', self.current_price)
         
-        elif self.pending_sell_for_next_bar and self.position_size >= 0:
+        elif self.pending_sell and self.position_size >= 0:
             logger.info(f"🎯 EXECUTANDO SELL (sinal da barra anterior)")
             self._open_position('sell', self.current_price)
         
-        # Resetar flags após tentativa de execução
-        self.pending_buy_for_next_bar = False
-        self.pending_sell_for_next_bar = False
+        # Resetar após tentativa de execução
+        self.pending_buy = False
+        self.pending_sell = False
     
-    def _process_completed_bar_for_signals(self):
-        """Processa barra completa para gerar NOVOS sinais"""
+    def _process_completed_bar(self):
+        """Processa barra ANTERIOR para gerar NOVOS sinais"""
         if not self.current_bar_data:
             return
         
@@ -577,21 +506,22 @@ class StrategyRunnerExact:
             # Processar através do interpretador
             signals = self.engine.process_candle(self.current_bar_data)
             
-            # TradingView detecta sinais no FECHAMENTO, executa na PRÓXIMA ABERTURA
-            self.signal_buy_detected_at_bar_close = signals['buy_signal_current']
-            self.signal_sell_detected_at_bar_close = signals['sell_signal_current']
+            # TradingView: Sinais detectados no FECHAMENTO, executados na PRÓXIMA ABERTURA
+            # Salvar sinais detectados AGORA (para próxima barra)
+            self.new_buy_signal = signals.get('buy_signal_current', False)
+            self.new_sell_signal = signals.get('sell_signal_current', False)
             
-            # Marcar para execução na próxima barra
-            if self.signal_buy_detected_at_bar_close:
-                self.pending_buy_for_next_bar = True
-                logger.info(f"   🟢 SINAL BUY DETECTADO (executará na próxima abertura)")
+            # Marcar como pendentes para a PRÓXIMA barra
+            if self.new_buy_signal:
+                self.pending_buy = True
+                logger.info(f"   🟢 NOVO SINAL BUY DETECTADO (executará na próxima barra)")
             
-            if self.signal_sell_detected_at_bar_close:
-                self.pending_sell_for_next_bar = True
-                logger.info(f"   🔴 SINAL SELL DETECTADO (executará na próxima abertura)")
+            if self.new_sell_signal:
+                self.pending_sell = True
+                logger.info(f"   🔴 NOVO SINAL SELL DETECTADO (executará na próxima barra)")
             
-            if not self.signal_buy_detected_at_bar_close and not self.signal_sell_detected_at_bar_close:
-                logger.info(f"   ⚪ Nenhum sinal detectado nesta barra")
+            if not self.new_buy_signal and not self.new_sell_signal:
+                logger.info(f"   ⚪ Nenhum sinal detectado")
                 
         except Exception as e:
             logger.error(f"💥 Erro ao processar barra: {e}")
@@ -607,7 +537,7 @@ class StrategyRunnerExact:
                 # Atualizar preço (arredondar para 2 casas decimais)
                 self.current_price = round(new_price, 2)
                 
-                # Verificar trailing stop
+                # Verificar trailing stop a cada tick de preço
                 self._check_trailing_stop()
                     
         except Exception as e:
@@ -747,10 +677,10 @@ class StrategyRunnerExact:
                 "new_bar": new_bar,
                 "current_price": self.current_price,
                 "bar_count": self.bar_count,
-                "signal_buy_detected": self.signal_buy_detected_at_bar_close,
-                "signal_sell_detected": self.signal_sell_detected_at_bar_close,
-                "pending_buy": self.pending_buy_for_next_bar,
-                "pending_sell": self.pending_sell_for_next_bar,
+                "pending_buy": self.pending_buy,
+                "pending_sell": self.pending_sell,
+                "new_buy_signal": self.new_buy_signal,
+                "new_sell_signal": self.new_sell_signal,
                 "position_size": self.position_size,
                 "position_side": self.position_side,
                 "entry_price": self.entry_price,
