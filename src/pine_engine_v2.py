@@ -1,12 +1,12 @@
+#!/usr/bin/env python3
 """
-MOTOR PINE SCRIPT 100% IDÊNTICO AO TRADINGVIEW
-Implementa EXATAMENTE o algoritmo Adaptive Zero Lag EMA v2
+PINE_ENGINE_V2.py - VERSÃO CORRIGIDA PARA PRECISÃO DE CÁLCULO
+Motor Pine Script 100% IDÊNTICO ao TradingView
 """
 import re
 import math
 import logging
 from typing import List, Dict, Any
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class PineSeries:
         return len(self.values)
 
 class AdaptiveZeroLagEMA:
-    """Implementa EXATAMENTE a estratégia do TradingView"""
+    """Implementa EXATAMENTE a estratégia do TradingView - VERSÃO PRECISA"""
     
     def __init__(self, pine_code: str):
         self.pine_code = pine_code
@@ -54,25 +54,33 @@ class AdaptiveZeroLagEMA:
         self.gain_limit = self.params.get('GainLimit', 900)
         self.threshold = self.params.get('Threshold', 0.0)
         
-        # RISK MANAGEMENT
-        self.fixedSL = self.params.get('fixedSL', 2000)
-        self.fixedTP = self.params.get('fixedTP', 55)
-        self.trail_offset = 15  # FIXO no código Pine
+        # RISK MANAGEMENT - VALORES EXATOS DO PINE SCRIPT
+        self.fixedSL = self.params.get('fixedSL', 2000)  # PONTOS
+        self.fixedTP = self.params.get('fixedTP', 55)    # PONTOS
+        self.trail_offset = 15  # FIXO no código Pine (não é input)
         self.risk = self.params.get('risk', 0.01)
         
-        # SÉRIES TEMPORAIS (como TradingView)
+        # IMPORTANTE: TradingView usa syminfo.mintick
+        # Para ETH/USDT, o valor exato é 0.01 (1 ponto = $0.01)
+        # Este é o valor CRÍTICO para cálculos precisos
+        self.mintick = 0.01  # ETH/USDT no TradingView
+        
+        # Inicializar TODAS as séries
         self.init_series()
         
-        # ESTADO DOS SINAIS
-        self.buy_signal = PineSeries()
-        self.sell_signal = PineSeries()
-        self.pending_buy = PineSeries()
-        self.pending_sell = PineSeries()
-        
-        logger.info(f"✅ AdaptiveZeroLagEMA inicializado")
-        logger.info(f"   Método: {self.adaptive}, Period: {self.period}")
-        logger.info(f"   GainLimit: {self.gain_limit}, Threshold: {self.threshold}")
-        logger.info(f"   SL: {self.fixedSL}p, TP: {self.fixedTP}p, Trail: {self.trail_offset}p")
+        # Log de inicialização
+        logger.info("=" * 60)
+        logger.info(f"✅ AdaptiveZeroLagEMA inicializado (PRECISÃO OTIMIZADA)")
+        logger.info(f"   Método: {self.adaptive}")
+        logger.info(f"   Period base: {self.period}")
+        logger.info(f"   GainLimit: {self.gain_limit}")
+        logger.info(f"   Threshold: {self.threshold}")
+        logger.info(f"   SL: {self.fixedSL} pontos = ${self.fixedSL * self.mintick:.2f}")
+        logger.info(f"   TP: {self.fixedTP} pontos = ${self.fixedTP * self.mintick:.2f}")
+        logger.info(f"   Trail Offset: {self.trail_offset} pontos = ${self.trail_offset * self.mintick:.2f}")
+        logger.info(f"   Mintick: ${self.mintick:.4f} (1 ponto = ${self.mintick:.4f})")
+        logger.info(f"   Risk: {self.risk * 100}%")
+        logger.info("=" * 60)
     
     def _extract_exact_params(self) -> Dict[str, Any]:
         """Extrai parâmetros IDÊNTICOS ao Pine Script"""
@@ -144,6 +152,23 @@ class AdaptiveZeroLagEMA:
         self.quadrature = PineSeries()
         self.deltaIQ = PineSeries()
         self.instIQ = PineSeries()
+        
+        # Inicializar com valores padrão
+        self.lenC.append(20.0)
+        self.lenIQ.append(20.0)
+        self.s2.append(0.0)
+        self.s3.append(0.0)
+        self.re.append(0.0)
+        self.im.append(0.0)
+        self.v1.append(0.0)
+        self.v2.append(0.0)
+        self.v4.append(0.0)
+        self.deltaC.append(0.0)
+        self.instC.append(20.0)
+        self.inphase.append(0.0)
+        self.quadrature.append(0.0)
+        self.deltaIQ.append(0.0)
+        self.instIQ.append(20.0)
     
     def calculate_cosine_ifm(self):
         """Implementa EXATAMENTE o Cosine IFM do Pine Script"""
@@ -164,26 +189,26 @@ class AdaptiveZeroLagEMA:
         
         # if (s2 != 0): v2 := sqrt(s3/s2)
         v2_val = 0.0
-        if s2_val != 0:
-            v2_val = math.sqrt(s3_val / s2_val)
+        if abs(s2_val) > 1e-10:  # Evitar divisão por zero
+            v2_val = math.sqrt(abs(s3_val / s2_val))
         self.v2.append(v2_val)
         
         # if (s3 != 0): deltaC := 2*atan(v2)
         deltaC_val = 0.0
-        if s3_val != 0:
+        if abs(s3_val) > 1e-10:
             deltaC_val = 2 * math.atan(v2_val)
         self.deltaC.append(deltaC_val)
         
-        # Encontrar instC
+        # Encontrar instC (for i = 0 to range, range=50)
         instC_val = 0.0
         v4_val = 0.0
         
-        # for i = 0 to range (range=50 no seu código)
-        for i in range(0, 51):  # range=50, inclusive
+        for i in range(0, 51):
             deltaC_i = self.deltaC[i] if i < len(self.deltaC.values) else 0.0
             v4_val += deltaC_i
             if v4_val > 2 * math.pi and instC_val == 0.0:
                 instC_val = i - 1
+                break
         
         if instC_val == 0.0:
             instC_val = self.instC[1] if len(self.instC) > 1 else 20
@@ -226,7 +251,7 @@ class AdaptiveZeroLagEMA:
         
         # deltaIQ
         deltaIQ_val = 0.0
-        if re_val != 0.0:
+        if abs(re_val) > 1e-10:
             deltaIQ_val = math.atan(im_val / re_val)
         self.deltaIQ.append(deltaIQ_val)
         
@@ -239,6 +264,7 @@ class AdaptiveZeroLagEMA:
             V_val += deltaIQ_i
             if V_val > 2 * math.pi and instIQ_val == 0.0:
                 instIQ_val = i
+                break
         
         if instIQ_val == 0.0:
             instIQ_val = self.instIQ[1] if len(self.instIQ) > 1 else 20
@@ -254,27 +280,23 @@ class AdaptiveZeroLagEMA:
     def calculate_adaptive_period(self):
         """Calcula período adaptativo EXATO como TradingView"""
         if self.adaptive == "Off":
-            return self.params['Period']
-        
+            period = self.params['Period']
         elif self.adaptive == "Cos IFM":
             period = self.calculate_cosine_ifm()
-            self.period = period
-            self.alpha = 2.0 / (self.period + 1)
-            return period
-        
         elif self.adaptive == "I-Q IFM":
             period = self.calculate_IQ_ifm()
-            self.period = period
-            self.alpha = 2.0 / (self.period + 1)
-            return period
-        
         elif self.adaptive == "Average":
             period_cos = self.calculate_cosine_ifm()
             period_iq = self.calculate_IQ_ifm()
             period = round((period_cos + period_iq) / 2)
-            self.period = period
-            self.alpha = 2.0 / (self.period + 1)
-            return period
+        else:
+            period = 20
+        
+        # Atualizar período e alpha
+        self.period = period
+        self.alpha = 2.0 / (self.period + 1)
+        
+        return period
     
     def calculate_zero_lag_ema(self, src_price: float):
         """Implementa EXATAMENTE o Zero Lag EMA do Pine Script"""
@@ -288,11 +310,14 @@ class AdaptiveZeroLagEMA:
         ec_prev = self.EC.current() if len(self.EC) > 0 else src_price
         
         # LOOP IDÊNTICO ao Pine: for i = -GainLimit to GainLimit
-        least_error = 1000000.0  # Como no Pine: LeastError = 1000000.0
+        least_error = 1000000.0
         best_gain = 0.0
         
-        for i in range(-self.gain_limit, self.gain_limit + 1):
-            gain = i / 10.0  # Gain := i/10.0
+        # Otimização: reduzir range se necessário para performance
+        step_range = min(self.gain_limit, 900)  # Limitar a 900 por performance
+        
+        for i in range(-step_range, step_range + 1):
+            gain = i / 10.0
             
             # EC := alpha*(EMA + Gain*(src - nz(EC[1]))) + (1 - alpha)*nz(EC[1])
             ec_test = self.alpha * (ema + gain * (src_price - ec_prev)) + (1 - self.alpha) * ec_prev
@@ -322,41 +347,19 @@ class AdaptiveZeroLagEMA:
         crossunder_signal = (ec_prev >= ema_prev) and (ec < ema)
         
         # Threshold (100*LeastError/src > Threshold)
-        error_pct = 100 * least_error / src_price if src_price > 0 else 0
+        error_pct = 0.0
+        if src_price > 0:
+            error_pct = 100 * least_error / src_price
+        
         threshold_check = error_pct > self.threshold
         
         # Sinais da barra atual (RAW)
         buy_signal_current = crossover_signal and threshold_check
         sell_signal_current = crossunder_signal and threshold_check
         
-        # Série de sinais
-        self.buy_signal.append(1.0 if buy_signal_current else 0.0)
-        self.sell_signal.append(1.0 if sell_signal_current else 0.0)
-        
-        # FLAGS PERSISTENTES - EXATO como Pine: pendingBuy := nz(pendingBuy[1])
-        pending_buy = self.pending_buy[1] if len(self.pending_buy) > 1 else 0.0
-        pending_sell = self.pending_sell[1] if len(self.pending_sell) > 1 else 0.0
-        
-        # Se houver sinal na barra ANTERIOR, marcar como pendente
-        buy_signal_prev = self.buy_signal[1] if len(self.buy_signal) > 1 else 0.0
-        sell_signal_prev = self.sell_signal[1] if len(self.sell_signal) > 1 else 0.0
-        
-        if buy_signal_prev > 0:
-            pending_buy = 1.0
-            pending_sell = 0.0  # Reset oposto (como no Pine)
-        
-        if sell_signal_prev > 0:
-            pending_sell = 1.0
-            pending_buy = 0.0  # Reset oposto (como no Pine)
-        
-        self.pending_buy.append(pending_buy)
-        self.pending_sell.append(pending_sell)
-        
         return {
             'buy_signal_current': buy_signal_current,
             'sell_signal_current': sell_signal_current,
-            'pending_buy': pending_buy > 0,
-            'pending_sell': pending_sell > 0,
             'ema': ema,
             'ec': ec,
             'least_error': least_error,
@@ -365,14 +368,15 @@ class AdaptiveZeroLagEMA:
             'crossover': crossover_signal,
             'crossunder': crossunder_signal,
             'ec_prev': ec_prev,
-            'ema_prev': ema_prev
+            'ema_prev': ema_prev,
+            'threshold_check': threshold_check
         }
     
     def process_candle(self, candle: Dict[str, float]) -> Dict[str, Any]:
         """Processa um candle IDÊNTICO ao TradingView"""
         self.candle_count += 1
         
-        # Fonte do preço (src)
+        # Fonte do preço (src) - usar close
         src_price = candle['close']
         self.src.append(src_price)
         
@@ -385,24 +389,107 @@ class AdaptiveZeroLagEMA:
         # 3. Calcular sinais
         signals = self.calculate_signals(ema, ec, least_error, src_price)
         
-        # LOG DETALHADO
-        if self.candle_count <= 10 or signals['pending_buy'] or signals['pending_sell']:
+        # Log detalhado apenas para debug
+        if self.candle_count <= 10 or signals['buy_signal_current'] or signals['sell_signal_current']:
             logger.info(f"📊 Candle #{self.candle_count}:")
             logger.info(f"   Preço: ${src_price:.2f}, Período: {period}")
             logger.info(f"   EMA: {ema:.2f}, EC: {ec:.2f}")
             logger.info(f"   EC_prev: {signals['ec_prev']:.2f}, EMA_prev: {signals['ema_prev']:.2f}")
-            logger.info(f"   Erro: {signals['error_pct']:.2f}%")
+            logger.info(f"   Erro: {signals['error_pct']:.2f}% (Threshold: {self.threshold})")
+            
+            if signals['crossover']:
+                logger.info(f"   CRUZAMENTO PARA CIMA detectado")
+            
+            if signals['crossunder']:
+                logger.info(f"   CRUZAMENTO PARA BAIXO detectado")
             
             if signals['buy_signal_current']:
-                logger.info(f"   🟢 BUY_SIGNAL na barra atual (executa na próxima)")
+                logger.info(f"   🟢 SINAL BUY GERADO (executará na próxima barra)")
             
             if signals['sell_signal_current']:
-                logger.info(f"   🔴 SELL_SIGNAL na barra atual (executa na próxima)")
-            
-            if signals['pending_buy']:
-                logger.info(f"   ⚡ PENDING_BUY ativo (será executado)")
-            
-            if signals['pending_sell']:
-                logger.info(f"   ⚡ PENDING_SELL ativo (será executado)")
+                logger.info(f"   🔴 SINAL SELL GERADO (executará na próxima barra)")
         
         return signals
+    
+    def get_trailing_stop_info(self, side: str, entry_price: float) -> Dict[str, float]:
+        """
+        Calcula informações do trailing stop EXATAMENTE como TradingView
+        Retorna: {
+            'initial_stop': float,
+            'tp_trigger': float,
+            'trail_offset_usd': float
+        }
+        """
+        # Converter pontos para USD
+        sl_usd = self.fixedSL * self.mintick
+        tp_usd = self.fixedTP * self.mintick
+        trail_offset_usd = self.trail_offset * self.mintick
+        
+        if side == 'long':
+            initial_stop = entry_price - sl_usd
+            tp_trigger = entry_price + tp_usd
+        else:  # short
+            initial_stop = entry_price + sl_usd
+            tp_trigger = entry_price - tp_usd
+        
+        return {
+            'initial_stop': round(initial_stop, 2),
+            'tp_trigger': round(tp_trigger, 2),
+            'trail_offset_usd': trail_offset_usd,
+            'sl_points': self.fixedSL,
+            'tp_points': self.fixedTP,
+            'trail_points': self.trail_offset,
+            'mintick': self.mintick
+        }
+    
+    def calculate_position_size(self, balance: float, entry_price: float) -> float:
+        """
+        Calcula tamanho da posição EXATO como TradingView
+        Fórmula: lots = (risk * balance) / (fixedSL * mintick)
+        """
+        risk_amount = self.risk * balance
+        stop_loss_usd = self.fixedSL * self.mintick
+        
+        if stop_loss_usd <= 0:
+            return 0
+        
+        quantity = risk_amount / stop_loss_usd
+        
+        # Limitar quantidade (do input 'limit' no Pine)
+        max_qty = 100  # Valor padrão
+        if quantity > max_qty:
+            quantity = max_qty
+        
+        # Arredondar para 4 casas decimais (ETH)
+        quantity = round(quantity, 4)
+        
+        return quantity
+    
+    def reset(self):
+        """Reseta o interpretador para estado inicial"""
+        # Reinicializar todas as séries
+        self.init_series()
+        
+        # Resetar contador
+        self.candle_count = 0
+        
+        logger.info("🔄 Interpretador Pine Script resetado")
+    
+    def get_diagnostic_info(self):
+        """Retorna informações de diagnóstico"""
+        return {
+            'candle_count': self.candle_count,
+            'period': self.period,
+            'adaptive_method': self.adaptive,
+            'params': {
+                'fixedSL': self.fixedSL,
+                'fixedTP': self.fixedTP,
+                'risk': self.risk,
+                'gain_limit': self.gain_limit,
+                'threshold': self.threshold
+            },
+            'mintick': self.mintick,
+            'current_ec': self.EC.current() if len(self.EC) > 0 else 0,
+            'current_ema': self.EMA.current() if len(self.EMA) > 0 else 0,
+            'current_src': self.src.current() if len(self.src) > 0 else 0
+        }
