@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MAIN.PY ATUALIZADO - USANDO STRATEGY RUNNER EXATO
+MAIN.PY - VERSÃO ATUALIZADA COM STRATEGY RUNNER EXACT
+Bot Trading ETH/USDT 100% igual ao TradingView
 """
 import os
 import sys
@@ -19,7 +20,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, 'src')
 sys.path.insert(0, src_path)
 
-# Configurar logging para Render - MAIS DETALHADO
+# Configurar logging para Render - DETALHADO
 if os.getenv('RENDER', '').lower() == 'true':
     logging.basicConfig(
         level=logging.INFO,
@@ -48,16 +49,19 @@ else:
     logger.info("💻 Ambiente local detectado")
 
 # ============================================================================
-# 3. IMPORTAR MÓDULOS DE src/
+# 3. IMPORTAR MÓDULOS DE src/ - ATUALIZADO!
 # ============================================================================
 try:
-    # Importar tudo de src - IMPORTANTE: Usar novo StrategyRunnerExact
+    # Importar módulos - USANDO NOVO STRATEGY RUNNER
     from src.okx_client import OKXClient
     from src.keep_alive import KeepAliveSystem
-    from src.strategy_runner_exact import StrategyRunnerExact  # NOVO!
     from src.trade_history import TradeHistory
     
+    # IMPORTANTE: Usar o novo StrategyRunnerExact
+    from src.strategy_runner_exact import StrategyRunnerExact
+    
     logger.info("✅ Módulos importados com sucesso")
+    logger.info("   ⚡ Usando StrategyRunnerExact (100% TradingView)")
     
     # Inicializar componentes
     okx_client = OKXClient()
@@ -72,7 +76,7 @@ try:
     
     keep_alive = KeepAliveSystem(base_url=base_url)
     
-    # Inicializar NOVO strategy runner (100% TradingView)
+    # ⚡⚡⚡ MUDANÇA CRÍTICA: Usar StrategyRunnerExact em vez do antigo
     strategy_runner = StrategyRunnerExact(okx_client, trade_history)
     
     logger.info("✅ Sistema inicializado com sucesso (STRATEGY RUNNER EXACT)")
@@ -125,60 +129,40 @@ def start_strategy_automatically():
             def trading_loop():
                 logger.info("🔄 Loop de trading iniciado automaticamente")
                 
-                # Contador para logs periódicos
+                # Contador para logs
                 last_status_log = time.time()
                 consecutive_errors = 0
-                last_bar_logged = None
                 
                 while trading_active and strategy_runner:
                     try:
                         # Executar estratégia
                         status = strategy_runner.run_strategy_realtime()
                         
-                        # Log detalhado a cada nova barra
-                        if strategy_runner.last_bar_timestamp and strategy_runner.last_bar_timestamp != last_bar_logged:
+                        # Log de nova barra
+                        if status.get('new_bar', False):
                             logger.info("=" * 60)
-                            logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} PROCESSADA")
-                            logger.info(f"   Preço: ${strategy_runner.current_price:.2f}")
-                            
-                            # Sinais pendentes do NOVO runner
-                            pending_buy = getattr(strategy_runner, 'pending_buy', False)
-                            pending_sell = getattr(strategy_runner, 'pending_sell', False)
-                            
-                            logger.info(f"   Sinal BUY pendente: {pending_buy}")
-                            logger.info(f"   Sinal SELL pendente: {pending_sell}")
-                            logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
-                            logger.info(f"   Lado: {strategy_runner.position_side}")
-                            
-                            if strategy_runner.entry_price:
-                                logger.info(f"   Entrada: ${strategy_runner.entry_price:.2f}")
-                            
-                            # Info do trailing stop
-                            if strategy_runner.trailing_manager:
-                                trailing_activated = getattr(strategy_runner.trailing_manager, 'trailing_activated', False)
-                                current_stop = getattr(strategy_runner.trailing_manager, 'current_stop', None)
-                                if trailing_activated:
-                                    logger.info(f"   Trailing Stop: ${current_stop:.2f} (ATIVADO)")
-                            
+                            logger.info(f"📊 BARRA {strategy_runner.bar_count} PROCESSADA")
+                            logger.info(f"   Preço: ${status.get('current_price', 0):.2f}")
+                            logger.info(f"   Sinais: BUY={status.get('buy_signal_pending', False)}, SELL={status.get('sell_signal_pending', False)}")
+                            logger.info(f"   Posição: {status.get('position_side', 'FLAT')} {abs(status.get('position_size', 0)):.4f} ETH")
                             logger.info("=" * 60)
-                            last_bar_logged = strategy_runner.last_bar_timestamp
                         
                         # Log periódico a cada 30 segundos
                         current_time = time.time()
                         if current_time - last_status_log > 30:
-                            if strategy_runner.current_price:
-                                position_str = f"{strategy_runner.position_side or 'FLAT'} {abs(strategy_runner.position_size):.4f} ETH"
-                                logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {position_str}")
-                                
-                                # Info do trailing
-                                if strategy_runner.trailing_manager:
-                                    trailing = strategy_runner.trailing_manager
-                                    if trailing.trailing_activated:
-                                        logger.info(f"   Trailing Stop: ${trailing.current_stop:.2f}")
+                            if status.get('current_price'):
+                                pos_side = status.get('position_side', 'FLAT')
+                                pos_size = abs(status.get('position_size', 0))
+                                logger.info(f"📈 Status: ${status['current_price']:.2f} | {pos_side} {pos_size:.4f} ETH")
+                            
+                            # Debug: mostrar sinais pendentes
+                            if status.get('buy_signal_pending') or status.get('sell_signal_pending'):
+                                logger.info(f"   Sinais pendentes: BUY={status.get('buy_signal_pending')}, SELL={status.get('sell_signal_pending')}")
+                            
                             last_status_log = current_time
                         
                         time.sleep(1)  # Loop principal (1 segundo)
-                        consecutive_errors = 0  # Resetar contador de erros
+                        consecutive_errors = 0
                         
                     except Exception as e:
                         consecutive_errors += 1
@@ -186,7 +170,7 @@ def start_strategy_automatically():
                         if consecutive_errors > 10:
                             logger.error("🔴 Muitos erros consecutivos, parando loop...")
                             break
-                        time.sleep(5)  # Aguarda 5 segundos em caso de erro
+                        time.sleep(5)
             
             # Iniciar thread de trading
             trade_thread = threading.Thread(target=trading_loop, daemon=True)
@@ -211,27 +195,28 @@ def home():
     # Obter informações da posição atual
     position_info = {}
     if strategy_runner:
-        # Para o NOVO runner, os atributos podem ser diferentes
-        current_stop = None
-        if strategy_runner.trailing_manager:
-            current_stop = strategy_runner.trailing_manager.current_stop
-        
         position_info = {
             'has_position': strategy_runner.position_size != 0,
             'position_side': strategy_runner.position_side,
             'position_size': abs(strategy_runner.position_size),
             'entry_price': strategy_runner.entry_price,
             'current_price': strategy_runner.current_price,
-            'stop_loss': current_stop,  # Usa o trailing stop atual
-            'take_profit': getattr(strategy_runner, 'take_profit_price', None),
-            'trailing_activated': getattr(strategy_runner.trailing_manager, 'trailing_activated', False) if strategy_runner.trailing_manager else False
+            'stop_loss': strategy_runner.stop_loss_price,
+            'take_profit': strategy_runner.take_profit_price,
+            'trailing_activated': getattr(strategy_runner, 'trailing_activated', False),
+            'trailing_stop': getattr(strategy_runner, 'trailing_stop_price', None)
         }
+    
+    # Verificar se está em simulação ou real
+    mode = "SIMULAÇÃO"
+    if okx_client and hasattr(okx_client, 'has_credentials'):
+        mode = "REAL" if okx_client.has_credentials else "SIMULAÇÃO"
     
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Bot Trading ETH/USDT - ESTRATÉGIA EXATA</title>
+        <title>Bot Trading ETH/USDT - STRATEGY RUNNER EXACT</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: Arial, sans-serif; background: #1a1a2e; color: white; text-align: center; padding: 20px; }
@@ -254,20 +239,33 @@ def home():
             .debug { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin: 20px 0; text-align: left; }
             .debug pre { overflow: auto; max-height: 300px; }
             .trailing-badge { background: #ffaa00; color: black; padding: 3px 8px; border-radius: 10px; font-size: 12px; font-weight: bold; }
+            .signal-badge { background: #00aaff; color: white; padding: 3px 8px; border-radius: 10px; font-size: 12px; margin: 2px; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
                 <h1>⚡ Bot Trading ETH/USDT</h1>
-                <p>Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Modo: SIMULAÇÃO</p>
+                <p>Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m</p>
                 <p><strong>Ambiente:</strong> """ + ("🌍 RENDER" if IS_RENDER else "💻 LOCAL") + """</p>
                 <p><strong>Status:</strong> {{ '🟢 ATIVO' if trading_active else '🔴 INATIVO' }}</p>
-                <p><strong>Versão:</strong> EXATA (100% TradingView)</p>
+                <p><strong>Modo:</strong> """ + mode + """ • <strong>Runner:</strong> EXACT VERSION</p>
             </div>
             
             <div class="status {{ 'active' if trading_active else 'inactive' }}">
-                {{ '🟢 ATIVO - Executando IDÊNTICO ao TradingView' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
+                {{ '🟢 ATIVO - Executando 100% igual TradingView' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
+            </div>
+            
+            <!-- Sinais Atuais -->
+            <div style="margin: 20px 0;">
+                {% if strategy_runner %}
+                <div style="display: inline-block; margin: 0 10px;">
+                    <span class="signal-badge">BUY Pendente: {{ '🟢 SIM' if strategy_runner.buy_signal_previous_bar else '🔴 NÃO' }}</span>
+                </div>
+                <div style="display: inline-block; margin: 0 10px;">
+                    <span class="signal-badge">SELL Pendente: {{ '🟢 SIM' if strategy_runner.sell_signal_previous_bar else '🔴 NÃO' }}</span>
+                </div>
+                {% endif %}
             </div>
             
             <!-- Informações da posição atual -->
@@ -278,11 +276,13 @@ def home():
                 <p><strong>Tamanho:</strong> {{ "%.4f"|format(position_info.position_size) }} ETH</p>
                 <p><strong>Entrada:</strong> ${{ "%.2f"|format(position_info.entry_price) }}</p>
                 <p><strong>Preço Atual:</strong> ${{ "%.2f"|format(position_info.current_price) }}</p>
-                <p><strong>Stop Atual:</strong> ${{ "%.2f"|format(position_info.stop_loss) }} 
-                    {% if position_info.trailing_activated %}
-                    <span class="trailing-badge">TRAILING ATIVADO</span>
-                    {% endif %}
+                <p><strong>Stop Loss:</strong> ${{ "%.2f"|format(position_info.stop_loss) }}</p>
+                <p><strong>Take Profit:</strong> ${{ "%.2f"|format(position_info.take_profit) }}</p>
+                {% if position_info.trailing_activated %}
+                <p><strong>Trailing Stop:</strong> ${{ "%.2f"|format(position_info.trailing_stop) }} 
+                    <span class="trailing-badge">ATIVADO</span>
                 </p>
+                {% endif %}
                 <p><strong>PnL Estimado:</strong> 
                     {% if position_info.position_side == 'long' %}
                         ${{ "%.2f"|format((position_info.current_price - position_info.entry_price) * position_info.position_size) }}
@@ -295,6 +295,7 @@ def home():
             </div>
             {% endif %}
             
+            <!-- Controles -->
             <div>
                 <button class="btn start-btn" onclick="controlBot('start')" {{ 'disabled' if trading_active else '' }}>
                     ⚡ Ligar Bot
@@ -309,6 +310,7 @@ def home():
                 {% endif %}
             </div>
             
+            <!-- Menu -->
             <div class="menu">
                 <a href="/status">📊 Status</a>
                 <a href="/history">📜 Histórico</a>
@@ -317,13 +319,14 @@ def home():
                 <a href="/test-auth">🔐 Testar OKX</a>
                 <a href="/restart">🔄 Reiniciar</a>
                 <a href="/force-close">🔴 Fechar Posição</a>
-                <a href="/exact-status">🎯 Status Exato</a>
+                <a href="/exact-debug">🎯 Debug Exato</a>
             </div>
             
+            <!-- Informações -->
             <div class="info">
-                <strong>✅ ESTRATÉGIA 100% TRADINGVIEW:</strong> Algoritmo idêntico, timing exato, trailing stop real.<br>
+                <strong>✅ STRATEGY RUNNER EXACT:</strong> Executa 100% igual ao TradingView<br>
                 <strong>⏰ Timeframe:</strong> 30 minutos • <strong>Horário:</strong> Brasília (BRT)<br>
-                <strong>🔧 Modo:</strong> {{ 'REAL' if okx_client and okx_client.has_credentials else 'SIMULAÇÃO' }}
+                <strong>🔧 Modo:</strong> """ + mode + """ • <strong>Versão:</strong> 3.0 (Corrigida)
             </div>
         </div>
         
@@ -365,11 +368,16 @@ def home():
     </body>
     </html>
     """
-    return render_template_string(html, 
-                                 trading_active=trading_active, 
-                                 IS_RENDER=IS_RENDER,
-                                 position_info=position_info,
-                                 okx_client=okx_client)
+    
+    # Preparar dados para template
+    template_data = {
+        'trading_active': trading_active,
+        'IS_RENDER': IS_RENDER,
+        'position_info': position_info,
+        'strategy_runner': strategy_runner
+    }
+    
+    return render_template_string(html, **template_data)
 
 # ============================================================================
 # 8. ENDPOINTS DA API
@@ -383,106 +391,77 @@ def health():
         "timestamp": datetime.now().isoformat(),
         "environment": "render" if IS_RENDER else "local",
         "uptime_seconds": round(time.time() - start_time, 2),
-        "version": "exact_1.0"
+        "version": "exact_3.0"
     })
 
-@app.route('/exact-status')
-def exact_status():
-    """Status detalhado do novo strategy runner"""
+@app.route('/exact-debug')
+def exact_debug():
+    """Debug detalhado do novo strategy runner"""
     if not strategy_runner:
         return jsonify({"error": "Strategy Runner não inicializado"}), 500
     
     try:
-        # Obter informações do engine
-        engine_info = {}
-        if hasattr(strategy_runner, 'engine'):
-            engine = strategy_runner.engine
-            engine_info = {
-                "candle_count": getattr(engine, 'candle_count', 0),
-                "period": getattr(engine, 'period', 20),
-                "adaptive_method": getattr(engine, 'adaptive', 'Cos IFM'),
-                "gain_limit": getattr(engine, 'gain_limit', 900),
-                "threshold": getattr(engine, 'threshold', 0.0)
-            }
-        
-        # Info do trailing stop
-        trailing_info = {}
-        if strategy_runner.trailing_manager:
-            tm = strategy_runner.trailing_manager
-            trailing_info = {
-                "trailing_activated": tm.trailing_activated,
-                "current_stop": tm.current_stop,
-                "tp_trigger": tm.tp_trigger,
-                "best_price": tm.best_price,
-                "side": tm.side
-            }
-        
         return jsonify({
-            "trading_active": trading_active,
             "strategy_runner": {
                 "is_running": strategy_runner.is_running,
                 "current_price": strategy_runner.current_price,
                 "bar_count": strategy_runner.bar_count,
-                "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if strategy_runner.last_bar_timestamp else None,
-                "pending_buy": getattr(strategy_runner, 'pending_buy', False),
-                "pending_sell": getattr(strategy_runner, 'pending_sell', False),
                 "position_size": strategy_runner.position_size,
                 "position_side": strategy_runner.position_side,
                 "entry_price": strategy_runner.entry_price,
-                "trailing_manager": trailing_info
+                "stop_loss_price": strategy_runner.stop_loss_price,
+                "take_profit_price": strategy_runner.take_profit_price,
+                "trailing_activated": getattr(strategy_runner, 'trailing_activated', False),
+                "trailing_stop_price": getattr(strategy_runner, 'trailing_stop_price', None),
+                "buy_signal_previous_bar": getattr(strategy_runner, 'buy_signal_previous_bar', False),
+                "sell_signal_previous_bar": getattr(strategy_runner, 'sell_signal_previous_bar', False),
+                "buy_signal_current_bar": getattr(strategy_runner, 'buy_signal_current_bar', False),
+                "sell_signal_current_bar": getattr(strategy_runner, 'sell_signal_current_bar', False)
             },
-            "engine": engine_info,
-            "environment": "render" if IS_RENDER else "local",
-            "simulation_mode": not (okx_client and okx_client.has_credentials)
+            "trading_active": trading_active,
+            "mode": "REAL" if (okx_client and getattr(okx_client, 'has_credentials', False)) else "SIMULAÇÃO"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/debug')
 def debug_info():
-    """Endpoint para diagnóstico DETALHADO"""
+    """Endpoint para diagnóstico"""
     try:
-        strategy_status = {}
-        if strategy_runner:
-            # Para o novo runner
-            engine_info = {}
-            if hasattr(strategy_runner, 'engine'):
-                engine = strategy_runner.engine
-                engine_info = {
-                    "candle_count": getattr(engine, 'candle_count', 0),
-                    "params": getattr(engine, 'params', {})
-                }
-            
-            strategy_status = {
-                "is_running": strategy_runner.is_running,
-                "current_price": strategy_runner.current_price,
-                "bar_count": strategy_runner.bar_count,
-                "pending_buy": getattr(strategy_runner, 'pending_buy', False),
-                "pending_sell": getattr(strategy_runner, 'pending_sell', False),
-                "position_size": strategy_runner.position_size,
-                "position_side": strategy_runner.position_side,
-                "entry_price": getattr(strategy_runner, 'entry_price', None),
-                "engine_initialized": hasattr(strategy_runner, 'engine') and strategy_runner.engine is not None,
-                "last_bar_timestamp": strategy_runner.last_bar_timestamp.isoformat() if strategy_runner.last_bar_timestamp else None,
-                "engine_info": engine_info,
-                "websocket_connected": getattr(strategy_runner, 'ws', None) and getattr(strategy_runner.ws, 'sock', None) and strategy_runner.ws.sock.connected
-            }
-        
-        # Obtém trade_history_count de forma segura
-        trade_history_count = 0
-        if trade_history and hasattr(trade_history, 'trades'):
-            trade_history_count = len(trade_history.trades)
-        
-        return jsonify({
+        # Informações básicas
+        basic_info = {
             "trading_active": trading_active,
             "environment": "render" if IS_RENDER else "local",
-            "simulation_mode": not (okx_client and okx_client.has_credentials),
-            "strategy_runner": strategy_status,
-            "okx_initialized": okx_client is not None,
-            "okx_has_credentials": okx_client.has_credentials if okx_client else False,
-            "trade_history_count": trade_history_count,
             "uptime_seconds": round(time.time() - start_time, 2),
             "current_time": datetime.now().isoformat()
+        }
+        
+        # Informações do strategy runner
+        strategy_info = {}
+        if strategy_runner:
+            strategy_info = {
+                "is_running": strategy_runner.is_running,
+                "current_price": strategy_runner.current_price,
+                "bar_count": getattr(strategy_runner, 'bar_count', 0),
+                "position_size": strategy_runner.position_size,
+                "position_side": strategy_runner.position_side,
+                "has_position": strategy_runner.position_size != 0
+            }
+        
+        # Informações do histórico
+        history_info = {}
+        if trade_history and hasattr(trade_history, 'trades'):
+            history_info = {
+                "total_trades": len(trade_history.trades),
+                "open_trades": len([t for t in trade_history.trades if t.get('status') == 'open'])
+            }
+        
+        return jsonify({
+            **basic_info,
+            "strategy_runner": strategy_info,
+            "trade_history": history_info,
+            "okx_initialized": okx_client is not None,
+            "mode": "REAL" if (okx_client and getattr(okx_client, 'has_credentials', False)) else "SIMULAÇÃO"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -501,12 +480,6 @@ def restart_strategy():
             strategy_runner.stop()
             trading_active = False
             time.sleep(2)
-        
-        # Resetar completamente o engine
-        if hasattr(strategy_runner, 'engine') and strategy_runner.engine:
-            # Chamar reset do engine se existir
-            if hasattr(strategy_runner.engine, 'reset'):
-                strategy_runner.engine.reset()
         
         # Reiniciar estratégia
         if strategy_runner.start():
@@ -532,62 +505,42 @@ def start_trading():
     
     try:
         if not strategy_runner.start():
-            return jsonify({"status": "error", "message": "Falha ao iniciar WebSocket."}), 500
+            return jsonify({"status": "error", "message": "Falha ao iniciar estratégia."}), 500
         
         trading_active = True
         
         def trading_loop():
             logger.info("🔄 Loop de trading iniciado manualmente")
             
-            # Contador para logs periódicos
             last_status_log = time.time()
             consecutive_errors = 0
-            last_bar_logged = None
             
             while trading_active and strategy_runner:
                 try:
                     # Executar estratégia
                     status = strategy_runner.run_strategy_realtime()
                     
-                    # Log detalhado a cada nova barra
-                    if strategy_runner.last_bar_timestamp and strategy_runner.last_bar_timestamp != last_bar_logged:
+                    # Log de nova barra
+                    if status.get('new_bar', False):
                         logger.info("=" * 60)
-                        logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} PROCESSADA")
-                        logger.info(f"   Preço: ${strategy_runner.current_price:.2f}")
-                        
-                        # Sinais pendentes
-                        pending_buy = getattr(strategy_runner, 'pending_buy', False)
-                        pending_sell = getattr(strategy_runner, 'pending_sell', False)
-                        
-                        logger.info(f"   Sinal BUY pendente: {pending_buy}")
-                        logger.info(f"   Sinal SELL pendente: {pending_sell}")
-                        logger.info(f"   Posição: {strategy_runner.position_size:.4f} ETH")
-                        logger.info(f"   Lado: {strategy_runner.position_side}")
-                        
-                        if strategy_runner.entry_price:
-                            logger.info(f"   Entrada: ${strategy_runner.entry_price:.2f}")
-                        
-                        # Info do trailing
-                        if strategy_runner.trailing_manager:
-                            tm = strategy_runner.trailing_manager
-                            if tm.trailing_activated:
-                                logger.info(f"   Trailing Stop: ${tm.current_stop:.2f} (ATIVADO)")
-                        
+                        logger.info(f"📊 BARRA {strategy_runner.bar_count} PROCESSADA")
+                        logger.info(f"   Preço: ${status.get('current_price', 0):.2f}")
+                        logger.info(f"   Sinais: BUY={status.get('buy_signal_pending', False)}, SELL={status.get('sell_signal_pending', False)}")
+                        logger.info(f"   Posição: {status.get('position_side', 'FLAT')} {abs(status.get('position_size', 0)):.4f} ETH")
                         logger.info("=" * 60)
-                        last_bar_logged = strategy_runner.last_bar_timestamp
                     
-                    # Log periódico a cada 30 segundos
+                    # Log periódico
                     current_time = time.time()
                     if current_time - last_status_log > 30:
-                        if strategy_runner.current_price:
-                            position_str = f"{strategy_runner.position_side or 'FLAT'} {abs(strategy_runner.position_size):.4f} ETH"
-                            logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {position_str}")
-                            
-                            # Info do trailing
-                            if strategy_runner.trailing_manager:
-                                tm = strategy_runner.trailing_manager
-                                if tm.trailing_activated:
-                                    logger.info(f"   Trailing Stop: ${tm.current_stop:.2f}")
+                        if status.get('current_price'):
+                            pos_side = status.get('position_side', 'FLAT')
+                            pos_size = abs(status.get('position_size', 0))
+                            logger.info(f"📈 Status: ${status['current_price']:.2f} | {pos_side} {pos_size:.4f} ETH")
+                        
+                        # Sinais pendentes
+                        if status.get('buy_signal_pending') or status.get('sell_signal_pending'):
+                            logger.info(f"   Sinais pendentes: BUY={status.get('buy_signal_pending')}, SELL={status.get('sell_signal_pending')}")
+                        
                         last_status_log = current_time
                     
                     time.sleep(1)
@@ -604,11 +557,11 @@ def start_trading():
         trade_thread = threading.Thread(target=trading_loop, daemon=True)
         trade_thread.start()
         
-        mode = "REAL" if okx_client and okx_client.has_credentials else "SIMULAÇÃO"
-        logger.info(f"⚡ BOT LIGADO em modo {mode} (100% TradingView)!")
+        mode = "REAL" if (okx_client and getattr(okx_client, 'has_credentials', False)) else "SIMULAÇÃO"
+        logger.info(f"⚡ BOT LIGADO em modo {mode} (StrategyRunnerExact)!")
         return jsonify({
             "status": "success", 
-            "message": f"Bot iniciado em modo {mode} (100% TradingView)!"
+            "message": f"Bot iniciado em modo {mode} (StrategyRunnerExact)!"
         })
         
     except Exception as e:
@@ -694,7 +647,10 @@ def force_close_position():
             return html
         
         # Método POST - Executar fechamento forçado
-        result = strategy_runner.force_close_position()
+        if not hasattr(strategy_runner, 'force_close_current_position'):
+            return jsonify({"error": "Método não disponível"}), 400
+        
+        result = strategy_runner.force_close_current_position()
         if result.get('success'):
             logger.info("🔴 POSIÇÃO FECHADA FORÇADAMENTE via API")
             return jsonify(result)
@@ -707,52 +663,33 @@ def force_close_position():
 
 @app.route('/status')
 def status():
+    # Obter informações básicas
     price = strategy_runner.current_price if strategy_runner else None
     balance = okx_client.get_balance() if okx_client else 0
     
-    # Obter sinais pendentes do NOVO runner
-    pending_buy = getattr(strategy_runner, 'pending_buy', False) if strategy_runner else False
-    pending_sell = getattr(strategy_runner, 'pending_sell', False) if strategy_runner else False
-    entry_price = getattr(strategy_runner, 'entry_price', None) if strategy_runner else None
-    position_side = getattr(strategy_runner, 'position_side', None) if strategy_runner else None
-    position_size = getattr(strategy_runner, 'position_size', 0) if strategy_runner else 0
-    last_bar = strategy_runner.last_bar_timestamp.strftime('%H:%M') if strategy_runner and strategy_runner.last_bar_timestamp else None
-    
-    # Info do trailing stop
-    stop_loss = None
-    trailing_activated = False
-    if strategy_runner and strategy_runner.trailing_manager:
-        stop_loss = strategy_runner.trailing_manager.current_stop
-        trailing_activated = strategy_runner.trailing_manager.trailing_activated
-    
-    # Calcular PnL se houver posição
-    pnl_usdt = 0
-    pnl_percent = 0
-    if position_side and entry_price and price:
-        if position_side == 'long':
-            pnl_usdt = (price - entry_price) * position_size
-            pnl_percent = ((price - entry_price) / entry_price) * 100
-        elif position_side == 'short':
-            pnl_usdt = (entry_price - price) * abs(position_size)
-            pnl_percent = ((entry_price - price) / entry_price) * 100
+    # Sinais do novo runner
+    buy_signal = False
+    sell_signal = False
+    if strategy_runner:
+        buy_signal = getattr(strategy_runner, 'buy_signal_previous_bar', False)
+        sell_signal = getattr(strategy_runner, 'sell_signal_previous_bar', False)
     
     return jsonify({
         "trading_active": trading_active,
         "current_price": price,
         "balance_usdt": balance,
-        "pending_buy_signal": pending_buy,
-        "pending_sell_signal": pending_sell,
-        "position_size": position_size,
-        "position_side": position_side,
-        "entry_price": entry_price,
-        "stop_loss_price": stop_loss,
-        "trailing_activated": trailing_activated,
-        "pnl_usdt": round(pnl_usdt, 2),
-        "pnl_percent": round(pnl_percent, 2),
-        "last_bar_timestamp": last_bar,
+        "buy_signal": buy_signal,
+        "sell_signal": sell_signal,
+        "position_size": strategy_runner.position_size if strategy_runner else 0,
+        "position_side": strategy_runner.position_side if strategy_runner else None,
+        "entry_price": strategy_runner.entry_price if strategy_runner else None,
+        "stop_loss_price": strategy_runner.stop_loss_price if strategy_runner else None,
+        "take_profit_price": strategy_runner.take_profit_price if strategy_runner else None,
+        "trailing_activated": getattr(strategy_runner, 'trailing_activated', False) if strategy_runner else False,
+        "bar_count": getattr(strategy_runner, 'bar_count', 0) if strategy_runner else 0,
         "environment": "render" if IS_RENDER else "local",
-        "simulation_mode": not (okx_client and okx_client.has_credentials),
-        "version": "exact_tradingview"
+        "mode": "REAL" if (okx_client and getattr(okx_client, 'has_credentials', False)) else "SIMULAÇÃO",
+        "version": "strategy_runner_exact"
     })
 
 @app.route('/history')
@@ -800,7 +737,7 @@ def history_page():
             <div class="container">
                 <div class="header">
                     <h1>📜 Histórico de Operações</h1>
-                    <p>ETH/USDT - Estratégia 100% TradingView</p>
+                    <p>ETH/USDT - Strategy Runner Exact</p>
                 </div>
                 
                 <div class="stats">
@@ -820,18 +757,6 @@ def history_page():
                         <div>Taxa de Acerto</div>
                         <div class="stat-value """ + ("positive" if stats['win_rate'] > 50 else "negative") + """">
                             """ + f"{stats['win_rate']:.1f}%" + """
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div>Lucro Total %</div>
-                        <div class="stat-value """ + ("positive" if stats['total_pnl_percent'] > 0 else "negative") + """">
-                            """ + f"{stats['total_pnl_percent']:.4f}%" + """
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div>Lucro Total USDT</div>
-                        <div class="stat-value """ + ("positive" if stats['total_pnl_usdt'] > 0 else "negative") + """">
-                            $""" + f"{stats['total_pnl_usdt']:.2f}" + """
                         </div>
                     </div>
                 </div>
@@ -895,12 +820,9 @@ def history_page():
                 </table>
             """
         
-        # Determinar modo
-        mode = "SIMULAÇÃO" if not (okx_client and okx_client.has_credentials) else "REAL"
-        
-        html += f"""
+        html += """
                 <div class="footer">
-                    <p><strong>🔧 MODO {mode}:</strong> Estratégia executada 100% igual ao TradingView</p>
+                    <p><strong>🔧 Strategy Runner Exact:</strong> Executa 100% igual ao TradingView</p>
                     <p>Horário de Brasília (BRT) • Timeframe: 30min</p>
                 </div>
             </div>
@@ -948,15 +870,14 @@ def test_auth():
         balance = okx_client.get_balance()
         price = okx_client.get_ticker_price()
         
+        has_credentials = getattr(okx_client, 'has_credentials', False)
+        
         return jsonify({
-            "auth": "success" if okx_client.has_credentials else "simulation",
+            "auth": "success" if has_credentials else "simulation",
             "balance_usdt": balance,
             "current_eth_price": price,
-            "api_key_exists": bool(okx_client.api_key),
-            "secret_key_exists": bool(okx_client.secret_key),
-            "passphrase_exists": bool(okx_client.passphrase),
-            "has_credentials": okx_client.has_credentials,
-            "mode": "REAL" if okx_client.has_credentials else "SIMULAÇÃO"
+            "has_credentials": has_credentials,
+            "mode": "REAL" if has_credentials else "SIMULAÇÃO"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
