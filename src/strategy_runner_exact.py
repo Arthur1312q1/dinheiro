@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 STRATEGY RUNNER EXACT - VERSÃO FINAL 100% IDÊNTICA AO TRADINGVIEW
+CÓDIGO COMPLETO E CORRIGIDO
 """
 import os
 import logging
@@ -173,7 +174,6 @@ class StrategyRunnerExact:
         
         # Timing crítico - SEM DELAY
         self.next_bar_check = None
-        self.bar_process_lock = threading.Lock()
         
         logger.info("✅ StrategyRunnerExact inicializado (100% IDÊNTICO ao Pine Script)")
 
@@ -270,7 +270,7 @@ class StrategyRunnerExact:
             logger.info("=" * 60)
             return False
         
-        # Registrar trade no histórico
+        # Registrar trade no histórico (USANDO O TRADE_HISTORY!)
         trade_id = self.trade_history.add_trade(
             side=side,
             entry_price=entry_price,
@@ -314,7 +314,7 @@ class StrategyRunnerExact:
         return True
 
     def _close_position(self, exit_price: float, reason: str = "") -> bool:
-        """Fecha posição"""
+        """Fecha posição (USANDO O TRADE_HISTORY!)"""
         if not self.trade_id or self.position_size == 0:
             logger.warning("⚠️  Nenhuma posição para fechar")
             return False
@@ -339,7 +339,7 @@ class StrategyRunnerExact:
             
             logger.info(f"   PnL: {pnl_pct}% (${pnl_usdt})")
         
-        # Fechar no histórico
+        # Fechar no histórico (USANDO O TRADE_HISTORY!)
         success = self.trade_history.close_trade(self.trade_id, exit_price)
         
         if success:
@@ -539,7 +539,6 @@ class StrategyRunnerExact:
             import traceback
             logger.error(traceback.format_exc())
 
-    # Métodos WebSocket
     def _on_ws_message(self, ws, message):
         try:
             data = json.loads(message)
@@ -582,4 +581,131 @@ class StrategyRunnerExact:
             on_open=self._on_ws_open,
             on_message=self._on_ws_message,
             on_error=self._on_ws_error,
-            on_close=self._on_w
+            on_close=self._on_ws_close
+        )
+        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        self.ws_thread.start()
+        logger.info("Thread WebSocket iniciada")
+        time.sleep(3)
+
+    def start(self):
+        """Inicia a execução 100% IDÊNTICA ao TradingView"""
+        logger.info("🚀 Iniciando execução 100% IDÊNTICA ao Pine Script...")
+        
+        # Iniciar WebSocket
+        self._start_websocket()
+        
+        # Aguardar preço atual
+        logger.info("⏳ Aguardando preço atual...")
+        for _ in range(30):
+            if self.current_price is not None:
+                break
+            time.sleep(1)
+        
+        if self.current_price is None:
+            logger.error("❌ Não foi possível obter preço atual")
+            return False
+        
+        logger.info(f"✅ Preço atual: ${self.current_price:.2f}")
+        
+        # Inicializar com candles históricos
+        self._initialize_candle_buffer()
+        
+        self.is_running = True
+        logger.info("✅ Execução iniciada (100% IDÊNTICA ao TradingView)")
+        return True
+
+    def _initialize_candle_buffer(self):
+        """Inicializa buffer com candles históricos"""
+        logger.info("📈 Inicializando com candles históricos...")
+        
+        try:
+            historical_candles = self.okx_client.get_candles(limit=100)
+            
+            if len(historical_candles) >= 30:
+                logger.info(f"✅ {len(historical_candles)} candles históricos")
+                
+                # Processar candles para "aquecer" o algoritmo
+                for candle in historical_candles:
+                    self.engine.process_candle(candle)
+                
+                logger.info(f"   🔧 {len(historical_candles)} candles processados")
+                
+                # Definir último timestamp
+                if historical_candles:
+                    last_ts = historical_candles[-1]['timestamp'] / 1000
+                    last_dt = datetime.fromtimestamp(last_ts, self.tz_utc)
+                    
+                    # Arredondar para início da barra de 30m em UTC
+                    minute = (last_dt.minute // 30) * 30
+                    self.last_bar_timestamp = last_dt.replace(
+                        minute=minute, 
+                        second=0, 
+                        microsecond=0
+                    )
+                    
+                    self.bar_count = len(historical_candles)
+                    logger.info(f"   ⏰ Última barra histórica: {self.last_bar_timestamp.strftime('%H:%M')} UTC")
+                    
+            else:
+                logger.warning(f"⚠️ Apenas {len(historical_candles)} candles")
+                
+        except Exception as e:
+            logger.error(f"❌ Erro ao inicializar candles: {e}")
+
+    def run_strategy_realtime(self):
+        """Executa estratégia em tempo real - SEM DELAY, baseado em tempo real"""
+        if not self.is_running:
+            return {"status": "stopped"}
+        
+        try:
+            # Verificar se a barra foi completada (baseado no tempo real)
+            new_bar = self._check_bar_completion()
+            
+            # Verificar trailing stop (a cada tick)
+            self._check_trailing_stop()
+            
+            return {
+                "status": "running",
+                "new_bar": new_bar,
+                "current_price": self.current_price,
+                "bar_count": self.bar_count,
+                "pending_buy": self.pending_buy,
+                "pending_sell": self.pending_sell,
+                "buy_signal_current": self.buy_signal_current,
+                "sell_signal_current": self.sell_signal_current,
+                "buy_signal_prev": self.buy_signal_prev,
+                "sell_signal_prev": self.sell_signal_prev,
+                "position_size": self.position_size,
+                "position_side": self.position_side,
+                "entry_price": self.entry_price,
+                "trailing_stop": self.trailing_manager.current_stop if self.trailing_manager else None,
+                "trailing_activated": self.trailing_manager.trailing_activated if self.trailing_manager else False
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro em run_strategy_realtime: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"status": "error", "error": str(e)}
+
+    def force_close_position(self):
+        """Força fechamento da posição atual"""
+        if not self.position_size or not self.current_price:
+            return {"success": False, "message": "Sem posição aberta"}
+        
+        try:
+            success = self._close_position(self.current_price, "force_close")
+            if success:
+                return {"success": True, "message": f"Posição fechada @ ${self.current_price:.2f}"}
+            else:
+                return {"success": False, "message": "Falha ao fechar posição"}
+        except Exception as e:
+            return {"success": False, "message": f"Erro: {str(e)}"}
+
+    def stop(self):
+        """Para a execução"""
+        self.is_running = False
+        if self.ws:
+            self.ws.close()
+        logger.info("⏹️ Execução parada")
