@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-STRATEGY RUNNER EXACT - VERSÃO FINAL 100% IDÊNTICA AO TRADINGVIEW
-CÓDIGO COMPLETO E CORRIGIDO
+STRATEGY RUNNER EXACT - CORREÇÕES CRÍTICAS APLICADAS
 """
 import os
 import logging
@@ -123,7 +122,7 @@ class TrailingStopManager:
             return current_price >= self.current_stop
 
 class StrategyRunnerExact:
-    """Executa estratégia 100% IDÊNTICA ao TradingView - SEM DELAY"""
+    """Executa estratégia 100% IDÊNTICA ao TradingView - CORREÇÕES CRÍTICAS"""
     
     def __init__(self, okx_client: OKXClient, trade_history):
         self.okx_client = okx_client
@@ -172,10 +171,10 @@ class StrategyRunnerExact:
         self.ws = None
         self.ws_thread = None
         
-        # Timing crítico - SEM DELAY
+        # Timing crítico - INICIALIZADO CORRETAMENTE
         self.next_bar_check = None
         
-        logger.info("✅ StrategyRunnerExact inicializado (100% IDÊNTICO ao Pine Script)")
+        logger.info("✅ StrategyRunnerExact inicializado (CORREÇÕES CRÍTICAS APLICADAS)")
 
     def _load_pine_script(self):
         """Carrega código Pine Script do arquivo"""
@@ -270,7 +269,7 @@ class StrategyRunnerExact:
             logger.info("=" * 60)
             return False
         
-        # Registrar trade no histórico (USANDO O TRADE_HISTORY!)
+        # Registrar trade no histórico
         trade_id = self.trade_history.add_trade(
             side=side,
             entry_price=entry_price,
@@ -314,7 +313,7 @@ class StrategyRunnerExact:
         return True
 
     def _close_position(self, exit_price: float, reason: str = "") -> bool:
-        """Fecha posição (USANDO O TRADE_HISTORY!)"""
+        """Fecha posição"""
         if not self.trade_id or self.position_size == 0:
             logger.warning("⚠️  Nenhuma posição para fechar")
             return False
@@ -339,7 +338,7 @@ class StrategyRunnerExact:
             
             logger.info(f"   PnL: {pnl_pct}% (${pnl_usdt})")
         
-        # Fechar no histórico (USANDO O TRADE_HISTORY!)
+        # Fechar no histórico
         success = self.trade_history.close_trade(self.trade_id, exit_price)
         
         if success:
@@ -384,8 +383,17 @@ class StrategyRunnerExact:
         
         # Calcular início da próxima barra
         current_minute = now_utc.minute
-        current_bar_minute = (current_minute // self.timeframe_minutes) * self.timeframe_minutes
-        current_bar_start = now_utc.replace(minute=current_bar_minute, second=0, microsecond=0)
+        bar_minute = (current_minute // self.timeframe_minutes) * self.timeframe_minutes
+        
+        # Se estamos exatamente no início de uma barra
+        if current_minute == bar_minute and now_utc.second < 5:
+            current_bar_start = now_utc.replace(second=0, microsecond=0)
+        else:
+            current_bar_start = now_utc.replace(
+                minute=bar_minute,
+                second=0,
+                microsecond=0
+            )
         
         # Próxima barra começa em +30 minutos
         next_bar_start = current_bar_start + timedelta(minutes=self.timeframe_minutes)
@@ -393,62 +401,53 @@ class StrategyRunnerExact:
         return next_bar_start
 
     def _check_bar_completion(self):
-        """Verifica se a barra atual foi completada - TIMING EXATO"""
+        """Verifica se uma nova barra de 30m começou - TIMING EXATO"""
+        if not self.current_price:
+            return False
+        
         now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
         
-        # Se for a primeira vez, inicializar
-        if self.last_bar_timestamp is None:
-            self.last_bar_timestamp = now_utc
-            self.current_bar_data = {
-                'timestamp': int(now_utc.timestamp() * 1000),
-                'open': self.current_price if self.current_price else 0,
-                'high': self.current_price if self.current_price else 0,
-                'low': self.current_price if self.current_price else 0,
-                'close': self.current_price if self.current_price else 0,
-                'volume': 0
-            }
+        # Se next_bar_check não foi inicializado, calcular
+        if self.next_bar_check is None:
             self.next_bar_check = self._calculate_next_bar_time()
-            logger.info(f"⏰ Primeira barra iniciada: {now_utc.strftime('%H:%M:%S')} UTC")
-            return False
+            logger.info(f"⏰ Inicializado next_bar_check: {self.next_bar_check.strftime('%H:%M:%S')} UTC")
         
         # Verificar se é hora da próxima barra
         if now_utc >= self.next_bar_check:
             logger.info("=" * 60)
-            logger.info(f"📊 BARRA COMPLETADA: {self.last_bar_timestamp.strftime('%H:%M')} UTC")
+            logger.info(f"📊 NOVA BARRA 30m INICIADA: {now_utc.strftime('%H:%M')} UTC")
+            logger.info(f"   Preço abertura: ${self.current_price:.2f}")
             
-            # Processar a barra que acabou de fechar
+            # IMPORTANTE: Ordem de execução IDÊNTICA ao Pine Script
+            # 1. Primeiro executar sinais pendentes da barra ANTERIOR
+            self._execute_pending_signals()
+            
+            # 2. Depois processar barra ANTERIOR para gerar NOVOS sinais
             if self.current_bar_data:
-                # Atualizar preço de fechamento com o último preço antes da nova barra
-                self.current_bar_data['close'] = self.current_price if self.current_price else self.current_bar_data['close']
-                
-                # 1. Primeiro: Processar barra anterior para gerar sinais
                 self._process_completed_bar()
-                
-                # 2. Depois: Executar sinais pendentes (da barra anterior [1])
-                self._execute_pending_signals()
             
-            # Iniciar nova barra
+            # 3. Iniciar nova barra
             self.last_bar_timestamp = now_utc
             self.bar_count += 1
             self.current_bar_data = {
                 'timestamp': int(now_utc.timestamp() * 1000),
-                'open': self.current_price if self.current_price else 0,
-                'high': self.current_price if self.current_price else 0,
-                'low': self.current_price if self.current_price else 0,
-                'close': self.current_price if self.current_price else 0,
+                'open': self.current_price,
+                'high': self.current_price,
+                'low': self.current_price,
+                'close': self.current_price,
                 'volume': 0
             }
             
             # Calcular próximo check
             self.next_bar_check = self._calculate_next_bar_time()
             
-            logger.info(f"   Nova barra #{self.bar_count} iniciada: {now_utc.strftime('%H:%M:%S')} UTC")
-            logger.info(f"   Próximo check: {self.next_bar_check.strftime('%H:%M:%S')} UTC")
+            logger.info(f"   Barra #{self.bar_count} iniciada")
+            logger.info(f"   Próxima verificação: {self.next_bar_check.strftime('%H:%M:%S')} UTC")
             logger.info("=" * 60)
             return True
         
         # Atualizar dados da barra atual
-        if self.current_bar_data and self.current_price:
+        if self.current_bar_data:
             self.current_bar_data['high'] = max(self.current_bar_data['high'], self.current_price)
             self.current_bar_data['low'] = min(self.current_bar_data['low'], self.current_price)
             self.current_bar_data['close'] = self.current_price
@@ -493,7 +492,7 @@ class StrategyRunnerExact:
         if not self.current_bar_data:
             return
         
-        logger.info(f"📈 Processando barra #{self.bar_count} para sinais...")
+        logger.info(f"📈 Processando barra #{self.bar_count-1 if self.bar_count > 0 else 0} para sinais...")
         logger.info(f"   Dados do candle:")
         logger.info(f"     Open: ${self.current_bar_data['open']:.2f}")
         logger.info(f"     High: ${self.current_bar_data['high']:.2f}")
@@ -608,45 +607,50 @@ class StrategyRunnerExact:
         
         logger.info(f"✅ Preço atual: ${self.current_price:.2f}")
         
-        # Inicializar com candles históricos
+        # Inicializar com candles históricos (APENAS para warm-up do engine)
         self._initialize_candle_buffer()
         
+        # Inicializar primeira barra com preço atual
+        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+        self.last_bar_timestamp = now_utc
+        self.current_bar_data = {
+            'timestamp': int(now_utc.timestamp() * 1000),
+            'open': self.current_price,
+            'high': self.current_price,
+            'low': self.current_price,
+            'close': self.current_price,
+            'volume': 0
+        }
+        
+        # Calcular próxima verificação de barra
+        self.next_bar_check = self._calculate_next_bar_time()
+        
+        logger.info(f"⏰ Primeira barra iniciada: {now_utc.strftime('%H:%M:%S')} UTC")
+        logger.info(f"📅 Próxima verificação: {self.next_bar_check.strftime('%H:%M:%S')} UTC")
+        
         self.is_running = True
-        logger.info("✅ Execução iniciada (100% IDÊNTICA ao TradingView)")
+        logger.info("✅ Execução iniciada (CORREÇÕES CRÍTICAS APLICADAS)")
         return True
 
     def _initialize_candle_buffer(self):
-        """Inicializa buffer com candles históricos"""
-        logger.info("📈 Inicializando com candles históricos...")
+        """Inicializa buffer com candles históricos APENAS para warm-up"""
+        logger.info("📈 Inicializando com candles históricos (WARM-UP)...")
         
         try:
             historical_candles = self.okx_client.get_candles(limit=100)
             
             if len(historical_candles) >= 30:
-                logger.info(f"✅ {len(historical_candles)} candles históricos")
+                logger.info(f"✅ {len(historical_candles)} candles históricos para warm-up")
                 
-                # Processar candles para "aquecer" o algoritmo
+                # Processar candles para "aquecer" o algoritmo (NÃO usar para trading)
                 for candle in historical_candles:
                     self.engine.process_candle(candle)
                 
-                logger.info(f"   🔧 {len(historical_candles)} candles processados")
+                logger.info(f"   🔧 {len(historical_candles)} candles processados (warm-up)")
                 
-                # Definir último timestamp
-                if historical_candles:
-                    last_ts = historical_candles[-1]['timestamp'] / 1000
-                    last_dt = datetime.fromtimestamp(last_ts, self.tz_utc)
-                    
-                    # Arredondar para início da barra de 30m em UTC
-                    minute = (last_dt.minute // 30) * 30
-                    self.last_bar_timestamp = last_dt.replace(
-                        minute=minute, 
-                        second=0, 
-                        microsecond=0
-                    )
-                    
-                    self.bar_count = len(historical_candles)
-                    logger.info(f"   ⏰ Última barra histórica: {self.last_bar_timestamp.strftime('%H:%M')} UTC")
-                    
+                # NÃO definir last_bar_timestamp com base no histórico
+                # Vamos começar do horário atual
+                
             else:
                 logger.warning(f"⚠️ Apenas {len(historical_candles)} candles")
                 
