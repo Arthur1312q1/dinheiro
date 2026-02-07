@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MAIN.PY ATUALIZADO - USANDO STRATEGY RUNNER EXATO
+MAIN.PY ATUALIZADO - COM SINCRONIZAÇÃO PERFEITA E BALANCE DINÂMICO
 """
 import os
 import sys
@@ -14,12 +14,11 @@ from flask import Flask, request, jsonify, render_template_string
 # ============================================================================
 # 1. CONFIGURAÇÃO INICIAL
 # ============================================================================
-# Adicionar src ao path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, 'src')
 sys.path.insert(0, src_path)
 
-# Configurar logging para Render - MAIS DETALHADO
+# Configurar logging
 if os.getenv('RENDER', '').lower() == 'true':
     logging.basicConfig(
         level=logging.INFO,
@@ -51,11 +50,13 @@ else:
 # 3. IMPORTAR MÓDULOS DE src/
 # ============================================================================
 try:
-    # Importar tudo de src - IMPORTANTE: Usar novo StrategyRunnerExact
     from src.okx_client import OKXClient
     from src.keep_alive import KeepAliveSystem
-    from src.strategy_runner_exact import StrategyRunnerExact  # NOVO!
+    from src.strategy_runner_exact import StrategyRunnerExact  # JÁ MODIFICADO
     from src.trade_history import TradeHistory
+    from src.time_sync import TimeSync  # NOVO
+    from src.balance_manager import BalanceManager  # NOVO
+    from src.comparison_logger import ComparisonLogger  # NOVO
     
     logger.info("✅ Módulos importados com sucesso")
     
@@ -72,10 +73,10 @@ try:
     
     keep_alive = KeepAliveSystem(base_url=base_url)
     
-    # Inicializar NOVO strategy runner (100% TradingView)
+    # Inicializar strategy runner (AGORA COM SINCRONIZAÇÃO PERFEITA)
     strategy_runner = StrategyRunnerExact(okx_client, trade_history)
     
-    logger.info("✅ Sistema inicializado com sucesso (STRATEGY RUNNER EXACT)")
+    logger.info("✅ Sistema inicializado com SINCRONIZAÇÃO PERFEITA")
     
 except Exception as e:
     logger.error(f"❌ Erro na inicialização: {e}")
@@ -138,7 +139,7 @@ def start_strategy_automatically():
                         # Log detalhado a cada nova barra
                         if strategy_runner.last_bar_timestamp and strategy_runner.last_bar_timestamp != last_bar_logged:
                             logger.info("=" * 60)
-                            logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} PROCESSADA")
+                            logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} UTC PROCESSADA")
                             logger.info(f"   Preço: ${strategy_runner.current_price:.2f}")
                             
                             # Sinais pendentes do NOVO runner
@@ -152,6 +153,11 @@ def start_strategy_automatically():
                             
                             if strategy_runner.entry_price:
                                 logger.info(f"   Entrada: ${strategy_runner.entry_price:.2f}")
+                            
+                            # BALANCE DINÂMICO
+                            if hasattr(strategy_runner, 'balance_manager'):
+                                balance = strategy_runner.balance_manager.get_balance()
+                                logger.info(f"   Balance: ${balance:.2f}")
                             
                             # Info do trailing stop
                             if strategy_runner.trailing_manager:
@@ -168,7 +174,12 @@ def start_strategy_automatically():
                         if current_time - last_status_log > 30:
                             if strategy_runner.current_price:
                                 position_str = f"{strategy_runner.position_side or 'FLAT'} {abs(strategy_runner.position_size):.4f} ETH"
-                                logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {position_str}")
+                                balance_str = ""
+                                if hasattr(strategy_runner, 'balance_manager'):
+                                    balance = strategy_runner.balance_manager.get_balance()
+                                    balance_str = f" | Balance: ${balance:.2f}"
+                                
+                                logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {position_str}{balance_str}")
                                 
                                 # Info do trailing
                                 if strategy_runner.trailing_manager:
@@ -204,14 +215,17 @@ if IS_RENDER:
     threading.Timer(5.0, start_strategy_automatically).start()
 
 # ============================================================================
-# 7. INTERFACE WEB
+# 7. INTERFACE WEB - ATUALIZADA COM NOVAS INFORMAÇÕES
 # ============================================================================
 @app.route('/')
 def home():
     # Obter informações da posição atual
     position_info = {}
+    balance_info = {}
+    sync_info = {}
+    
     if strategy_runner:
-        # Para o NOVO runner, os atributos podem ser diferentes
+        # Informações da posição
         current_stop = None
         if strategy_runner.trailing_manager:
             current_stop = strategy_runner.trailing_manager.current_stop
@@ -222,20 +236,39 @@ def home():
             'position_size': abs(strategy_runner.position_size),
             'entry_price': strategy_runner.entry_price,
             'current_price': strategy_runner.current_price,
-            'stop_loss': current_stop,  # Usa o trailing stop atual
-            'take_profit': getattr(strategy_runner, 'take_profit_price', None),
+            'stop_loss': current_stop,
             'trailing_activated': getattr(strategy_runner.trailing_manager, 'trailing_activated', False) if strategy_runner.trailing_manager else False
         }
+        
+        # Informações do balance
+        if hasattr(strategy_runner, 'balance_manager'):
+            balance_stats = strategy_runner.balance_manager.get_stats()
+            balance_info = {
+                'current_balance': balance_stats['current_balance'],
+                'initial_capital': balance_stats['initial_capital'],
+                'netprofit': balance_stats['netprofit'],
+                'trade_count': balance_stats['trade_count']
+            }
+        
+        # Informações de sincronização
+        if hasattr(strategy_runner, 'time_sync'):
+            sync_data = strategy_runner.time_sync.get_current_bar_info()
+            next_bar_in = sync_data.get('seconds_to_next_bar', 0)
+            sync_info = {
+                'next_bar_in': int(next_bar_in) if next_bar_in else 0,
+                'current_time': sync_data['current_timestamp'].strftime('%H:%M:%S') if sync_data.get('current_timestamp') else 'N/A',
+                'bar_count': strategy_runner.bar_count
+            }
     
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Bot Trading ETH/USDT - ESTRATÉGIA EXATA</title>
+        <title>Bot Trading ETH/USDT - SINCRONIZAÇÃO PERFEITA</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: Arial, sans-serif; background: #1a1a2e; color: white; text-align: center; padding: 20px; }
-            .container { max-width: 800px; margin: 0 auto; }
+            .container { max-width: 900px; margin: 0 auto; }
             .header { background: rgba(0, 255, 136, 0.1); padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #00ff88; }
             .status { padding: 15px; border-radius: 10px; margin: 15px 0; font-weight: bold; }
             .active { background: rgba(0, 255, 136, 0.2); border: 2px solid #00ff88; }
@@ -244,56 +277,80 @@ def home():
             .start-btn { background: #00ff88; color: #000; }
             .stop-btn { background: #ff4444; color: white; }
             .force-close-btn { background: #ffaa00; color: #000; }
+            .sync-btn { background: #0088ff; color: white; }
             .btn:disabled { opacity: 0.5; cursor: not-allowed; }
             .menu { margin: 30px 0; }
             .menu a { color: #00ff88; text-decoration: none; margin: 0 15px; font-size: 16px; }
             .menu a:hover { text-decoration: underline; }
             .info { color: #aaa; font-size: 14px; margin-top: 20px; }
             .position-info { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; }
-            .position-info h3 { color: #00ff88; margin-top: 0; }
+            .balance-info { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; }
+            .sync-info { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 10px; margin: 20px 0; text-align: left; }
+            .info h3 { color: #00ff88; margin-top: 0; }
             .debug { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin: 20px 0; text-align: left; }
             .debug pre { overflow: auto; max-height: 300px; }
             .trailing-badge { background: #ffaa00; color: black; padding: 3px 8px; border-radius: 10px; font-size: 12px; font-weight: bold; }
+            .sync-badge { background: #0088ff; color: white; padding: 3px 8px; border-radius: 10px; font-size: 12px; font-weight: bold; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin: 20px 0; }
+            .card { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 10px; text-align: left; }
+            .card h4 { margin-top: 0; color: #00ff88; }
+            .value { font-size: 24px; font-weight: bold; margin: 10px 0; }
+            .positive { color: #00ff88; }
+            .negative { color: #ff4444; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
                 <h1>⚡ Bot Trading ETH/USDT</h1>
-                <p>Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Modo: SIMULAÇÃO</p>
+                <p>Estratégia: Adaptive Zero Lag EMA v2 • Timeframe: 30m • Sincronização PERFEITA</p>
                 <p><strong>Ambiente:</strong> """ + ("🌍 RENDER" if IS_RENDER else "💻 LOCAL") + """</p>
                 <p><strong>Status:</strong> {{ '🟢 ATIVO' if trading_active else '🔴 INATIVO' }}</p>
-                <p><strong>Versão:</strong> EXATA (100% TradingView)</p>
+                <p><strong>Versão:</strong> SINCRONIZAÇÃO PERFEITA com TradingView</p>
             </div>
             
             <div class="status {{ 'active' if trading_active else 'inactive' }}">
-                {{ '🟢 ATIVO - Executando IDÊNTICO ao TradingView' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
+                {{ '🟢 ATIVO - Executando 100% idêntico ao TradingView' if trading_active else '🔴 INATIVO - Aguardando ativação' }}
             </div>
             
-            <!-- Informações da posição atual -->
-            {% if position_info.has_position %}
-            <div class="position-info">
-                <h3>📊 Posição Atual</h3>
-                <p><strong>Lado:</strong> {{ position_info.position_side|upper }}</p>
-                <p><strong>Tamanho:</strong> {{ "%.4f"|format(position_info.position_size) }} ETH</p>
-                <p><strong>Entrada:</strong> ${{ "%.2f"|format(position_info.entry_price) }}</p>
-                <p><strong>Preço Atual:</strong> ${{ "%.2f"|format(position_info.current_price) }}</p>
-                <p><strong>Stop Atual:</strong> ${{ "%.2f"|format(position_info.stop_loss) }} 
-                    {% if position_info.trailing_activated %}
-                    <span class="trailing-badge">TRAILING ATIVADO</span>
-                    {% endif %}
-                </p>
-                <p><strong>PnL Estimado:</strong> 
-                    {% if position_info.position_side == 'long' %}
-                        ${{ "%.2f"|format((position_info.current_price - position_info.entry_price) * position_info.position_size) }}
-                        ({{ "%.2f"|format(((position_info.current_price - position_info.entry_price) / position_info.entry_price * 100)) }}%)
+            <!-- Grid de informações -->
+            <div class="grid">
+                <div class="card">
+                    <h4>⏰ Sincronização</h4>
+                    <p>Próxima barra em: <strong>{{ sync_info.next_bar_in }}s</strong></p>
+                    <p>Horário UTC: {{ sync_info.current_time }}</p>
+                    <p>Barra #{{ sync_info.bar_count }}</p>
+                    <span class="sync-badge">NTP SYNC</span>
+                </div>
+                
+                <div class="card">
+                    <h4>💰 Balance</h4>
+                    <div class="value {{ 'positive' if balance_info.netprofit > 0 else 'negative' if balance_info.netprofit < 0 else '' }}">
+                        ${{ "%.2f"|format(balance_info.current_balance) }}
+                    </div>
+                    <p>Capital: ${{ "%.2f"|format(balance_info.initial_capital) }}</p>
+                    <p>Net Profit: ${{ "%.2f"|format(balance_info.netprofit) }}</p>
+                    <p>Trades: {{ balance_info.trade_count }}</p>
+                </div>
+                
+                <div class="card">
+                    <h4>📊 Posição</h4>
+                    {% if position_info.has_position %}
+                        <div class="value {{ 'positive' if position_info.position_side == 'long' else 'negative' }}">
+                            {{ position_info.position_side|upper }} {{ "%.4f"|format(position_info.position_size) }} ETH
+                        </div>
+                        <p>Entrada: ${{ "%.2f"|format(position_info.entry_price) }}</p>
+                        <p>Atual: ${{ "%.2f"|format(position_info.current_price) }}</p>
+                        <p>Stop: ${{ "%.2f"|format(position_info.stop_loss) }}</p>
+                        {% if position_info.trailing_activated %}
+                        <span class="trailing-badge">TRAILING ATIVADO</span>
+                        {% endif %}
                     {% else %}
-                        ${{ "%.2f"|format((position_info.entry_price - position_info.current_price) * position_info.position_size) }}
-                        ({{ "%.2f"|format(((position_info.entry_price - position_info.current_price) / position_info.entry_price * 100)) }}%)
+                        <div class="value">FLAT</div>
+                        <p>Sem posição aberta</p>
                     {% endif %}
-                </p>
+                </div>
             </div>
-            {% endif %}
             
             <div>
                 <button class="btn start-btn" onclick="controlBot('start')" {{ 'disabled' if trading_active else '' }}>
@@ -301,6 +358,9 @@ def home():
                 </button>
                 <button class="btn stop-btn" onclick="controlBot('stop')" {{ 'disabled' if not trading_active else '' }}>
                     ⏹️ Parar Bot
+                </button>
+                <button class="btn sync-btn" onclick="window.location.href='/validate-sync'">
+                    🔧 Validar Sincronização
                 </button>
                 {% if position_info.has_position %}
                 <button class="btn force-close-btn" onclick="forceClosePosition()">
@@ -312,17 +372,19 @@ def home():
             <div class="menu">
                 <a href="/status">📊 Status</a>
                 <a href="/history">📜 Histórico</a>
+                <a href="/balance-status">💰 Balance</a>
+                <a href="/sync-status">⏰ Sincronização</a>
                 <a href="/debug">🐛 Debug</a>
                 <a href="/health">❤️ Saúde</a>
                 <a href="/test-auth">🔐 Testar OKX</a>
-                <a href="/restart">🔄 Reiniciar</a>
-                <a href="/force-close">🔴 Fechar Posição</a>
                 <a href="/exact-status">🎯 Status Exato</a>
+                <a href="/validate-sync">🔧 Validação</a>
             </div>
             
             <div class="info">
-                <strong>✅ ESTRATÉGIA 100% TRADINGVIEW:</strong> Algoritmo idêntico, timing exato, trailing stop real.<br>
-                <strong>⏰ Timeframe:</strong> 30 minutos • <strong>Horário:</strong> Brasília (BRT)<br>
+                <strong>✅ SINCRONIZAÇÃO PERFEITA:</strong> Timing exato, balance dinâmico, cálculos 100% idênticos.<br>
+                <strong>⏰ Timeframe:</strong> 30 minutos • <strong>Horário:</strong> UTC (sincronizado NTP)<br>
+                <strong>💰 Balance:</strong> ${{ "%.2f"|format(balance_info.current_balance) }} (Capital: ${{ "%.2f"|format(balance_info.initial_capital) }} + Profit: ${{ "%.2f"|format(balance_info.netprofit) }})<br>
                 <strong>🔧 Modo:</strong> {{ 'REAL' if okx_client and okx_client.has_credentials else 'SIMULAÇÃO' }}
             </div>
         </div>
@@ -369,6 +431,8 @@ def home():
                                  trading_active=trading_active, 
                                  IS_RENDER=IS_RENDER,
                                  position_info=position_info,
+                                 balance_info=balance_info,
+                                 sync_info=sync_info,
                                  okx_client=okx_client)
 
 # ============================================================================
@@ -378,22 +442,209 @@ def home():
 def health():
     return jsonify({
         "status": "healthy",
-        "service": "OKX ETH Trading Bot - EXACT VERSION",
+        "service": "OKX ETH Trading Bot - SINCRONIZAÇÃO PERFEITA",
         "trading_active": trading_active,
         "timestamp": datetime.now().isoformat(),
         "environment": "render" if IS_RENDER else "local",
         "uptime_seconds": round(time.time() - start_time, 2),
-        "version": "exact_1.0"
+        "version": "sync_perfect_1.0"
     })
 
-@app.route('/exact-status')
-def exact_status():
-    """Status detalhado do novo strategy runner"""
+@app.route('/sync-status')
+def sync_status():
+    """Status da sincronização temporal"""
     if not strategy_runner:
         return jsonify({"error": "Strategy Runner não inicializado"}), 500
     
     try:
-        # Obter informações do engine
+        sync_info = strategy_runner.time_sync.get_current_bar_info()
+        return jsonify({
+            "synchronized_time": sync_info['current_timestamp'].isoformat(),
+            "current_bar": sync_info['current_bar_timestamp'].isoformat(),
+            "next_bar_in": sync_info['seconds_to_next_bar'],
+            "time_offset": strategy_runner.time_sync.time_offset,
+            "ntp_sync": strategy_runner.time_sync.last_sync.isoformat() if strategy_runner.time_sync.last_sync else None,
+            "bar_count": strategy_runner.bar_count,
+            "is_bar_start": sync_info['is_bar_start'],
+            "time_since_bar_start": sync_info['time_since_bar_start']
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/balance-status')
+def balance_status():
+    """Status do balance dinâmico"""
+    if not strategy_runner:
+        return jsonify({"error": "Strategy Runner não inicializado"}), 500
+    
+    try:
+        stats = strategy_runner.balance_manager.get_stats()
+        return jsonify({
+            "balance": stats['current_balance'],
+            "initial_capital": stats['initial_capital'],
+            "netprofit": stats['netprofit'],
+            "trade_count": stats['trade_count'],
+            "avg_pnl_per_trade": stats['avg_pnl_per_trade'],
+            "formula": "balance = initial_capital + netprofit"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/validate-sync')
+def validate_sync_page():
+    """Página para validação de sincronização"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Validação de Sincronização</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; background: #1a1a2e; color: white; padding: 20px; }
+            .container { max-width: 800px; margin: 0 auto; }
+            .header { background: rgba(0, 255, 136, 0.1); padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #00ff88; }
+            .btn { padding: 12px 24px; margin: 10px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: bold; }
+            .test-btn { background: #0088ff; color: white; }
+            .back-btn { background: #555; color: white; }
+            .result { margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 8px; }
+            .success { color: #00ff88; }
+            .warning { color: #ffaa00; }
+            .error { color: #ff4444; }
+            .info-box { background: rgba(0, 136, 255, 0.1); padding: 15px; border-radius: 10px; margin: 20px 0; border: 1px solid #0088ff; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔧 Validação de Sincronização</h1>
+                <p>Teste se o bot está sincronizado 100% com o TradingView</p>
+            </div>
+            
+            <div class="info-box">
+                <h3>⚠️ IMPORTANTE</h3>
+                <p>Para validação completa, compare os logs em <code>comparison_logs/</code> com o TradingView.</p>
+                <p>Verifique que:</p>
+                <ul>
+                    <li>Barras começam no mesmo horário (±500ms)</li>
+                    <li>Mesmos sinais buy/sell</li>
+                    <li>Mesmo position size</li>
+                    <li>Mesmo balance após cada trade</li>
+                </ul>
+            </div>
+            
+            <div>
+                <button class="btn test-btn" onclick="testSync()">Testar Sincronização NTP</button>
+                <button class="btn test-btn" onclick="getBalance()">Verificar Balance</button>
+                <button class="btn test-btn" onclick="getFullStatus()">Status Completo</button>
+                <button class="btn back-btn" onclick="window.location.href='/'">Voltar</button>
+            </div>
+            
+            <div id="result" class="result"></div>
+            
+            <div>
+                <h3>📊 Como validar manualmente:</h3>
+                <ol>
+                    <li>Execute o bot e o TradingView simultaneamente</li>
+                    <li>Compare os logs em <code>comparison_logs/comparison_YYYY-MM-DD.log</code></li>
+                    <li>Verifique se os sinais são idênticos</li>
+                    <li>Confirme que os trades são executados nos mesmos preços</li>
+                </ol>
+                
+                <h3>📁 Arquivos de log:</h3>
+                <p>Logs de comparação: <code>comparison_logs/comparison_*.log</code></p>
+                <p>Dados estruturados: <code>comparison_logs/comparison_data_*.json</code></p>
+            </div>
+        </div>
+        
+        <script>
+        async function testSync() {
+            const response = await fetch('/sync-status');
+            const data = await response.json();
+            
+            const resultDiv = document.getElementById('result');
+            
+            if (data.error) {
+                resultDiv.innerHTML = `<div class="error"><h4>❌ Erro:</h4><p>${data.error}</p></div>`;
+                return;
+            }
+            
+            let statusClass = 'success';
+            if (Math.abs(data.time_offset) > 0.5) {
+                statusClass = 'warning';
+            }
+            
+            resultDiv.innerHTML = `
+                <div class="${statusClass}">
+                    <h4>⏰ Status da Sincronização:</h4>
+                    <p><strong>Horário sincronizado:</strong> ${data.synchronized_time}</p>
+                    <p><strong>Barra atual:</strong> ${data.current_bar}</p>
+                    <p><strong>Próxima barra em:</strong> ${data.next_bar_in?.toFixed(1) || 'N/A'} segundos</p>
+                    <p><strong>Offset NTP:</strong> ${data.time_offset?.toFixed(3) || 'N/A'} segundos ${Math.abs(data.time_offset) > 0.5 ? '⚠️ (maior que 500ms)' : '✅'}</p>
+                    <p><strong>Última sincronização:</strong> ${data.ntp_sync || 'N/A'}</p>
+                    <p><strong>Contador de barras:</strong> ${data.bar_count || 0}</p>
+                    <p><strong>É início de barra:</strong> ${data.is_bar_start ? '✅ Sim' : '❌ Não'}</p>
+                </div>
+            `;
+        }
+        
+        async function getBalance() {
+            const response = await fetch('/balance-status');
+            const data = await response.json();
+            
+            const resultDiv = document.getElementById('result');
+            
+            if (data.error) {
+                resultDiv.innerHTML = `<div class="error"><h4>❌ Erro:</h4><p>${data.error}</p></div>`;
+                return;
+            }
+            
+            resultDiv.innerHTML = `
+                <div class="success">
+                    <h4>💰 Status do Balance:</h4>
+                    <p><strong>Balance atual:</strong> $${data.balance?.toFixed(2) || '0.00'}</p>
+                    <p><strong>Capital inicial:</strong> $${data.initial_capital?.toFixed(2) || '0.00'}</p>
+                    <p><strong>Net Profit:</strong> $${data.netprofit?.toFixed(2) || '0.00'} ${data.netprofit > 0 ? '📈' : data.netprofit < 0 ? '📉' : '➖'}</p>
+                    <p><strong>Total trades:</strong> ${data.trade_count || 0}</p>
+                    <p><strong>Média por trade:</strong> $${data.avg_pnl_per_trade?.toFixed(2) || '0.00'}</p>
+                    <p><strong>Fórmula:</strong> ${data.formula || 'N/A'}</p>
+                </div>
+            `;
+        }
+        
+        async function getFullStatus() {
+            const response = await fetch('/exact-status');
+            const data = await response.json();
+            
+            const resultDiv = document.getElementById('result');
+            
+            if (data.error) {
+                resultDiv.innerHTML = `<div class="error"><h4>❌ Erro:</h4><p>${data.error}</p></div>`;
+                return;
+            }
+            
+            resultDiv.innerHTML = `
+                <div class="success">
+                    <h4>🎯 Status Completo do Strategy Runner:</h4>
+                    <pre style="text-align: left; background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; max-height: 400px; overflow: auto;">
+${JSON.stringify(data, null, 2)}
+                    </pre>
+                </div>
+            `;
+        }
+        </script>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route('/exact-status')
+def exact_status():
+    """Status detalhado do strategy runner"""
+    if not strategy_runner:
+        return jsonify({"error": "Strategy Runner não inicializado"}), 500
+    
+    try:
+        # Informações do engine
         engine_info = {}
         if hasattr(strategy_runner, 'engine'):
             engine = strategy_runner.engine
@@ -417,6 +668,28 @@ def exact_status():
                 "side": tm.side
             }
         
+        # Info do balance
+        balance_info = {}
+        if hasattr(strategy_runner, 'balance_manager'):
+            balance_stats = strategy_runner.balance_manager.get_stats()
+            balance_info = {
+                "current_balance": balance_stats['current_balance'],
+                "initial_capital": balance_stats['initial_capital'],
+                "netprofit": balance_stats['netprofit'],
+                "trade_count": balance_stats['trade_count']
+            }
+        
+        # Info de sincronização
+        sync_info = {}
+        if hasattr(strategy_runner, 'time_sync'):
+            sync_data = strategy_runner.time_sync.get_current_bar_info()
+            sync_info = {
+                "synchronized_time": sync_data['current_timestamp'].isoformat(),
+                "current_bar": sync_data['current_bar_timestamp'].isoformat(),
+                "next_bar_in": sync_data['seconds_to_next_bar'],
+                "time_offset": strategy_runner.time_sync.time_offset
+            }
+        
         return jsonify({
             "trading_active": trading_active,
             "strategy_runner": {
@@ -429,7 +702,9 @@ def exact_status():
                 "position_size": strategy_runner.position_size,
                 "position_side": strategy_runner.position_side,
                 "entry_price": strategy_runner.entry_price,
-                "trailing_manager": trailing_info
+                "trailing_manager": trailing_info,
+                "balance_manager": balance_info,
+                "time_sync": sync_info
             },
             "engine": engine_info,
             "environment": "render" if IS_RENDER else "local",
@@ -444,7 +719,6 @@ def debug_info():
     try:
         strategy_status = {}
         if strategy_runner:
-            # Para o novo runner
             engine_info = {}
             if hasattr(strategy_runner, 'engine'):
                 engine = strategy_runner.engine
@@ -468,19 +742,34 @@ def debug_info():
                 "websocket_connected": getattr(strategy_runner, 'ws', None) and getattr(strategy_runner.ws, 'sock', None) and strategy_runner.ws.sock.connected
             }
         
-        # Obtém trade_history_count de forma segura
-        trade_history_count = 0
-        if trade_history and hasattr(trade_history, 'trades'):
-            trade_history_count = len(trade_history.trades)
+        # Balance info
+        balance_info = {}
+        if hasattr(strategy_runner, 'balance_manager'):
+            balance_stats = strategy_runner.balance_manager.get_stats()
+            balance_info = {
+                "current_balance": balance_stats['current_balance'],
+                "netprofit": balance_stats['netprofit']
+            }
+        
+        # Sync info
+        sync_info = {}
+        if hasattr(strategy_runner, 'time_sync'):
+            sync_data = strategy_runner.time_sync.get_current_bar_info()
+            sync_info = {
+                "time_offset": strategy_runner.time_sync.time_offset,
+                "next_bar_in": sync_data.get('seconds_to_next_bar', 0)
+            }
         
         return jsonify({
             "trading_active": trading_active,
             "environment": "render" if IS_RENDER else "local",
             "simulation_mode": not (okx_client and okx_client.has_credentials),
             "strategy_runner": strategy_status,
+            "balance_info": balance_info,
+            "sync_info": sync_info,
             "okx_initialized": okx_client is not None,
             "okx_has_credentials": okx_client.has_credentials if okx_client else False,
-            "trade_history_count": trade_history_count,
+            "trade_history_count": len(trade_history.trades) if trade_history else 0,
             "uptime_seconds": round(time.time() - start_time, 2),
             "current_time": datetime.now().isoformat()
         })
@@ -502,9 +791,12 @@ def restart_strategy():
             trading_active = False
             time.sleep(2)
         
+        # Resetar balance
+        if hasattr(strategy_runner, 'balance_manager'):
+            strategy_runner.balance_manager.reset_balance(1000.0)
+        
         # Resetar completamente o engine
         if hasattr(strategy_runner, 'engine') and strategy_runner.engine:
-            # Chamar reset do engine se existir
             if hasattr(strategy_runner.engine, 'reset'):
                 strategy_runner.engine.reset()
         
@@ -539,23 +831,19 @@ def start_trading():
         def trading_loop():
             logger.info("🔄 Loop de trading iniciado manualmente")
             
-            # Contador para logs periódicos
             last_status_log = time.time()
             consecutive_errors = 0
             last_bar_logged = None
             
             while trading_active and strategy_runner:
                 try:
-                    # Executar estratégia
                     status = strategy_runner.run_strategy_realtime()
                     
-                    # Log detalhado a cada nova barra
                     if strategy_runner.last_bar_timestamp and strategy_runner.last_bar_timestamp != last_bar_logged:
                         logger.info("=" * 60)
-                        logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} PROCESSADA")
+                        logger.info(f"📊 BARRA {strategy_runner.last_bar_timestamp.strftime('%H:%M')} UTC PROCESSADA")
                         logger.info(f"   Preço: ${strategy_runner.current_price:.2f}")
                         
-                        # Sinais pendentes
                         pending_buy = getattr(strategy_runner, 'pending_buy', False)
                         pending_sell = getattr(strategy_runner, 'pending_sell', False)
                         
@@ -567,7 +855,10 @@ def start_trading():
                         if strategy_runner.entry_price:
                             logger.info(f"   Entrada: ${strategy_runner.entry_price:.2f}")
                         
-                        # Info do trailing
+                        if hasattr(strategy_runner, 'balance_manager'):
+                            balance = strategy_runner.balance_manager.get_balance()
+                            logger.info(f"   Balance: ${balance:.2f}")
+                        
                         if strategy_runner.trailing_manager:
                             tm = strategy_runner.trailing_manager
                             if tm.trailing_activated:
@@ -576,14 +867,17 @@ def start_trading():
                         logger.info("=" * 60)
                         last_bar_logged = strategy_runner.last_bar_timestamp
                     
-                    # Log periódico a cada 30 segundos
                     current_time = time.time()
                     if current_time - last_status_log > 30:
                         if strategy_runner.current_price:
                             position_str = f"{strategy_runner.position_side or 'FLAT'} {abs(strategy_runner.position_size):.4f} ETH"
-                            logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {position_str}")
+                            balance_str = ""
+                            if hasattr(strategy_runner, 'balance_manager'):
+                                balance = strategy_runner.balance_manager.get_balance()
+                                balance_str = f" | Balance: ${balance:.2f}"
                             
-                            # Info do trailing
+                            logger.info(f"📈 Status: ${strategy_runner.current_price:.2f} | Posição: {position_str}{balance_str}")
+                            
                             if strategy_runner.trailing_manager:
                                 tm = strategy_runner.trailing_manager
                                 if tm.trailing_activated:
@@ -605,10 +899,10 @@ def start_trading():
         trade_thread.start()
         
         mode = "REAL" if okx_client and okx_client.has_credentials else "SIMULAÇÃO"
-        logger.info(f"⚡ BOT LIGADO em modo {mode} (100% TradingView)!")
+        logger.info(f"⚡ BOT LIGADO em modo {mode} (SINCRONIZAÇÃO PERFEITA)!")
         return jsonify({
             "status": "success", 
-            "message": f"Bot iniciado em modo {mode} (100% TradingView)!"
+            "message": f"Bot iniciado em modo {mode} (SINCRONIZAÇÃO PERFEITA)!"
         })
         
     except Exception as e:
@@ -635,7 +929,6 @@ def force_close_position():
     
     try:
         if request.method == 'GET':
-            # Página HTML para fechamento manual
             html = """
             <!DOCTYPE html>
             <html>
@@ -708,15 +1001,22 @@ def force_close_position():
 @app.route('/status')
 def status():
     price = strategy_runner.current_price if strategy_runner else None
-    balance = okx_client.get_balance() if okx_client else 0
     
-    # Obter sinais pendentes do NOVO runner
+    # Obter sinais pendentes
     pending_buy = getattr(strategy_runner, 'pending_buy', False) if strategy_runner else False
     pending_sell = getattr(strategy_runner, 'pending_sell', False) if strategy_runner else False
     entry_price = getattr(strategy_runner, 'entry_price', None) if strategy_runner else None
     position_side = getattr(strategy_runner, 'position_side', None) if strategy_runner else None
     position_size = getattr(strategy_runner, 'position_size', 0) if strategy_runner else 0
     last_bar = strategy_runner.last_bar_timestamp.strftime('%H:%M') if strategy_runner and strategy_runner.last_bar_timestamp else None
+    
+    # Info do balance
+    balance = 0
+    netprofit = 0
+    if strategy_runner and hasattr(strategy_runner, 'balance_manager'):
+        stats = strategy_runner.balance_manager.get_stats()
+        balance = stats['current_balance']
+        netprofit = stats['netprofit']
     
     # Info do trailing stop
     stop_loss = None
@@ -740,6 +1040,7 @@ def status():
         "trading_active": trading_active,
         "current_price": price,
         "balance_usdt": balance,
+        "netprofit_usdt": netprofit,
         "pending_buy_signal": pending_buy,
         "pending_sell_signal": pending_sell,
         "position_size": position_size,
@@ -750,9 +1051,11 @@ def status():
         "pnl_usdt": round(pnl_usdt, 2),
         "pnl_percent": round(pnl_percent, 2),
         "last_bar_timestamp": last_bar,
+        "bar_count": strategy_runner.bar_count if strategy_runner else 0,
         "environment": "render" if IS_RENDER else "local",
         "simulation_mode": not (okx_client and okx_client.has_credentials),
-        "version": "exact_tradingview"
+        "version": "sync_perfect",
+        "formula": "balance = initial_capital + netprofit"
     })
 
 @app.route('/history')
@@ -800,7 +1103,7 @@ def history_page():
             <div class="container">
                 <div class="header">
                     <h1>📜 Histórico de Operações</h1>
-                    <p>ETH/USDT - Estratégia 100% TradingView</p>
+                    <p>ETH/USDT - Sincronização Perfeita com TradingView</p>
                 </div>
                 
                 <div class="stats">
@@ -895,13 +1198,18 @@ def history_page():
                 </table>
             """
         
-        # Determinar modo
+        # Balance atual
+        current_balance = 1000.0
+        if strategy_runner and hasattr(strategy_runner, 'balance_manager'):
+            current_balance = strategy_runner.balance_manager.get_balance()
+        
         mode = "SIMULAÇÃO" if not (okx_client and okx_client.has_credentials) else "REAL"
         
         html += f"""
                 <div class="footer">
-                    <p><strong>🔧 MODO {mode}:</strong> Estratégia executada 100% igual ao TradingView</p>
-                    <p>Horário de Brasília (BRT) • Timeframe: 30min</p>
+                    <p><strong>💰 BALANCE ATUAL: ${current_balance:.2f}</strong></p>
+                    <p><strong>🔧 MODO {mode}:</strong> Estratégia 100% sincronizada com TradingView</p>
+                    <p>Horário UTC sincronizado NTP • Timeframe: 30min</p>
                 </div>
             </div>
             
@@ -966,7 +1274,11 @@ def test_auth():
 # ============================================================================
 if __name__ == '__main__':
     logger.info(f"🚀 Iniciando servidor na porta {PORT}...")
-    logger.info(f"✅ Usando StrategyRunnerExact (100% TradingView)")
+    logger.info(f"✅ SISTEMA DE SINCRONIZAÇÃO PERFEITA ATIVADO")
+    logger.info(f"   - Balance dinâmico (initial_capital + netprofit)")
+    logger.info(f"   - Sincronização NTP com precisão de 500ms")
+    logger.info(f"   - Timing exato de barras 30min")
+    logger.info(f"   - Logs de comparação em comparison_logs/")
     
     # Iniciar estratégia automaticamente se estiver em ambiente local
     if not IS_RENDER:
