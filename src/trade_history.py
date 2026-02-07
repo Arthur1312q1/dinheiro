@@ -1,5 +1,5 @@
 """
-Sistema de histórico de operações
+Sistema de histórico de operações - MODIFICADO
 """
 import json
 import os
@@ -9,17 +9,13 @@ from typing import List, Dict
 
 class TradeHistory:
     def __init__(self, file_path=None):
-        # Configurar timezone do Brasil
         self.tz_brazil = pytz.timezone('America/Sao_Paulo')
         
-        # Determinar caminho do arquivo
         if file_path is None:
-            # Usar disco do Render se disponível
             if os.path.exists('/data'):
                 self.file_path = "/data/trade_history.json"
                 print("📁 Usando disco persistente /data do Render")
             else:
-                # Usar pasta local
                 self.file_path = "trade_history.json"
                 print("📁 Usando arquivo local")
         else:
@@ -29,6 +25,12 @@ class TradeHistory:
         self.trades = []
         self.load_trades()
         print(f"📊 Histórico inicializado: {len(self.trades)} trades")
+    
+    # NOVO MÉTODO: Adicionado para balance_manager
+    def get_netprofit(self):
+        """Retorna soma de todos os PnL de trades fechados"""
+        closed_trades = [t for t in self.trades if t['status'] == 'closed']
+        return sum(t['pnl_usdt'] for t in closed_trades)
     
     def get_brazil_time(self):
         """Retorna horário atual no fuso do Brasil"""
@@ -65,14 +67,13 @@ class TradeHistory:
             return None
     
     def close_trade(self, trade_id, exit_price):
-        """Fecha uma trade existente"""
+        """Fecha uma trade existente - MODIFICADO para retornar PnL"""
         try:
             for trade in self.trades:
                 if trade['id'] == trade_id and trade['status'] == 'open':
                     exit_time = self.get_brazil_time()
                     entry_price = trade['entry_price']
                     
-                    # Calcular PnL
                     if trade['side'] == 'buy':
                         pnl_percent = ((exit_price - entry_price) / entry_price) * 100
                     else:  # sell
@@ -80,7 +81,6 @@ class TradeHistory:
                     
                     pnl_usdt = (entry_price * trade['quantity'] * pnl_percent) / 100
                     
-                    # Calcular duração
                     try:
                         entry_time_obj = datetime.fromisoformat(trade['entry_time'].replace('Z', '+00:00'))
                     except:
@@ -88,7 +88,6 @@ class TradeHistory:
                     
                     duration_seconds = (exit_time - entry_time_obj).total_seconds()
                     
-                    # Formatar duração
                     if duration_seconds < 60:
                         duration = f"{duration_seconds:.0f}s"
                     elif duration_seconds < 3600:
@@ -96,7 +95,6 @@ class TradeHistory:
                     else:
                         duration = f"{duration_seconds/3600:.2f}h"
                     
-                    # Atualizar trade
                     trade['exit_price'] = exit_price
                     trade['exit_time'] = exit_time.isoformat()
                     trade['exit_time_str'] = exit_time.strftime('%d/%m/%Y %H:%M:%S')
@@ -109,19 +107,21 @@ class TradeHistory:
                     
                     emoji = "✅" if pnl_percent > 0 else "❌" if pnl_percent < 0 else "➖"
                     print(f"{emoji} Trade #{trade_id} fechada: PnL {pnl_percent:.4f}% (${pnl_usdt:.2f})")
-                    return True
+                    
+                    # RETORNA PnL para balance_manager
+                    return {'success': True, 'pnl_usdt': pnl_usdt, 'pnl_percent': pnl_percent}
             
-            return False
+            return {'success': False, 'pnl_usdt': 0, 'pnl_percent': 0}
         except Exception as e:
             print(f"❌ Erro ao fechar trade #{trade_id}: {e}")
-            return False
+            return {'success': False, 'pnl_usdt': 0, 'pnl_percent': 0}
     
     def get_all_trades(self, limit=50):
-        """Retorna todas as trades (mais recentes primeiro)"""
+        """Retorna todas as trades"""
         return sorted(self.trades, key=lambda x: x['id'], reverse=True)[:limit]
     
     def get_stats(self):
-        """Retorna estatísticas do histórico"""
+        """Retorna estatísticas"""
         closed_trades = [t for t in self.trades if t['status'] == 'closed']
         
         if not closed_trades:
@@ -150,7 +150,7 @@ class TradeHistory:
         }
     
     def save_trades(self):
-        """Salva trades em arquivo JSON"""
+        """Salva trades em arquivo"""
         try:
             with open(self.file_path, 'w', encoding='utf-8') as f:
                 json.dump(self.trades, f, indent=2, ensure_ascii=False)
@@ -164,13 +164,13 @@ class TradeHistory:
                 with open(self.file_path, 'r', encoding='utf-8') as f:
                     self.trades = json.load(f)
             else:
-                self.trades = []  # Garante que está inicializado
+                self.trades = []
         except Exception as e:
             print(f"❌ Erro ao carregar histórico: {e}")
-            self.trades = []  # Garante que está inicializado
+            self.trades = []
     
     def clear_history(self):
-        """Limpa todo o histórico"""
+        """Limpa histórico"""
         self.trades = []
         if os.path.exists(self.file_path):
             os.remove(self.file_path)
