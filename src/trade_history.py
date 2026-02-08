@@ -1,5 +1,5 @@
 """
-Sistema de histórico de operações - MODIFICADO
+Sistema de histórico de operações - MODIFICADO PARA RETORNAR PnL
 """
 import json
 import os
@@ -67,13 +67,17 @@ class TradeHistory:
             return None
     
     def close_trade(self, trade_id, exit_price):
-        """Fecha uma trade existente - MODIFICADO para retornar PnL"""
+        """
+        Fecha uma trade existente - MODIFICADO para retornar PnL
+        Retorna: {'success': bool, 'pnl_usdt': float, 'pnl_percent': float, 'trade_id': int}
+        """
         try:
             for trade in self.trades:
                 if trade['id'] == trade_id and trade['status'] == 'open':
                     exit_time = self.get_brazil_time()
                     entry_price = trade['entry_price']
                     
+                    # Calcular PnL
                     if trade['side'] == 'buy':
                         pnl_percent = ((exit_price - entry_price) / entry_price) * 100
                     else:  # sell
@@ -81,6 +85,7 @@ class TradeHistory:
                     
                     pnl_usdt = (entry_price * trade['quantity'] * pnl_percent) / 100
                     
+                    # Calcular duração
                     try:
                         entry_time_obj = datetime.fromisoformat(trade['entry_time'].replace('Z', '+00:00'))
                     except:
@@ -95,6 +100,7 @@ class TradeHistory:
                     else:
                         duration = f"{duration_seconds/3600:.2f}h"
                     
+                    # Atualizar trade
                     trade['exit_price'] = exit_price
                     trade['exit_time'] = exit_time.isoformat()
                     trade['exit_time_str'] = exit_time.strftime('%d/%m/%Y %H:%M:%S')
@@ -108,13 +114,24 @@ class TradeHistory:
                     emoji = "✅" if pnl_percent > 0 else "❌" if pnl_percent < 0 else "➖"
                     print(f"{emoji} Trade #{trade_id} fechada: PnL {pnl_percent:.4f}% (${pnl_usdt:.2f})")
                     
-                    # RETORNA PnL para balance_manager
-                    return {'success': True, 'pnl_usdt': pnl_usdt, 'pnl_percent': pnl_percent}
+                    # RETORNAR PnL para balance_manager (MODIFICAÇÃO CRÍTICA)
+                    return {
+                        'success': True,
+                        'pnl_usdt': pnl_usdt,
+                        'pnl_percent': pnl_percent,
+                        'trade_id': trade_id,
+                        'side': trade['side'],
+                        'entry_price': entry_price,
+                        'exit_price': exit_price,
+                        'quantity': trade['quantity']
+                    }
             
-            return {'success': False, 'pnl_usdt': 0, 'pnl_percent': 0}
+            # Se não encontrou trade aberta
+            return {'success': False, 'pnl_usdt': 0, 'pnl_percent': 0, 'trade_id': trade_id}
+            
         except Exception as e:
             print(f"❌ Erro ao fechar trade #{trade_id}: {e}")
-            return {'success': False, 'pnl_usdt': 0, 'pnl_percent': 0}
+            return {'success': False, 'pnl_usdt': 0, 'pnl_percent': 0, 'trade_id': trade_id}
     
     def get_all_trades(self, limit=50):
         """Retorna todas as trades"""
