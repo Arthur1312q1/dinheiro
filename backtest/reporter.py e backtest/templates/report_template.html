@@ -1,0 +1,57 @@
+# backtest/reporter.py
+import webbrowser
+from pathlib import Path
+from jinja2 import Template
+
+class BacktestReporter:
+    """Renderiza relatório HTML com gráficos Chart.js e DataTables."""
+
+    def __init__(self, report_data: dict, data_df: pd.DataFrame):
+        self.data = report_data
+        self.df = data_df
+
+    def generate(self, output_path: str = "backtest_report.html"):
+        template_path = Path(__file__).parent / "templates" / "report_template.html"
+        with open(template_path, 'r', encoding='utf-8') as f:
+            template = Template(f.read())
+
+        # Prepara dados para o gráfico
+        candles = []
+        for idx, row in self.df.iterrows():
+            candles.append({
+                'time': row['timestamp'],
+                'open': row['open'],
+                'high': row['high'],
+                'low': row['low'],
+                'close': row['close']
+            })
+
+        # Prepara marcadores de trade
+        markers = []
+        for t in self.data['trades']:
+            if 'exit_time' in t:
+                markers.append({
+                    'time': t['entry_time'],
+                    'price': t['entry_price'],
+                    'type': 'entry',
+                    'action': t['action']
+                })
+                markers.append({
+                    'time': t['exit_time'],
+                    'price': t['exit_price'],
+                    'type': 'exit',
+                    'action': 'EXIT'
+                })
+
+        html = template.render(
+            candles=candles,
+            markers=markers,
+            trades=self.data['trades'],
+            stats=self.data
+        )
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+
+        webbrowser.open(f"file://{Path(output_path).absolute()}")
+        return output_path
