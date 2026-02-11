@@ -55,3 +55,143 @@ class BacktestReporter:
 
         webbrowser.open(f"file://{Path(output_path).absolute()}")
         return output_path
+<!-- backtest/templates/report_template.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AZLEMA Backtest Report</title>
+    <meta charset="utf-8">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.4/css/jquery.dataTables.css">
+    <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; margin: 20px; background: #0E1111; color: #E0E0E0; }
+        .container { max-width: 1400px; margin: auto; }
+        .chart-container { height: 500px; margin-bottom: 30px; background: #1E1E1E; padding: 15px; border-radius: 8px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #1E1E1E; padding: 20px; border-radius: 8px; border-left: 5px solid #FFA500; }
+        .stat-value { font-size: 28px; font-weight: bold; color: #FFA500; }
+        table.dataTable { color: #E0E0E0 !important; background: #1E1E1E; }
+        .buy { color: #00FF00; font-weight: bold; }
+        .sell { color: #FF4444; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📈 Adaptive Zero Lag EMA v2 – Backtest Report</h1>
+
+        <!-- Métricas -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div>Total PnL (USDT)</div>
+                <div class="stat-value">{{ "%.2f"|format(stats.total_pnl_usdt) }}</div>
+            </div>
+            <div class="stat-card">
+                <div>Final Balance</div>
+                <div class="stat-value">{{ "%.2f"|format(stats.final_balance) }}</div>
+            </div>
+            <div class="stat-card">
+                <div>Win Rate</div>
+                <div class="stat-value">{{ "%.1f"|format(stats.win_rate) }}%</div>
+            </div>
+            <div class="stat-card">
+                <div>Max Drawdown</div>
+                <div class="stat-value">{{ "%.2f"|format(stats.max_drawdown) }}%</div>
+            </div>
+            <div class="stat-card">
+                <div>Total Trades</div>
+                <div class="stat-value">{{ stats.total_trades }}</div>
+            </div>
+            <div class="stat-card">
+                <div>Sharpe (annual)</div>
+                <div class="stat-value">{{ "%.2f"|format(stats.sharpe) }}</div>
+            </div>
+        </div>
+
+        <!-- Gráfico Candlestick + Trades -->
+        <div class="chart-container">
+            <canvas id="priceChart"></canvas>
+        </div>
+
+        <!-- Tabela de Trades -->
+        <h2>📋 Detalhamento dos Trades</h2>
+        <table id="tradesTable" class="display" style="width:100%">
+            <thead>
+                <tr>
+                    <th>Entry Time</th><th>Exit Time</th><th>Action</th><th>Qty</th>
+                    <th>Entry Price</th><th>Exit Price</th><th>PnL (USDT)</th><th>PnL %</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in trades %}
+                <tr>
+                    <td>{{ t.entry_time }}</td>
+                    <td>{{ t.exit_time if t.exit_time else '--' }}</td>
+                    <td class="{{ 'buy' if t.action == 'BUY' else 'sell' }}">{{ t.action }}</td>
+                    <td>{{ "%.3f"|format(t.qty) }}</td>
+                    <td>{{ "%.2f"|format(t.entry_price) }}</td>
+                    <td>{{ "%.2f"|format(t.exit_price) if t.exit_price else '--' }}</td>
+                    <td style="color: {{ 'green' if t.pnl_usdt > 0 else 'red' }};">
+                        {{ "%.2f"|format(t.pnl_usdt) }}
+                    </td>
+                    <td style="color: {{ 'green' if t.pnl_percent > 0 else 'red' }};">
+                        {{ "%.2f"|format(t.pnl_percent) }}%
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        // Gráfico de preços e marcadores (Chart.js)
+        const ctx = document.getElementById('priceChart').getContext('2d');
+        const candles = {{ candles|tojson }};
+        const markers = {{ markers|tojson }};
+
+        // Prepara dados OHLC (simplificado – linha de fechamento)
+        const labels = candles.map(c => c.time);
+        const closePrices = candles.map(c => c.close);
+
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Close Price',
+                    data: closePrices,
+                    borderColor: '#2196F3',
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    fill: false
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    annotation: {
+                        annotations: markers.map(m => ({
+                            type: 'point',
+                            xValue: m.time,
+                            yValue: m.price,
+                            backgroundColor: m.type === 'entry' ? 
+                                (m.action === 'BUY' ? 'green' : 'red') : 'gray',
+                            radius: 5
+                        }))
+                    }
+                }
+            }
+        });
+
+        $(document).ready( function () {
+            $('#tradesTable').DataTable({
+                order: [[0, 'desc']],
+                pageLength: 25,
+                responsive: true
+            });
+        });
+    </script>
+</body>
+</html>
