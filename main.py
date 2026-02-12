@@ -1,6 +1,7 @@
 # main.py
 import os
 import argparse
+import traceback
 from pathlib import Path
 import pandas as pd
 from flask import Flask, jsonify, render_template_string
@@ -40,19 +41,19 @@ app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
 # ============================================================================
-# 🚀 ROTA PRINCIPAL – EXIBE O BACKTEST DIRETAMENTE (SEM REDIRECT)
+# 🚀 ROTA PRINCIPAL – EXIBE O BACKTEST DIRETAMENTE
 # ============================================================================
 @app.route('/')
 def root():
-    """Página inicial: executa o backtest e mostra o relatório completo."""
+    """Página inicial: executa o backtest e mostra o relatório."""
     return backtest_web()
 
 # ============================================================================
-# ENDPOINT DE BACKTEST (COMPARTILHA A MESMA LÓGICA)
+# ENDPOINT DE BACKTEST
 # ============================================================================
 @app.route('/backtest')
 def backtest_web():
-    """Executa o backtest e retorna o relatório HTML."""
+    """Executa o backtest e retorna o relatório HTML com tratamento de erros."""
     try:
         # 1. Coleta dados da OKX
         collector = OKXDataCollector(
@@ -61,6 +62,10 @@ def backtest_web():
             limit=CANDLE_LIMIT
         )
         df = collector.fetch_recent(days=BACKTEST_DAYS)
+        
+        # Verifica se o DataFrame está vazio
+        if df.empty:
+            return jsonify({"error": "Nenhum candle retornado da OKX", "status": "failed"}), 500
         
         # 2. Inicializa estratégia
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
@@ -77,10 +82,14 @@ def backtest_web():
         return render_template_string(html_content)
     
     except Exception as e:
+        # Captura o traceback completo para diagnóstico
+        tb = traceback.format_exc()
+        print(f"ERRO NO BACKTEST:\n{tb}")  # Isso aparecerá nos logs do Render
         return jsonify({
             "error": str(e),
+            "traceback": tb.split('\n'),
             "status": "failed",
-            "message": "Verifique as credenciais da OKX e a conexão com a internet."
+            "message": "Verifique as credenciais da OKX e os logs do servidor."
         }), 500
 
 # ============================================================================
@@ -110,8 +119,7 @@ def run_backtest():
 # ============================================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
-    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest',
-                        help='backtest (linha de comando) ou server (web)')
+    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
     args = parser.parse_args()
 
     if args.mode == 'backtest':
