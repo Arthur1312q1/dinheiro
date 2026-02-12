@@ -3,6 +3,7 @@ import os
 import argparse
 from pathlib import Path
 import pandas as pd
+from flask import Flask, jsonify, send_file, render_template_string
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 from data.collector import OKXDataCollector
@@ -12,10 +13,8 @@ from keepalive.pinger import KeepAlivePinger
 from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
-from flask import Flask, jsonify
-
 # ============================================================================
-# CONFIGURAÇÕES DA ESTRATÉGIA – ALTERE AQUI OS PARÂMETROS DESEJADOS
+# CONFIGURAÇÕES DA ESTRATÉGIA
 # ============================================================================
 STRATEGY_CONFIG = {
     "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
@@ -29,77 +28,85 @@ STRATEGY_CONFIG = {
     "max_lots": env_int("MAX_LOTS", 100)
 }
 
-# ============================================================================
-# CONFIGURAÇÕES DE COLETA DE DADOS
-# ============================================================================
 SYMBOL = env("SYMBOL", "ETH/USDT")
 TIMEFRAME = env("TIMEFRAME", "30m")
 BACKTEST_DAYS = env_int("BACKTEST_DAYS", 30)
 CANDLE_LIMIT = env_int("CANDLE_LIMIT", 1000)
 
 # ============================================================================
-# CRIAÇÃO DA APLICAÇÃO FLASK (GLOBAL) – PARA GUNICORN
+# CRIAÇÃO DA APLICAÇÃO FLASK
 # ============================================================================
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
-# Rota raiz para evitar erro 404
 @app.route('/')
 def home():
     return jsonify({
         "service": "AZLEMA Backtest Engine",
         "status": "running",
-        "endpoints": ["/", "/ping", "/health", "/uptimerobot"],
+        "endpoints": ["/", "/ping", "/health", "/uptimerobot", "/backtest"],
         "docs": "https://github.com/Arthur1312q1/dinheiro"
     }), 200
 
-# Opcional: iniciar keepalive automaticamente (pode ser deixado comentado)
-# def setup_keepalive():
-#     base_url = env("SELF_URL", "https://dinheiro.onrender.com")
-#     pinger = KeepAlivePinger(base_url=base_url)
-#     pinger.start(intervals=[13, 23, 30])
-# setup_keepalive()
+# ============================================================================
+# ENDPOINT PRINCIPAL: BACKTEST VIA NAVEGADOR
+# ============================================================================
+@app.route('/backtest')
+def backtest_web():
+    """Executa o backtest e retorna o relatório HTML completo."""
+    try:
+        # 1. Coleta dados
+        collector = OKXDataCollector(
+            symbol=SYMBOL,
+            timeframe=TIMEFRAME,
+            limit=CANDLE_LIMIT
+        )
+        df = collector.fetch_recent(days=BACKTEST_DAYS)
+        
+        # 2. Inicializa estratégia
+        strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
+        
+        # 3. Executa backtest
+        engine = BacktestEngine(strategy, df)
+        results = engine.run()
+        
+        # 4. Gera HTML do relatório
+        reporter = BacktestReporter(results, df)
+        html_content = reporter.generate_html()
+        
+        # 5. Retorna como página web
+        return render_template_string(html_content)
+    
+    except Exception as e:
+        return jsonify({"error": str(e), "status": "failed"}), 500
 
 # ============================================================================
-# FLUXO DE BACKTESTING
+# FUNÇÕES DE BACKTEST LOCAL (MANTIDAS PARA COMPATIBILIDADE)
 # ============================================================================
 def run_backtest():
     print("🔍 Iniciando coleta de dados da OKX...")
-    collector = OKXDataCollector(
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-        limit=CANDLE_LIMIT
-    )
+    collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
     df = collector.fetch_recent(days=BACKTEST_DAYS)
     print(f"✅ {len(df)} candles baixados.")
-
+    
     print("⚙️  Inicializando estratégia...")
     strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-
+    
     print("📊 Executando backtest...")
     engine = BacktestEngine(strategy, df)
     results = engine.run()
-
+    
     print("📈 Gerando relatório visual...")
     reporter = BacktestReporter(results, df)
-    report_path = reporter.generate('azlema_backtest_report.html')
+    report_path = reporter.save_html('azlema_backtest_report.html')
     print(f"✅ Relatório salvo: {report_path}")
-
-    print("\n========== RESUMO ==========")
-    print(f"Total Trades: {results['total_trades']}")
-    print(f"Win Rate: {results['win_rate']:.2f}%")
-    print(f"Total PnL: ${results['total_pnl_usdt']:.2f}")
-    print(f"Final Balance: ${results['final_balance']:.2f}")
-    print(f"Max Drawdown: {results['max_drawdown']:.2f}%")
-    print("============================\n")
 
 # ============================================================================
 # PONTO DE ENTRADA
 # ============================================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
-    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest',
-                        help='backtest (gera relatório) ou server (webhook + keepalive)')
+    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
     args = parser.parse_args()
 
     if args.mode == 'backtest':
