@@ -3,7 +3,7 @@ import os
 import argparse
 from pathlib import Path
 import pandas as pd
-from flask import Flask, jsonify, render_template_string, redirect
+from flask import Flask, jsonify, render_template_string
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 from data.collector import OKXDataCollector
@@ -40,39 +40,54 @@ app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
 # ============================================================================
-# 🚀 ROTA PRINCIPAL – AGORA EXIBE O BACKTEST DIRETAMENTE
+# 🚀 ROTA PRINCIPAL – EXIBE O BACKTEST DIRETAMENTE (SEM REDIRECT)
 # ============================================================================
 @app.route('/')
 def root():
-    """REDIRECIONA DIRETAMENTE PARA O BACKTEST"""
-    return redirect('/backtest')
+    """Página inicial: executa o backtest e mostra o relatório completo."""
+    return backtest_web()
 
 # ============================================================================
-# ENDPOINT DE BACKTEST (MANTIDO)
+# ENDPOINT DE BACKTEST (COMPARTILHA A MESMA LÓGICA)
 # ============================================================================
 @app.route('/backtest')
 def backtest_web():
-    """Executa o backtest e retorna o relatório HTML completo."""
+    """Executa o backtest e retorna o relatório HTML."""
     try:
-        collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        # 1. Coleta dados da OKX
+        collector = OKXDataCollector(
+            symbol=SYMBOL,
+            timeframe=TIMEFRAME,
+            limit=CANDLE_LIMIT
+        )
         df = collector.fetch_recent(days=BACKTEST_DAYS)
         
+        # 2. Inicializa estratégia
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
+        
+        # 3. Executa backtest
         engine = BacktestEngine(strategy, df)
         results = engine.run()
         
+        # 4. Gera HTML do relatório
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
         
+        # 5. Renderiza a página
         return render_template_string(html_content)
     
     except Exception as e:
-        return jsonify({"error": str(e), "status": "failed"}), 500
+        return jsonify({
+            "error": str(e),
+            "status": "failed",
+            "message": "Verifique as credenciais da OKX e a conexão com a internet."
+        }), 500
 
 # ============================================================================
-# FUNÇÕES DE BACKTEST LOCAL
+# FUNÇÕES DE BACKTEST LOCAL (COMPATIBILIDADE)
 # ============================================================================
 def run_backtest():
+    """Modo backtest via linha de comando."""
     print("🔍 Iniciando coleta de dados da OKX...")
     collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
     df = collector.fetch_recent(days=BACKTEST_DAYS)
@@ -95,7 +110,8 @@ def run_backtest():
 # ============================================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
-    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
+    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest',
+                        help='backtest (linha de comando) ou server (web)')
     args = parser.parse_args()
 
     if args.mode == 'backtest':
