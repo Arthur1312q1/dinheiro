@@ -3,7 +3,7 @@ import os
 import argparse
 from pathlib import Path
 import pandas as pd
-from flask import Flask, jsonify, send_file, render_template_string
+from flask import Flask, jsonify, render_template_string, redirect
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 from data.collector import OKXDataCollector
@@ -39,49 +39,38 @@ CANDLE_LIMIT = env_int("CANDLE_LIMIT", 1000)
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
+# ============================================================================
+# 🚀 ROTA PRINCIPAL – AGORA EXIBE O BACKTEST DIRETAMENTE
+# ============================================================================
 @app.route('/')
-def home():
-    return jsonify({
-        "service": "AZLEMA Backtest Engine",
-        "status": "running",
-        "endpoints": ["/", "/ping", "/health", "/uptimerobot", "/backtest"],
-        "docs": "https://github.com/Arthur1312q1/dinheiro"
-    }), 200
+def root():
+    """REDIRECIONA DIRETAMENTE PARA O BACKTEST"""
+    return redirect('/backtest')
 
 # ============================================================================
-# ENDPOINT PRINCIPAL: BACKTEST VIA NAVEGADOR
+# ENDPOINT DE BACKTEST (MANTIDO)
 # ============================================================================
 @app.route('/backtest')
 def backtest_web():
     """Executa o backtest e retorna o relatório HTML completo."""
     try:
-        # 1. Coleta dados
-        collector = OKXDataCollector(
-            symbol=SYMBOL,
-            timeframe=TIMEFRAME,
-            limit=CANDLE_LIMIT
-        )
+        collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = collector.fetch_recent(days=BACKTEST_DAYS)
         
-        # 2. Inicializa estratégia
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-        
-        # 3. Executa backtest
         engine = BacktestEngine(strategy, df)
         results = engine.run()
         
-        # 4. Gera HTML do relatório
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
         
-        # 5. Retorna como página web
         return render_template_string(html_content)
     
     except Exception as e:
         return jsonify({"error": str(e), "status": "failed"}), 500
 
 # ============================================================================
-# FUNÇÕES DE BACKTEST LOCAL (MANTIDAS PARA COMPATIBILIDADE)
+# FUNÇÕES DE BACKTEST LOCAL
 # ============================================================================
 def run_backtest():
     print("🔍 Iniciando coleta de dados da OKX...")
