@@ -7,6 +7,16 @@ logger = logging.getLogger(__name__)
 
 webhook_bp = Blueprint('webhook', __name__)
 
+@webhook_bp.route('/', methods=['GET'])
+def index():
+    """Página inicial – lista os endpoints disponíveis."""
+    return jsonify({
+        "service": "AZLEMA Backtest Engine",
+        "status": "running",
+        "endpoints": ["/", "/ping", "/health", "/uptimerobot"],
+        "documentation": "https://github.com/Arthur1312q1/dinheiro"
+    }), 200
+
 @webhook_bp.route('/uptimerobot', methods=['GET', 'POST'])
 def uptimerobot_webhook():
     """
