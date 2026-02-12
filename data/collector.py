@@ -6,11 +6,6 @@ from typing import Optional
 from utils.env_loader import env
 
 class OKXDataCollector:
-    """
-    Baixa dados históricos da OKX via CCXT.
-    Utiliza variáveis de ambiente: OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE.
-    """
-
     def __init__(self, symbol: str = "ETH/USDT", timeframe: str = "30m", limit: int = 1000):
         self.symbol = symbol
         self.timeframe = timeframe
@@ -24,9 +19,7 @@ class OKXDataCollector:
         })
 
     def fetch_ohlcv(self, since: Optional[str] = None) -> pd.DataFrame:
-        """
-        Retorna DataFrame com colunas: timestamp, open, high, low, close, volume.
-        """
+        """Retorna DataFrame com candles, garantindo que não haja valores nulos."""
         since_ts = None
         if since:
             since_ts = pd.Timestamp(since).timestamp() * 1000
@@ -38,13 +31,22 @@ class OKXDataCollector:
             limit=self.limit
         )
 
+        # Converte para DataFrame e trata valores nulos
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Converte timestamp para datetime (nunca será None)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
+        
+        # Remove linhas com timestamp inválido
+        df = df.dropna(subset=['timestamp'])
+        
+        # Garante que colunas numéricas sejam float e preenche NaN com 0
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+        
         return df
 
     def fetch_recent(self, days: int = 30) -> pd.DataFrame:
-        """
-        Baixa os últimos 'days' dias (útil para backtesting rápido).
-        """
+        """Baixa os últimos 'days' dias."""
         since = pd.Timestamp.now() - pd.Timedelta(days=days)
         return self.fetch_ohlcv(since=since.isoformat())
