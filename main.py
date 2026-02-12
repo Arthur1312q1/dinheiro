@@ -12,8 +12,7 @@ from keepalive.pinger import KeepAlivePinger
 from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
-# Flask para webhook (modo servidor)
-from flask import Flask
+from flask import Flask, jsonify
 
 # ============================================================================
 # CONFIGURAÇÕES DA ESTRATÉGIA – ALTERE AQUI OS PARÂMETROS DESEJADOS
@@ -44,15 +43,21 @@ CANDLE_LIMIT = env_int("CANDLE_LIMIT", 1000)
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
-# Opcional: configurar pinger se desejar iniciar junto com o servidor Flask
-# (mas não é necessário para o funcionamento do Gunicorn)
-def setup_keepalive():
-    base_url = env("SELF_URL", "http://localhost:5000")
-    pinger = KeepAlivePinger(base_url=base_url)
-    pinger.start(intervals=[13, 23, 30])
+# Rota raiz para evitar erro 404
+@app.route('/')
+def home():
+    return jsonify({
+        "service": "AZLEMA Backtest Engine",
+        "status": "running",
+        "endpoints": ["/", "/ping", "/health", "/uptimerobot"],
+        "docs": "https://github.com/Arthur1312q1/dinheiro"
+    }), 200
 
-# Se você quiser que o keepalive inicie automaticamente quando o servidor subir,
-# descomente a linha abaixo (cuidado: pode executar threads mesmo no Gunicorn)
+# Opcional: iniciar keepalive automaticamente (pode ser deixado comentado)
+# def setup_keepalive():
+#     base_url = env("SELF_URL", "https://dinheiro.onrender.com")
+#     pinger = KeepAlivePinger(base_url=base_url)
+#     pinger.start(intervals=[13, 23, 30])
 # setup_keepalive()
 
 # ============================================================================
@@ -100,6 +105,5 @@ if __name__ == '__main__':
     if args.mode == 'backtest':
         run_backtest()
     else:
-        # Inicia o servidor Flask localmente (desenvolvimento)
         port = env_int("PORT", 5000)
         app.run(host='0.0.0.0', port=port)
