@@ -1,154 +1,133 @@
 # data/collector.py
-import os
-import ccxt
 import pandas as pd
+import requests
 import time
-import random
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Optional, List
+import random
+
 from utils.env_loader import env
 
 class OKXDataCollector:
     """
-    Coletor de dados da OKX com fallback para dados mockados.
-    Se a API da OKX falhar (mercados inválidos, timeout, etc.),
-    automaticamente retorna candles simulados realistas.
+    Coletor de dados da OKX via API REST pública.
+    Não depende do CCXT, portanto livre do erro de mercados.
     """
 
-    def __init__(self, symbol: str = "ETH/USDT", timeframe: str = "30m", limit: int = 1000):
+    def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 150):
+        """
+        Args:
+            symbol: Formato "ETH-USDT" (OKX usa hífen, não barra)
+            timeframe: 1m, 3m, 5m, 15m, 30m, 1H, 2H, 4H, 6H, 12H, 1D, 1W, 1M
+            limit: Máximo de candles (OKX permite até 300 por requisição)
+        """
         self.symbol = symbol
-        self.timeframe = timeframe
-        self.limit = limit
+        self.timeframe = self._convert_timeframe(timeframe)
+        self.limit = min(limit, 300)  # Limite da OKX
+        self.base_url = "https://www.okx.com"
 
-        # Tenta inicializar a exchange
-        self.exchange = None
-        try:
-            self.exchange = ccxt.okx({
-                'apiKey': env('OKX_API_KEY', ''),
-                'secret': env('OKX_SECRET', ''),
-                'password': env('OKX_PASSPHRASE', ''),
-                'enableRateLimit': True,
-            })
-        except Exception as e:
-            print(f"⚠️ Não foi possível inicializar OKX: {e}. Usará dados mockados.")
+    def _convert_timeframe(self, tf: str) -> str:
+        """Converte formato 30m para o formato da OKX (30m)."""
+        mapping = {
+            '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
+            '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '12h': '12H',
+            '1d': '1D', '1w': '1W', '1M': '1M'
+        }
+        return mapping.get(tf.lower(), '30m')
 
-    def _generate_mock_candles(self, days: int = 30) -> pd.DataFrame:
-        """
-        Gera candles realistas de ETH/USDT para os últimos N dias.
-        Baseado em dados históricos reais de fevereiro 2026.
-        """
-        print(f"📊 Gerando {days} dias de dados mockados para {self.symbol}...")
-        
-        # Preço inicial baseado em ETH/USDT real (fev/2026)
+    def _generate_mock_candles(self, days: int = 3) -> pd.DataFrame:
+        """Gera dados mockados realistas para fallback."""
+        print("📊 Usando dados mockados (fallback)...")
         base_price = 3200.0
-        volatility = 0.015  # 1.5% por candle
-        
-        # Timestamps
+        volatility = 0.015
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(days=days)
-        
-        # Intervalo de 30 minutos
         delta = timedelta(minutes=30)
         current_time = start_time
-        
         candles = []
         price = base_price
-        
-        while current_time <= end_time:
-            # Movimento aleatório
+        while current_time <= end_time and len(candles) < self.limit:
             change = random.uniform(-volatility, volatility)
             price *= (1 + change)
-            price = max(price, base_price * 0.7)  # não cai muito
-            
-            # Gera OHLC
-            open_price = price
-            high_price = price * (1 + random.uniform(0, 0.005))
-            low_price = price * (1 - random.uniform(0, 0.005))
-            close_price = price * (1 + random.uniform(-0.002, 0.002))
-            
+            price = max(price, base_price * 0.7)
+            high = price * (1 + random.uniform(0, 0.005))
+            low = price * (1 - random.uniform(0, 0.005))
+            close = price * (1 + random.uniform(-0.002, 0.002))
             volume = random.uniform(5000, 15000)
-            
             candles.append([
-                int(current_time.timestamp() * 1000),  # timestamp ms
-                round(open_price, 2),
-                round(high_price, 2),
-                round(low_price, 2),
-                round(close_price, 2),
+                int(current_time.timestamp() * 1000),
+                round(price, 2),
+                round(high, 2),
+                round(low, 2),
+                round(close, 2),
                 round(volume, 2)
             ])
-            
             current_time += delta
-        
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.tail(self.limit)  # respeita o limite
+        return df.tail(self.limit)
 
-    def fetch_ohlcv(self, since: Optional[str] = None) -> pd.DataFrame:
-        """Tenta OKX; se falhar, retorna dados mockados."""
-        
-        # Se não há exchange, vai direto para mock
-        if not self.exchange:
-            return self._generate_mock_candles(days=30)
-        
+    def fetch_ohlcv(self, since: Optional[datetime] = None) -> pd.DataFrame:
+        """
+        Busca candles da API pública da OKX.
+        Retorna DataFrame com colunas: timestamp, open, high, low, close, volume.
+        """
+        endpoint = "/api/v5/market/candles"
+        params = {
+            'instId': self.symbol,
+            'bar': self.timeframe,
+            'limit': self.limit
+        }
+
+        # Se 'since' for fornecido, adiciona parâmetro 'after' (OKX usa timestamp em ms)
+        if since:
+            # OKX espera o timestamp do primeiro candle APÓS o especificado? 
+            # Na prática, passamos o timestamp do candle mais antigo desejado.
+            params['after'] = str(int(since.timestamp() * 1000))
+
         try:
-            # Tenta carregar mercados com timeout
-            if not self.exchange.markets:
-                self._safe_load_markets()
-            
-            # Verifica símbolo
-            if self.symbol not in self.exchange.markets:
-                # Tenta normalizar
-                normalized = self.symbol.replace('/', '').upper()
-                found = False
-                for sym in self.exchange.markets:
-                    if sym.replace('/', '').upper() == normalized:
-                        self.symbol = sym
-                        found = True
-                        break
-                if not found:
-                    print(f"⚠️ Símbolo {self.symbol} não encontrado. Usando mock.")
-                    return self._generate_mock_candles(days=30)
-            
-            since_ts = None
-            if since:
-                since_ts = pd.Timestamp(since).timestamp() * 1000
-            
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol=self.symbol,
-                timeframe=self.timeframe,
-                since=since_ts,
-                limit=self.limit
+            print(f"🔍 Solicitando {self.limit} candles de {self.symbol} ({self.timeframe})...")
+            response = requests.get(
+                self.base_url + endpoint,
+                params=params,
+                timeout=10
             )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('code') != '0':
+                print(f"⚠️ Erro na API OKX: {data.get('msg')}")
+                return self._generate_mock_candles()
+
+            # Formato da OKX: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm?]
+            candles_data = data['data']
             
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            # Inverte para ordem crescente (OKX retorna do mais recente para o mais antigo)
+            candles_data.reverse()
+
+            processed = []
+            for c in candles_data:
+                processed.append([
+                    int(c[0]),
+                    float(c[1]),  # open
+                    float(c[2]),  # high
+                    float(c[3]),  # low
+                    float(c[4]),  # close
+                    float(c[5])   # volume
+                ])
+
+            df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
-            print(f"✅ Dados OKX obtidos: {len(df)} candles")
+            print(f"✅ Obtidos {len(df)} candles reais da OKX")
             return df
-            
-        except Exception as e:
-            print(f"⚠️ Erro na API OKX: {e}. Usando dados mockados.")
-            return self._generate_mock_candles(days=30)
 
-    def _safe_load_markets(self, reload: bool = False, params: dict = {}) -> dict:
-        """Versão segura do load_markets com tratamento de erros."""
-        try:
-            markets = self.exchange.fetch_markets(params)
-            valid_markets = {}
-            for market in markets:
-                if market.get('base') and market.get('quote'):
-                    valid_markets[market['symbol']] = market
-            self.exchange.markets = valid_markets
-            self.exchange.symbols = list(valid_markets.keys())
-            return valid_markets
         except Exception as e:
-            print(f"⚠️ Erro ao carregar mercados: {e}")
-            # Retorna um dicionário mínimo para não quebrar
-            self.exchange.markets = {self.symbol: {'symbol': self.symbol, 'base': 'ETH', 'quote': 'USDT'}}
-            self.exchange.symbols = [self.symbol]
-            return self.exchange.markets
+            print(f"⚠️ Falha na API OKX: {e}")
+            return self._generate_mock_candles()
 
-    def fetch_recent(self, days: int = 30) -> pd.DataFrame:
-        """Baixa os últimos 'days' dias (com fallback mock)."""
-        return self.fetch_ohlcv(since=(datetime.utcnow() - timedelta(days=days)).isoformat())
+    def fetch_recent(self, days: int = 2) -> pd.DataFrame:
+        """
+        Baixa candles dos últimos 'days' dias (para 150 candles 30m, ~3 dias são suficientes).
+        """
+        since = datetime.utcnow() - timedelta(days=days)
+        return self.fetch_ohlcv(since=since)
