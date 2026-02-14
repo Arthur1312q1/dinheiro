@@ -48,13 +48,12 @@ STRATEGY_CONFIG = {
 }
 
 # ============================================================================
-# CONFIGURAÇÕES DE COLETA DE DADOS – 1000 CANDLES (essencial para adaptativo)
+# CONFIGURAÇÕES DE COLETA DE DADOS – FORÇA 1000 CANDLES (ignora variável)
 # ============================================================================
 RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
-BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 1000)   # ← 1000 candles
-CANDLE_LIMIT = BACKTEST_CANDLES
+CANDLE_LIMIT = 1000   # ← FORÇADO EM 1000, independente da variável de ambiente
 
 # ============================================================================
 # CRIAÇÃO DA APLICAÇÃO FLASK
@@ -76,12 +75,15 @@ def backtest_web():
         if df.empty:
             return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
         
-        # ✅ WARM-UP: remove os primeiros 100 candles (estabilização dos filtros)
+        # Warm-up: remove os primeiros 100 candles (estabilização dos filtros)
         df = df.iloc[100:].reset_index(drop=True)
         
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         engine = BacktestEngine(strategy, df)
         results = engine.run()
+        
+        # Adiciona o período adaptativo aos resultados para debug
+        results['period_history'] = [t['indicators']['Period'] for t in results.get('trades', []) if 'indicators' in t]
         
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
