@@ -2,8 +2,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # TRADUÇÃO CIRÚRGICA – ADAPTIVE ZERO LAG EMA v2 (PINE SCRIPT v3 → PYTHON)
 # ═══════════════════════════════════════════════════════════════════════════
-# ✅ CORREÇÃO CRÍTICA: lenIQ e lenC agora persistem entre barras (como no Pine)
-# ✅ AGORA GERA TRADES REAIS COM OS DADOS DA OKX
+# ✅ Agora com proteção de histórico: só gera sinais após 50 barras de warm-up
 # ═══════════════════════════════════════════════════════════════════════════
 
 import math
@@ -39,7 +38,7 @@ class AdaptiveZeroLagEMA:
     im_prev: float = 0.0
     deltaIQ_buffer: deque = field(default_factory=lambda: deque(maxlen=RANGE + 1))
     instIQ: float = 0.0
-    lenIQ: float = 0.0          # ← PERSISTE ENTRE BARRAS
+    lenIQ: float = 0.0
 
     # Cosine IFM
     v1_prev: float = 0.0
@@ -47,7 +46,7 @@ class AdaptiveZeroLagEMA:
     s3: float = 0.0
     deltaC_buffer: deque = field(default_factory=lambda: deque(maxlen=RANGE + 1))
     instC: float = 0.0
-    lenC: float = 0.0           # ← PERSISTE ENTRE BARRAS
+    lenC: float = 0.0
 
     # Zero-Lag EMA
     EMA: float = 0.0
@@ -106,7 +105,6 @@ class AdaptiveZeroLagEMA:
     # NÚCLEO 1: I-Q IFM
     # ------------------------------------------------------------------------
     def _update_iq_ifm(self, src: float):
-        """Atualiza I-Q IFM e armazena lenIQ em self.lenIQ (persistente)."""
         imult = 0.635
         qmult = 0.338
         inphase = 0.0
@@ -149,7 +147,6 @@ class AdaptiveZeroLagEMA:
 
         self.deltaIQ_buffer.append(deltaIQ)
 
-        # Detecção do período
         delta_list = list(self.deltaIQ_buffer)
         for i in range(RANGE + 1):
             idx = -(i + 1)
@@ -162,14 +159,12 @@ class AdaptiveZeroLagEMA:
             instIQ = self.instIQ
         self.instIQ = instIQ
 
-        # ✅ CORREÇÃO: usa self.lenIQ (persistente)
         self.lenIQ = 0.25 * instIQ + 0.75 * self.lenIQ
 
     # ------------------------------------------------------------------------
     # NÚCLEO 2: COSINE IFM
     # ------------------------------------------------------------------------
     def _update_cosine_ifm(self, src: float):
-        """Atualiza Cosine IFM e armazena lenC em self.lenC (persistente)."""
         s2 = 0.0
         s3 = 0.0
         deltaC = 0.0
@@ -211,7 +206,6 @@ class AdaptiveZeroLagEMA:
             instC = self.instC
         self.instC = instC
 
-        # ✅ CORREÇÃO: usa self.lenC (persistente)
         self.lenC = 0.25 * instC + 0.75 * self.lenC
 
     # ------------------------------------------------------------------------
@@ -310,6 +304,11 @@ class AdaptiveZeroLagEMA:
     # MÉTODO PRINCIPAL
     # ------------------------------------------------------------------------
     def next(self, candle: Dict) -> Dict:
+        # ✅ PROTEÇÃO DE HISTÓRICO: só gera ações após acumular 50 candles internos
+        if len(self._src_buffer) < 50 or len(self.deltaIQ_buffer) < 50:
+            self._src_buffer.append(candle['close'])
+            return {"action": "NONE", "qty": 0, "price": 0, "comment": "", "balance": self.balance, "timestamp": candle.get('timestamp')}
+
         src = candle['close']
 
         # 1. Indicadores adaptativos
