@@ -2,21 +2,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # TRADUÇÃO CIRÚRGICA – ADAPTIVE ZERO LAG EMA v2 (PINE SCRIPT v3 → PYTHON)
 # ═══════════════════════════════════════════════════════════════════════════
-# Engenharia reversa completa. Cada linha reflete EXATAMENTE o comportamento
-# do código Pine original, incluindo:
-# - Reinicialização de variáveis temporárias a cada barra
-# - Acesso histórico via buffers circulares
-# - Tratamento de valores nulos com nz()
-# - Detecção de ciclo por soma acumulada
-# - Otimização de ganho com EC[1] congelado
-# - Flags persistentes com delay de 1 barra
-# - Trailing stop com ativação por lucro
+# ✅ Warm-up corrigido: usa self._bar_count em vez de len(_src_buffer)
+# ✅ Logs a cada 50 candles para depuração
 # ═══════════════════════════════════════════════════════════════════════════
 
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 print("🧠 Estratégia AZLEMA carregada - Versão completa (416 linhas)")
 
@@ -427,8 +420,8 @@ class AdaptiveZeroLagEMA:
         self._bar_count += 1
         src = candle['close']
 
-        # Warm-up interno: só processa após acumular 50 candles
-        if len(self._src_buffer) < 50 or len(self.deltaIQ_buffer) < 50:
+        # ✅ CORREÇÃO: warm-up baseado no contador, não no tamanho do buffer
+        if self._bar_count < 50:
             self._src_buffer.append(src)
             return {
                 "action": "NONE",
