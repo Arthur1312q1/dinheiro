@@ -14,6 +14,8 @@ from keepalive.pinger import KeepAlivePinger
 from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
+print("🚀 MAIN.PY INICIOU - Versão com 1000 candles e logs")  # LOG INICIAL
+
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
     symbol = symbol.replace('/', '-').replace('_', '-').replace(' ', '-')
@@ -45,16 +47,19 @@ RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
 CANDLE_LIMIT = 1000   # FORÇADO
+print(f"📊 Config: {CANDLE_LIMIT} candles, símbolo {SYMBOL}")  # LOG
 
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
 @app.route('/')
 def root():
+    print("📍 Rota / acessada")  # LOG
     return backtest_web()
 
 @app.route('/backtest')
 def backtest_web():
+    print("📍 Executando backtest...")  # LOG
     try:
         collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = collector.fetch_ohlcv()
@@ -63,6 +68,7 @@ def backtest_web():
 
         # Warm-up: remove primeiros 100 candles
         df = df.iloc[100:].reset_index(drop=True)
+        print(f"📈 {len(df)} candles após warm-up")
 
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         engine = BacktestEngine(strategy, df)
@@ -70,15 +76,16 @@ def backtest_web():
 
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
+        print("✅ Backtest concluído")  # LOG
         return render_template_string(html_content)
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"ERRO NO BACKTEST:\n{tb}")
+        print(f"❌ ERRO NO BACKTEST:\n{tb}")
         return jsonify({"error": str(e), "traceback": tb.split('\n'), "status": "failed"}), 500
 
 def run_backtest():
-    print(f"🔍 Solicitando {CANDLE_LIMIT} candles de {SYMBOL}...")
+    print(f"🔍 Executando backtest local com {CANDLE_LIMIT} candles...")
     collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
     df = collector.fetch_ohlcv()
     df = df.iloc[100:].reset_index(drop=True)
@@ -96,8 +103,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
     parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
     args = parser.parse_args()
+    print(f"⚙️ Modo: {args.mode}")
     if args.mode == 'backtest':
         run_backtest()
     else:
         port = env_int("PORT", 5000)
+        print(f"🌐 Servidor iniciando na porta {port}")
         app.run(host='0.0.0.0', port=port)
