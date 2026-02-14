@@ -14,7 +14,7 @@ from keepalive.pinger import KeepAlivePinger
 from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
-print("🚀 MAIN.PY INICIOU - Versão com coletor paginado (1000 candles)")
+print("🚀 MAIN.PY INICIOU - Versão com 2000 candles e período fixo opcional")
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
@@ -31,8 +31,13 @@ def normalize_symbol(symbol: str) -> str:
             symbol = f"{symbol}-USDT"
     return symbol
 
+# ============================================================================
+# CONFIGURAÇÕES – AJUSTE AQUI PARA TESTAR
+# ============================================================================
+# Para testar com período fixo (como no TradingView), altere ADAPTIVE_METHOD para "Off"
+# Exemplo: adaptive_method = "Off"  (usará Period=20)
 STRATEGY_CONFIG = {
-    "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
+    "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),  # "Off" para período fixo
     "threshold": env_float("THRESHOLD", 0.0),
     "fixed_sl_points": env_int("FIXED_SL", 2000),
     "fixed_tp_points": env_int("FIXED_TP", 55),
@@ -46,29 +51,27 @@ STRATEGY_CONFIG = {
 RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
-CANDLE_LIMIT = 1000   # FORÇADO
-print(f"📊 Config: {CANDLE_LIMIT} candles, símbolo {SYMBOL}, timeframe {TIMEFRAME}")
+CANDLE_LIMIT = env_int("CANDLE_LIMIT", 2000)   # ← 2000 candles (mais dados)
+WARMUP = env_int("WARMUP", 20)                  # ← warm-up reduzido
 
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
 @app.route('/')
 def root():
-    print("📍 Rota / acessada")
     return backtest_web()
 
 @app.route('/backtest')
 def backtest_web():
-    print("📍 Executando backtest...")
     try:
         collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = collector.fetch_ohlcv()
         if df.empty:
             return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
 
-        # Warm-up: remove primeiros 100 candles
-        df = df.iloc[100:].reset_index(drop=True)
-        print(f"📈 {len(df)} candles após warm-up")
+        # Warm-up reduzido
+        df = df.iloc[WARMUP:].reset_index(drop=True)
+        print(f"📈 {len(df)} candles após warm-up de {WARMUP}")
 
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         engine = BacktestEngine(strategy, df)
@@ -76,37 +79,20 @@ def backtest_web():
 
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
-        print("✅ Backtest concluído")
         return render_template_string(html_content)
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"❌ ERRO NO BACKTEST:\n{tb}")
+        print(f"❌ ERRO:\n{tb}")
         return jsonify({"error": str(e), "traceback": tb.split('\n'), "status": "failed"}), 500
 
-def run_backtest():
-    print(f"🔍 Executando backtest local com {CANDLE_LIMIT} candles...")
-    collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-    df = collector.fetch_ohlcv()
-    df = df.iloc[100:].reset_index(drop=True)
-    print(f"✅ {len(df)} candles após warm-up.")
-
-    strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-    engine = BacktestEngine(strategy, df)
-    results = engine.run()
-
-    reporter = BacktestReporter(results, df)
-    report_path = reporter.save_html('azlema_backtest_report.html')
-    print(f"✅ Relatório salvo: {report_path}")
-
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
-    parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['backtest', 'server'], default='server')
     args = parser.parse_args()
-    print(f"⚙️ Modo: {args.mode}")
     if args.mode == 'backtest':
-        run_backtest()
+        # Modo linha de comando (não usado no Render)
+        pass
     else:
         port = env_int("PORT", 5000)
-        print(f"🌐 Servidor iniciando na porta {port}")
         app.run(host='0.0.0.0', port=port)
