@@ -8,7 +8,7 @@ from typing import Optional
 class OKXDataCollector:
     """
     Coletor de dados da OKX via API REST pública.
-    Agora sem o FutureWarning do pandas.
+    Sem warnings do pandas (uso de .copy() para evitar chained assignment).
     """
 
     def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 1000):
@@ -45,8 +45,8 @@ class OKXDataCollector:
             timestamp = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
             candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # CORREÇÃO: atribuição direta, sem .loc, sem warning
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # ✅ CORREÇÃO DEFINITIVA: cria uma nova coluna sem chained assignment
+        df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
         return df
 
     def fetch_ohlcv(self) -> pd.DataFrame:
@@ -76,8 +76,8 @@ class OKXDataCollector:
                 processed.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
 
             df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            # CORREÇÃO: atribuição direta, sem warning
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # ✅ CORREÇÃO DEFINITIVA: usa assign para evitar warning
+            df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
             print(f"✅ Obtidos {len(df)} candles reais da OKX")
             return df
 
