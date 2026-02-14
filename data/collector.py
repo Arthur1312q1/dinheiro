@@ -46,7 +46,8 @@ class OKXDataCollector:
             timestamp = int((end_time - delta * (count - i)).timestamp() * 1000)
             candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # ✅ CORREÇÃO: usando assign para evitar warning
+        df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
         return df
 
     def _fetch_page(self, after: Optional[int] = None) -> List:
@@ -119,7 +120,8 @@ class OKXDataCollector:
                 ])
 
             df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # ✅ CORREÇÃO: usando assign
+            df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
             print(f"✅ Obtidos {len(df)} candles reais da OKX")
             return df
 
