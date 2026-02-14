@@ -2,7 +2,7 @@
 import pandas as pd
 from pathlib import Path
 from jinja2 import Template
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
 
 class BacktestReporter:
@@ -10,94 +10,65 @@ class BacktestReporter:
         self.data = report_data
         self.df = candles_df
 
-    def _safe_str(self, value: Any) -> str:
-        """Converte qualquer valor para string, tratando None."""
-        if value is None:
-            return ""
-        if hasattr(value, 'isoformat'):
-            return value.isoformat()
-        return str(value)
-
-    def _safe_float(self, value: Any, default: float = 0.0) -> float:
-        """Converte para float, tratando None e erros."""
-        if value is None:
-            return default
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return default
-
     def generate_html(self) -> str:
-        """Gera o HTML do relatório com proteção contra None."""
+        print(f"📊 Gerando relatório com {len(self.df)} candles e {len(self.data.get('trades', []))} trades")
+        
         template_path = Path(__file__).parent / "templates" / "report_template.html"
         with open(template_path, 'r', encoding='utf-8') as f:
             template = Template(f.read())
 
-        # Prepara candles com timestamps seguros
+        # Prepara candles com timestamps em ISO
         candles = []
         for _, row in self.df.iterrows():
             candles.append({
-                'time': self._safe_str(row.get('timestamp')),
-                'open': self._safe_float(row.get('open')),
-                'high': self._safe_float(row.get('high')),
-                'low': self._safe_float(row.get('low')),
-                'close': self._safe_float(row.get('close'))
+                'time': row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                'open': float(row['open']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'close': float(row['close'])
             })
 
-        # Prepara marcadores de trade com valores seguros
+        # Prepara marcadores de trade
         markers = []
         for trade in self.data.get('trades', []):
-            entry_time = self._safe_str(trade.get('entry_time'))
-            exit_time = self._safe_str(trade.get('exit_time'))
-            
-            if entry_time:
+            if 'entry_time' in trade and trade['entry_time']:
                 markers.append({
-                    'time': entry_time,
-                    'price': self._safe_float(trade.get('entry_price')),
+                    'time': trade['entry_time'].isoformat() if hasattr(trade['entry_time'], 'isoformat') else str(trade['entry_time']),
+                    'price': trade['entry_price'],
                     'type': 'entry',
-                    'action': trade.get('action', 'UNKNOWN')
+                    'action': trade['action']
                 })
-            if exit_time:
+            if 'exit_time' in trade and trade['exit_time']:
                 markers.append({
-                    'time': exit_time,
-                    'price': self._safe_float(trade.get('exit_price')),
+                    'time': trade['exit_time'].isoformat() if hasattr(trade['exit_time'], 'isoformat') else str(trade['exit_time']),
+                    'price': trade['exit_price'],
                     'type': 'exit',
                     'action': 'EXIT'
                 })
 
-        # Prepara trades para a tabela com valores seguros
+        # Prepara trades para a tabela
         trades_table = []
         for trade in self.data.get('trades', []):
             trades_table.append({
-                'entry_time': self._safe_str(trade.get('entry_time')),
-                'exit_time': self._safe_str(trade.get('exit_time')),
+                'entry_time': trade.get('entry_time', ''),
+                'exit_time': trade.get('exit_time', ''),
                 'action': trade.get('action', ''),
-                'qty': self._safe_float(trade.get('qty')),
-                'entry_price': self._safe_float(trade.get('entry_price')),
-                'exit_price': self._safe_float(trade.get('exit_price')),
-                'pnl_usdt': self._safe_float(trade.get('pnl_usdt')),
-                'pnl_percent': self._safe_float(trade.get('pnl_percent'))
+                'qty': trade.get('qty', 0),
+                'entry_price': trade.get('entry_price', 0),
+                'exit_price': trade.get('exit_price', 0),
+                'pnl_usdt': trade.get('pnl_usdt', 0),
+                'pnl_percent': trade.get('pnl_percent', 0)
             })
 
-        # Função now para o rodapé
-        def now():
-            return datetime.now()
+        # Último candle para debug
+        ultimo_candle = candles[-1] if candles else None
 
         html = template.render(
             candles=candles,
             markers=markers,
             trades=trades_table,
             stats=self.data,
-            now=now
+            ultimo_candle=ultimo_candle,
+            now=datetime.now
         )
         return html
-
-    def save_html(self, output_path: str = "backtest_report.html") -> str:
-        """Salva o HTML em arquivo (para compatibilidade local)."""
-        html = self.generate_html()
-        out_path = Path(output_path).absolute()
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(html)
-        import webbrowser
-        webbrowser.open(f"file://{out_path}")
-        return str(out_path)
