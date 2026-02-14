@@ -14,7 +14,7 @@ from keepalive.pinger import KeepAlivePinger
 from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
-print("🚀 MAIN.PY INICIOU - Versão com 1000 candles e logs")  # LOG INICIAL
+print("🚀 MAIN.PY INICIOU - Versão com coletor paginado (1000 candles)")
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
@@ -47,19 +47,19 @@ RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
 CANDLE_LIMIT = 1000   # FORÇADO
-print(f"📊 Config: {CANDLE_LIMIT} candles, símbolo {SYMBOL}")  # LOG
+print(f"📊 Config: {CANDLE_LIMIT} candles, símbolo {SYMBOL}, timeframe {TIMEFRAME}")
 
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
 @app.route('/')
 def root():
-    print("📍 Rota / acessada")  # LOG
+    print("📍 Rota / acessada")
     return backtest_web()
 
 @app.route('/backtest')
 def backtest_web():
-    print("📍 Executando backtest...")  # LOG
+    print("📍 Executando backtest...")
     try:
         collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = collector.fetch_ohlcv()
@@ -76,7 +76,7 @@ def backtest_web():
 
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
-        print("✅ Backtest concluído")  # LOG
+        print("✅ Backtest concluído")
         return render_template_string(html_content)
 
     except Exception as e:
