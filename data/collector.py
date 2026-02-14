@@ -6,15 +6,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 class OKXDataCollector:
-    """
-    Coletor de dados da OKX via API REST pública.
-    Sem warnings do pandas (uso de .copy() para evitar chained assignment).
-    """
-
     def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 1000):
         self.symbol = symbol.strip().upper().replace('/', '-').replace('_', '-')
         self.timeframe = self._convert_timeframe(timeframe)
-        self.limit = min(limit, 300)  # Limite máximo da API OKX
+        self.limit = min(limit, 300)
         self.base_url = "https://www.okx.com"
 
     def _convert_timeframe(self, tf: str) -> str:
@@ -26,7 +21,6 @@ class OKXDataCollector:
         return mapping.get(tf.lower(), '30m')
 
     def _generate_mock_candles(self) -> pd.DataFrame:
-        """Fallback caso a API falhe."""
         print("📊 Usando dados mockados (fallback)...")
         base_price = 3200.0
         volatility = 0.015
@@ -45,12 +39,10 @@ class OKXDataCollector:
             timestamp = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
             candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # ✅ CORREÇÃO DEFINITIVA: cria uma nova coluna sem chained assignment
         df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
         return df
 
     def fetch_ohlcv(self) -> pd.DataFrame:
-        """Busca candles da OKX."""
         endpoint = "/api/v5/market/candles"
         params = {
             'instId': self.symbol,
@@ -76,7 +68,6 @@ class OKXDataCollector:
                 processed.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
 
             df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            # ✅ CORREÇÃO DEFINITIVA: usa assign para evitar warning
             df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
             print(f"✅ Obtidos {len(df)} candles reais da OKX")
             return df
