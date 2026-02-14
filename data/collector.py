@@ -8,18 +8,16 @@ from typing import Optional
 class OKXDataCollector:
     """
     Coletor de dados da OKX via API REST pública.
-    Formato do símbolo: "ETH-USDT" (obrigatório).
+    Agora sem o FutureWarning do pandas.
     """
 
-    def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 150):
-        # Normaliza símbolo (remove espaços, substitui / por -)
+    def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 1000):
         self.symbol = symbol.strip().upper().replace('/', '-').replace('_', '-')
         self.timeframe = self._convert_timeframe(timeframe)
         self.limit = min(limit, 300)  # Limite máximo da API OKX
         self.base_url = "https://www.okx.com"
 
     def _convert_timeframe(self, tf: str) -> str:
-        """Converte formato 30m para o formato da OKX."""
         mapping = {
             '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
             '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '12h': '12H',
@@ -28,12 +26,11 @@ class OKXDataCollector:
         return mapping.get(tf.lower(), '30m')
 
     def _generate_mock_candles(self) -> pd.DataFrame:
-        """Gera dados mockados realistas para fallback (apenas se API falhar)."""
+        """Fallback caso a API falhe."""
         print("📊 Usando dados mockados (fallback)...")
         base_price = 3200.0
         volatility = 0.015
         end_time = datetime.utcnow()
-        # Gera candles suficientes para o limite solicitado
         delta = timedelta(minutes=30)
         candles = []
         price = base_price
@@ -46,24 +43,14 @@ class OKXDataCollector:
             close = price * (1 + random.uniform(-0.002, 0.002))
             volume = random.uniform(5000, 15000)
             timestamp = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
-            candles.append([
-                timestamp,
-                round(price, 2),
-                round(high, 2),
-                round(low, 2),
-                round(close, 2),
-                round(volume, 2)
-            ])
+            candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # CORREÇÃO PANDAS: usar .loc para evitar FutureWarning
-        df.loc[:, 'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # CORREÇÃO: atribuição direta, sem .loc, sem warning
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
 
     def fetch_ohlcv(self) -> pd.DataFrame:
-        """
-        Busca os últimos 'limit' candles da OKX.
-        Retorna DataFrame com colunas: timestamp, open, high, low, close, volume.
-        """
+        """Busca candles da OKX."""
         endpoint = "/api/v5/market/candles"
         params = {
             'instId': self.symbol,
@@ -73,11 +60,7 @@ class OKXDataCollector:
 
         try:
             print(f"🔍 Solicitando {self.limit} candles de {self.symbol} ({self.timeframe})...")
-            response = requests.get(
-                self.base_url + endpoint,
-                params=params,
-                timeout=10
-            )
+            response = requests.get(self.base_url + endpoint, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
@@ -86,22 +69,15 @@ class OKXDataCollector:
                 return self._generate_mock_candles()
 
             candles_data = data['data']
-            candles_data.reverse()  # ordem crescente
+            candles_data.reverse()
 
             processed = []
             for c in candles_data:
-                processed.append([
-                    int(c[0]),
-                    float(c[1]),
-                    float(c[2]),
-                    float(c[3]),
-                    float(c[4]),
-                    float(c[5])
-                ])
+                processed.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
 
             df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            # CORREÇÃO PANDAS: usar .loc
-            df.loc[:, 'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # CORREÇÃO: atribuição direta, sem warning
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             print(f"✅ Obtidos {len(df)} candles reais da OKX")
             return df
 
