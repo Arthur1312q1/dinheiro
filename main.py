@@ -18,26 +18,11 @@ from utils.env_loader import env, env_int, env_float
 # FUNÇÃO AUXILIAR: NORMALIZA SÍMBOLO PARA O FORMATO DA OKX (ETH-USDT)
 # ============================================================================
 def normalize_symbol(symbol: str) -> str:
-    """
-    Converte qualquer formato comum para o padrão da OKX: "ETH-USDT".
-    Exemplos:
-        "ETH/USDT"  -> "ETH-USDT"
-        "ETHUSDT"   -> "ETH-USDT"
-        "BTC-USD"   -> "BTC-USDT" (assume USDT como quote)
-        "BTC-USDT"  -> "BTC-USDT"
-    """
-    # Remove espaços
     symbol = symbol.strip().upper()
-    
-    # Substitui separadores comuns por hífen
     symbol = symbol.replace('/', '-').replace('_', '-').replace(' ', '-')
-    
-    # Se não tiver hífen, insere antes do USDT (ex: ETHUSDT -> ETH-USDT)
     if '-' not in symbol and symbol.endswith('USDT'):
-        base = symbol[:-4]  # remove 'USDT'
+        base = symbol[:-4]
         symbol = f"{base}-USDT"
-    
-    # Garantir que a quote seja USDT (padrão para nosso backtest)
     if not symbol.endswith('-USDT'):
         if '-' in symbol:
             base, quote = symbol.split('-')
@@ -45,11 +30,10 @@ def normalize_symbol(symbol: str) -> str:
                 symbol = f"{base}-USDT"
         else:
             symbol = f"{symbol}-USDT"
-    
     return symbol
 
 # ============================================================================
-# CONFIGURAÇÕES DA ESTRATÉGIA
+# CONFIGURAÇÕES DA ESTRATÉGIA (iguais ao Pine)
 # ============================================================================
 STRATEGY_CONFIG = {
     "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
@@ -64,12 +48,12 @@ STRATEGY_CONFIG = {
 }
 
 # ============================================================================
-# CONFIGURAÇÕES DE COLETA DE DADOS
+# CONFIGURAÇÕES DE COLETA DE DADOS – 1000 CANDLES (essencial para adaptativo)
 # ============================================================================
-RAW_SYMBOL = env("SYMBOL", "ETH-USDT")  # ← AGORA O PADRÃO É "ETH-USDT" (correto!)
-SYMBOL = normalize_symbol(RAW_SYMBOL)    # Garante formato OKX
+RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
+SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
-BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 150)  # ← 150 candles, não dias
+BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 1000)   # ← 1000 candles
 CANDLE_LIMIT = BACKTEST_CANDLES
 
 # ============================================================================
@@ -80,35 +64,27 @@ app.register_blueprint(webhook_bp)
 
 @app.route('/')
 def root():
-    """Página inicial: executa o backtest e mostra o relatório."""
     return backtest_web()
 
 @app.route('/backtest')
 def backtest_web():
-    """Executa o backtest e retorna o relatório HTML."""
+    """Executa o backtest com 1000 candles e warm-up de 100 barras."""
     try:
-        # 1. Coleta dados da OKX
-        collector = OKXDataCollector(
-            symbol=SYMBOL,
-            timeframe=TIMEFRAME,
-            limit=CANDLE_LIMIT
-        )
-        df = collector.fetch_ohlcv()  # Agora busca os últimos 150 candles
+        collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        df = collector.fetch_ohlcv()
         
         if df.empty:
             return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
         
-        # 2. Inicializa estratégia
-        strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
+        # ✅ WARM-UP: remove os primeiros 100 candles (estabilização dos filtros)
+        df = df.iloc[100:].reset_index(drop=True)
         
-        # 3. Executa backtest
+        strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         engine = BacktestEngine(strategy, df)
         results = engine.run()
         
-        # 4. Gera HTML do relatório
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
-        
         return render_template_string(html_content)
     
     except Exception as e:
@@ -128,7 +104,8 @@ def run_backtest():
     print(f"🔍 Solicitando {CANDLE_LIMIT} candles de {SYMBOL}...")
     collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
     df = collector.fetch_ohlcv()
-    print(f"✅ {len(df)} candles obtidos.")
+    df = df.iloc[100:].reset_index(drop=True)
+    print(f"✅ {len(df)} candles após warm-up.")
     
     print("⚙️  Inicializando estratégia...")
     strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
