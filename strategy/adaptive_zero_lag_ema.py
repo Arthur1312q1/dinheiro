@@ -1,14 +1,8 @@
 # strategy/adaptive_zero_lag_ema.py
-# ═══════════════════════════════════════════════════════════════════════════
-# TRADUÇÃO CIRÚRGICA – ADAPTIVE ZERO LAG EMA v2 (PINE SCRIPT v3 → PYTHON)
-# ═══════════════════════════════════════════════════════════════════════════
-# ✅ Agora com proteção de histórico: só gera sinais após 50 barras de warm-up
-# ═══════════════════════════════════════════════════════════════════════════
-
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 PI = 3.14159265359
 RANGE = 50
@@ -29,7 +23,6 @@ class AdaptiveZeroLagEMA:
     max_lots: int = 100
 
     # ---------- ESTADO PERSISTENTE ----------
-    # I-Q IFM
     inphase_buffer: deque = field(default_factory=lambda: deque(maxlen=4))
     quadrature_buffer: deque = field(default_factory=lambda: deque(maxlen=3))
     re: float = 0.0
@@ -40,7 +33,6 @@ class AdaptiveZeroLagEMA:
     instIQ: float = 0.0
     lenIQ: float = 0.0
 
-    # Cosine IFM
     v1_prev: float = 0.0
     s2: float = 0.0
     s3: float = 0.0
@@ -48,7 +40,6 @@ class AdaptiveZeroLagEMA:
     instC: float = 0.0
     lenC: float = 0.0
 
-    # Zero-Lag EMA
     EMA: float = 0.0
     EMA_prev: float = 0.0
     EC: float = 0.0
@@ -57,16 +48,13 @@ class AdaptiveZeroLagEMA:
     BestGain: float = 0.0
     alpha: float = 0.0
 
-    # Sinais e flags
     buy_signal_prev: bool = False
     sell_signal_prev: bool = False
     pending_buy: bool = False
     pending_sell: bool = False
 
-    # Período adaptativo
     Period: int = 20
 
-    # Gerenciamento de posição
     position_size: float = 0.0
     entry_price: float = 0.0
     highest_price: float = 0.0
@@ -74,12 +62,13 @@ class AdaptiveZeroLagEMA:
     trailing_activated: bool = False
     stop_price: float = 0.0
 
-    # Capital
     balance: float = field(init=False)
 
-    # Buffers auxiliares
     _src_buffer: deque = field(default_factory=lambda: deque(maxlen=8))
     _P_buffer: deque = field(default_factory=lambda: deque(maxlen=5))
+
+    # Contador para logs
+    _bar_count: int = 0
 
     # Webhook comments
     enter_long_comment: str = "ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
@@ -102,7 +91,7 @@ class AdaptiveZeroLagEMA:
             self._P_buffer.append(0.0)
 
     # ------------------------------------------------------------------------
-    # NÚCLEO 1: I-Q IFM
+    # I-Q IFM
     # ------------------------------------------------------------------------
     def _update_iq_ifm(self, src: float):
         imult = 0.635
@@ -147,6 +136,7 @@ class AdaptiveZeroLagEMA:
 
         self.deltaIQ_buffer.append(deltaIQ)
 
+        # Detecção de instIQ
         delta_list = list(self.deltaIQ_buffer)
         for i in range(RANGE + 1):
             idx = -(i + 1)
@@ -162,7 +152,7 @@ class AdaptiveZeroLagEMA:
         self.lenIQ = 0.25 * instIQ + 0.75 * self.lenIQ
 
     # ------------------------------------------------------------------------
-    # NÚCLEO 2: COSINE IFM
+    # COSINE IFM
     # ------------------------------------------------------------------------
     def _update_cosine_ifm(self, src: float):
         s2 = 0.0
@@ -209,7 +199,7 @@ class AdaptiveZeroLagEMA:
         self.lenC = 0.25 * instC + 0.75 * self.lenC
 
     # ------------------------------------------------------------------------
-    # NÚCLEO 3: ZERO LAG EMA
+    # ZERO LAG EMA
     # ------------------------------------------------------------------------
     def _update_zero_lag_ema(self, src: float, period: int):
         alpha = 2.0 / (period + 1)
@@ -236,7 +226,7 @@ class AdaptiveZeroLagEMA:
         self.BestGain = best_gain
 
     # ------------------------------------------------------------------------
-    # NÚCLEO 4: TRAILING STOP
+    # TRAILING STOP
     # ------------------------------------------------------------------------
     def _update_position_trailing(self, candle: Dict) -> Optional[Dict]:
         if self.position_size == 0:
@@ -290,7 +280,7 @@ class AdaptiveZeroLagEMA:
         return None
 
     # ------------------------------------------------------------------------
-    # NÚCLEO 5: POSITION SIZING
+    # POSITION SIZING
     # ------------------------------------------------------------------------
     def _calculate_lots(self) -> float:
         risk_amount = self.risk_percent * self.balance
@@ -304,12 +294,13 @@ class AdaptiveZeroLagEMA:
     # MÉTODO PRINCIPAL
     # ------------------------------------------------------------------------
     def next(self, candle: Dict) -> Dict:
-        # ✅ PROTEÇÃO DE HISTÓRICO: só gera ações após acumular 50 candles internos
-        if len(self._src_buffer) < 50 or len(self.deltaIQ_buffer) < 50:
-            self._src_buffer.append(candle['close'])
-            return {"action": "NONE", "qty": 0, "price": 0, "comment": "", "balance": self.balance, "timestamp": candle.get('timestamp')}
-
+        self._bar_count += 1
         src = candle['close']
+
+        # Warm-up interno: só processa após acumular 50 candles
+        if len(self._src_buffer) < 50 or len(self.deltaIQ_buffer) < 50:
+            self._src_buffer.append(src)
+            return {"action": "NONE", "qty": 0, "price": 0, "comment": "", "balance": self.balance, "timestamp": candle.get('timestamp')}
 
         # 1. Indicadores adaptativos
         if self.adaptive_method in ["I-Q IFM", "Average"]:
@@ -346,12 +337,16 @@ class AdaptiveZeroLagEMA:
         self.buy_signal_prev = buy_signal
         self.sell_signal_prev = sell_signal
 
-        # 6. Verifica saídas
+        # 6. Logs a cada 10 candles para depuração
+        if self._bar_count % 10 == 0:
+            print(f"BARRA {self._bar_count}: Period={self.Period}, EC={self.EC:.2f}, EMA={self.EMA:.2f}, LeastError={self.LeastError:.4f}, lenIQ={self.lenIQ:.2f}, lenC={self.lenC:.2f}, crossover={crossover}, crossunder={crossunder}")
+
+        # 7. Verifica saídas
         exit_action = self._update_position_trailing(candle)
         if exit_action:
             return exit_action
 
-        # 7. Entradas
+        # 8. Entradas
         action = "NONE"
         qty = 0.0
         price = 0.0
@@ -374,6 +369,7 @@ class AdaptiveZeroLagEMA:
                 price = src
                 comment = self.enter_long_comment
                 self.pending_buy = False
+                print(f"🚀 ENTRADA LONG na barra {self._bar_count} a {src}")
 
             elif self.pending_sell and self.position_size >= 0:
                 if self.position_size > 0:
@@ -389,8 +385,9 @@ class AdaptiveZeroLagEMA:
                 price = src
                 comment = self.enter_short_comment
                 self.pending_sell = False
+                print(f"🚀 ENTRADA SHORT na barra {self._bar_count} a {src}")
 
-        # 8. Atualiza prev para próxima barra
+        # 9. Atualiza prev para próxima barra
         self.EMA_prev = self.EMA
         self.EC_prev = self.EC
 
