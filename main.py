@@ -14,8 +14,9 @@ from keepalive.pinger import KeepAlivePinger
 from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
-print("🚀 MAIN.PY INICIOU - Versão com coletor paginado (1000 candles)")
-
+# ============================================================================
+# FUNÇÃO AUXILIAR: NORMALIZA SÍMBOLO
+# ============================================================================
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
     symbol = symbol.replace('/', '-').replace('_', '-').replace(' ', '-')
@@ -31,6 +32,11 @@ def normalize_symbol(symbol: str) -> str:
             symbol = f"{symbol}-USDT"
     return symbol
 
+# ============================================================================
+# CONFIGURAÇÕES DA ESTRATÉGIA
+# ============================================================================
+FORCE_PERIOD = env_int("FORCE_PERIOD", None)  # NOVO: se definido no ambiente, usa período fixo
+
 STRATEGY_CONFIG = {
     "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
     "threshold": env_float("THRESHOLD", 0.0),
@@ -40,73 +46,100 @@ STRATEGY_CONFIG = {
     "risk_percent": env_float("RISK_PERCENT", 0.01),
     "tick_size": env_float("TICK_SIZE", 0.01),
     "initial_capital": env_float("INITIAL_CAPITAL", 1000.0),
-    "max_lots": env_int("MAX_LOTS", 100)
+    "max_lots": env_int("MAX_LOTS", 100),
+    "force_period": FORCE_PERIOD
 }
 
+# ============================================================================
+# CONFIGURAÇÕES DE COLETA DE DADOS
+# ============================================================================
 RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
-CANDLE_LIMIT = 1000   # FORÇADO
-print(f"📊 Config: {CANDLE_LIMIT} candles, símbolo {SYMBOL}, timeframe {TIMEFRAME}")
+BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 1000)
+CANDLE_LIMIT = BACKTEST_CANDLES
 
+# ============================================================================
+# CRIAÇÃO DA APLICAÇÃO FLASK
+# ============================================================================
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
 
 @app.route('/')
 def root():
-    print("📍 Rota / acessada")
     return backtest_web()
 
 @app.route('/backtest')
 def backtest_web():
-    print("📍 Executando backtest...")
     try:
+        print("📍 Rota /backtest acessada")
+        print("📍 Executando backtest...")
+        
         collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = collector.fetch_ohlcv()
+        
         if df.empty:
             return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
-
-        # Warm-up: remove primeiros 100 candles
+        
+        # Warm-up: remove primeiras 100 barras
         df = df.iloc[100:].reset_index(drop=True)
         print(f"📈 {len(df)} candles após warm-up")
-
+        
+        # Adiciona índice para logs
+        df['index'] = df.index
+        
+        print("⚙️ Estratégia inicializada")
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
+        
         engine = BacktestEngine(strategy, df)
         results = engine.run()
-
+        
+        print(f"📊 Gerando relatório com {len(df)} candles e {results['total_trades']} trades")
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
+        
         print("✅ Backtest concluído")
         return render_template_string(html_content)
-
+    
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"❌ ERRO NO BACKTEST:\n{tb}")
+        print(f"ERRO NO BACKTEST:\n{tb}")
         return jsonify({"error": str(e), "traceback": tb.split('\n'), "status": "failed"}), 500
 
+# ============================================================================
+# FUNÇÕES DE BACKTEST LOCAL
+# ============================================================================
 def run_backtest():
-    print(f"🔍 Executando backtest local com {CANDLE_LIMIT} candles...")
+    print(f"🔍 Buscando até {CANDLE_LIMIT} candles de {SYMBOL}...")
     collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
     df = collector.fetch_ohlcv()
+    print(f"✅ Obtidos {len(df)} candles reais da OKX")
+    
     df = df.iloc[100:].reset_index(drop=True)
-    print(f"✅ {len(df)} candles após warm-up.")
-
+    print(f"📈 {len(df)} candles após warm-up")
+    
+    df['index'] = df.index
+    print("⚙️ Estratégia inicializada")
     strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
+    
     engine = BacktestEngine(strategy, df)
     results = engine.run()
-
+    
+    print(f"📊 Gerando relatório com {len(df)} candles e {results['total_trades']} trades")
     reporter = BacktestReporter(results, df)
     report_path = reporter.save_html('azlema_backtest_report.html')
     print(f"✅ Relatório salvo: {report_path}")
 
+# ============================================================================
+# PONTO DE ENTRADA
+# ============================================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
     parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
     args = parser.parse_args()
-    print(f"⚙️ Modo: {args.mode}")
+
     if args.mode == 'backtest':
         run_backtest()
     else:
         port = env_int("PORT", 5000)
-        print(f"🌐 Servidor iniciando na porta {port}")
         app.run(host='0.0.0.0', port=port)
