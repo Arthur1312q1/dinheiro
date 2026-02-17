@@ -2,16 +2,22 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # TRADUÇÃO FIEL DO PINE SCRIPT v3 → PYTHON
 #
-# FLUXO EXATO DO PINE:
-#   Barra N:   buy_signal calculado
-#   Barra N+1: buy_signal[1]=True → pendingBuy := true
-#              pendingBuy=True e pos<=0 → strategy.entry agendado
-#   Barra N+2: entrada executada no OPEN
+# PROBLEMA RAIZ CORRIGIDO:
+#   O TradingView processa TODOS os candles históricos para aquecer os
+#   indicadores (EMA, EC, lenC etc). Se iniciamos com EMA=EC=0, ocorre
+#   um crossover FALSO na primeira barra porque EC converge para o preço
+#   rapidamente (BestGain corrige) mas EMA começa em alpha*price (~3% do price).
 #
-# Em Python:
-#   Barra N:   buy_signal → salvo em buy_signal_prev
-#   Barra N+1: buy_signal_prev → pending_buy=True → entry_scheduled=True
-#   Barra N+2: entry_scheduled → entrada no OPEN
+#   SOLUÇÃO: a estratégia recebe warmup_bars como parâmetro.
+#   Ela processa os indicadores em TODOS os candles, mas só abre posições
+#   após warmup_bars barras (equivalente ao histórico do TradingView).
+#
+# FLUXO PINE (calc_on_every_tick=false, process_orders_on_close=false default):
+#   Barra N:   buy_signal calculado no CLOSE
+#   Barra N+1: buy_signal[1]=True → pendingBuy=True
+#              if pendingBuy and pos<=0: strategy.entry chamado
+#              → entrada executa no OPEN da barra N+2
+#   Barra N+2: posição aberta, strategy.exit monitora
 # ═══════════════════════════════════════════════════════════════════════════
 
 import math
@@ -26,17 +32,18 @@ GAIN_LIMIT = 900
 
 @dataclass
 class AdaptiveZeroLagEMA:
-    # ---------- PARÂMETROS (espelham os inputs do Pine) ----------
+    # ---------- PARÂMETROS ----------
     adaptive_method: str = "Cos IFM"
     threshold: float = 0.0
-    fixed_sl_points: int = 2000         # fixedSL
-    fixed_tp_points: int = 55           # fixedTP = trail_points
-    trail_offset: int = 15              # trail_offset
-    risk_percent: float = 0.01          # risk
+    fixed_sl_points: int = 2000         # fixedSL (em ticks)
+    fixed_tp_points: int = 55           # trail_points (em ticks)
+    trail_offset: int = 15              # trail_offset (em ticks)
+    risk_percent: float = 0.01
     tick_size: float = 0.01             # syminfo.mintick
     initial_capital: float = 1000.0
-    max_lots: int = 100                 # limit
+    max_lots: int = 100
     force_period: Optional[int] = None
+    warmup_bars: int = 100              # barras para aquecer indicadores sem operar
 
     # ---------- ESTADO IFM I-Q ----------
     inphase_buffer: deque = field(default_factory=lambda: deque(maxlen=4))
@@ -56,8 +63,8 @@ class AdaptiveZeroLagEMA:
     lenC: float = 0.0
 
     # ---------- ESTADO ZERO-LAG EMA ----------
-    EMA: float = 0.0   # nz(EMA[1])
-    EC: float = 0.0    # nz(EC[1])
+    EMA: float = 0.0
+    EC: float = 0.0
     LeastError: float = 0.0
     BestGain: float = 0.0
 
@@ -65,17 +72,17 @@ class AdaptiveZeroLagEMA:
     Period: int = 20
 
     # ---------- FLAGS PINE-STYLE ----------
-    pending_buy: bool = False        # pendingBuy (persiste entre barras)
-    pending_sell: bool = False       # pendingSell
-    buy_signal_prev: bool = False    # buy_signal[1]
-    sell_signal_prev: bool = False   # sell_signal[1]
+    pending_buy: bool = False
+    pending_sell: bool = False
+    buy_signal_prev: bool = False
+    sell_signal_prev: bool = False
     entry_scheduled_long: bool = False
     entry_scheduled_short: bool = False
 
     # ---------- POSIÇÃO ----------
-    position_size: float = 0.0       # strategy.position_size
-    position_avg_price: float = 0.0  # strategy.position_avg_price
-    net_profit: float = 0.0          # strategy.netprofit
+    position_size: float = 0.0
+    position_avg_price: float = 0.0
+    net_profit: float = 0.0
 
     # ---------- TRAILING STOP ----------
     highest_price: float = 0.0
@@ -83,9 +90,16 @@ class AdaptiveZeroLagEMA:
     trailing_active: bool = False
     exit_active: bool = False
 
+    # ---------- CONTADOR DE BARRAS ----------
+    _bar_count: int = 0
+
     # ---------- BUFFERS AUXILIARES ----------
-    _src_buf: deque = field(default_factory=lambda: deque(maxlen=8))
+    # IMPORTANTE: src_buf é SEPARADO para IFM e não compartilhado
+    # No Pine, src[7] é o mesmo para ambos os IFMs pois é calculado uma vez
+    # Como usamos "Cos IFM" por padrão (apenas _calc_cosine_ifm), isso é OK
+    _src_buf_iq: deque = field(default_factory=lambda: deque(maxlen=8))
     _P_buf: deque = field(default_factory=lambda: deque(maxlen=5))
+    _src_buf_cos: deque = field(default_factory=lambda: deque(maxlen=8))
 
     balance: float = field(init=False)
 
@@ -99,19 +113,20 @@ class AdaptiveZeroLagEMA:
             self.deltaIQ_buffer.append(0.0)
             self.deltaC_buffer.append(0.0)
         for _ in range(8):
-            self._src_buf.append(0.0)
+            self._src_buf_iq.append(0.0)
+            self._src_buf_cos.append(0.0)
         for _ in range(5):
             self._P_buf.append(0.0)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # I-Q IFM
+    # I-Q IFM — fiel ao Pine (usa atan, não atan2)
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_iq_ifm(self, src: float):
         imult = 0.635
         qmult = 0.338
 
-        self._src_buf.append(src)
-        P = src - self._src_buf[0]  # src - src[7]
+        self._src_buf_iq.append(src)
+        P = src - self._src_buf_iq[0]  # src - src[7]
         self._P_buf.append(P)
 
         P_list = list(self._P_buf)
@@ -120,9 +135,9 @@ class AdaptiveZeroLagEMA:
 
         ib = list(self.inphase_buffer)
         qb = list(self.quadrature_buffer)
-        inphase_3   = ib[0]  if len(ib) >= 4 else 0.0
-        inphase_1   = ib[-2] if len(ib) >= 2 else 0.0
-        quadrature_2 = qb[0] if len(qb) >= 3 else 0.0
+        inphase_3    = ib[0]  if len(ib) >= 4 else 0.0
+        inphase_1    = ib[-2] if len(ib) >= 2 else 0.0
+        quadrature_2 = qb[0]  if len(qb) >= 3 else 0.0
         quadrature_1 = qb[-2] if len(qb) >= 2 else 0.0
 
         inphase    = 1.25 * (P_4 - imult * P_2) + imult * inphase_3
@@ -136,8 +151,7 @@ class AdaptiveZeroLagEMA:
         self.re_prev = re
         self.im_prev = im
 
-        # Pine usa atan(im/re), não atan2
-        deltaIQ = math.atan(im / re) if re != 0.0 else 0.0
+        deltaIQ = math.atan(im / re) if re != 0.0 else 0.0  # Pine: atan (não atan2)
         self.deltaIQ_buffer.append(deltaIQ)
 
         d_list = list(self.deltaIQ_buffer)
@@ -151,16 +165,16 @@ class AdaptiveZeroLagEMA:
                     instIQ = float(i)
 
         if instIQ == 0.0:
-            instIQ = self.instIQ  # nz(instIQ[1])
+            instIQ = self.instIQ
         self.instIQ = instIQ
         self.lenIQ = 0.25 * instIQ + 0.75 * self.lenIQ
 
     # ═══════════════════════════════════════════════════════════════════════
-    # COSINE IFM
+    # COSINE IFM — fiel ao Pine
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_cosine_ifm(self, src: float):
-        self._src_buf.append(src)
-        v1 = src - self._src_buf[0]  # src - src[7]
+        self._src_buf_cos.append(src)
+        v1 = src - self._src_buf_cos[0]  # src - src[7]
         v1_1 = self.v1_prev
         self.v1_prev = v1
 
@@ -184,7 +198,7 @@ class AdaptiveZeroLagEMA:
             if abs(idx) <= len(d_list):
                 v4 += d_list[idx]
                 if v4 > 2 * PI and instC == 0.0:
-                    instC = float(i - 1)  # Pine: instC := i - 1
+                    instC = float(i - 1)  # Pine: i - 1
 
         if instC == 0.0:
             instC = self.instC  # instC[1]
@@ -192,14 +206,12 @@ class AdaptiveZeroLagEMA:
         self.lenC = 0.25 * instC + 0.75 * self.lenC
 
     # ═══════════════════════════════════════════════════════════════════════
-    # ZERO-LAG EMA
-    # Retorna (ema_prev, ec_prev, ema_new, ec_new) para calcular crossover
+    # ZERO-LAG EMA — retorna (ema_prev, ec_prev, ema_new, ec_new)
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_zero_lag_ema(self, src: float, period: int):
         alpha = 2.0 / (period + 1)
-
-        ema_prev = self.EMA  # nz(EMA[1])
-        ec_prev  = self.EC   # nz(EC[1])
+        ema_prev = self.EMA   # nz(EMA[1])
+        ec_prev  = self.EC    # nz(EC[1])
 
         ema_new = alpha * src + (1 - alpha) * ema_prev
 
@@ -224,7 +236,7 @@ class AdaptiveZeroLagEMA:
 
     # ═══════════════════════════════════════════════════════════════════════
     # TRAILING STOP — replica strategy.exit do Pine
-    # loss=fixedSL, trail_points=fixedTP, trail_offset=15
+    # loss=fixedSL ticks, trail_points=fixedTP ticks, trail_offset=15 ticks
     # ═══════════════════════════════════════════════════════════════════════
     def _check_exit(self, candle: Dict) -> Optional[Dict]:
         if self.position_size == 0 or not self.exit_active:
@@ -258,12 +270,8 @@ class AdaptiveZeroLagEMA:
                 self.trailing_active = False
                 self.exit_active = False
                 return {
-                    "action": "EXIT_LONG",
-                    "price": exit_price,
-                    "qty": qty,
-                    "pnl": pnl,
-                    "balance": self.balance,
-                    "timestamp": ts,
+                    "action": "EXIT_LONG", "price": exit_price, "qty": qty,
+                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
                     "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
                 }
 
@@ -290,22 +298,17 @@ class AdaptiveZeroLagEMA:
                 self.trailing_active = False
                 self.exit_active = False
                 return {
-                    "action": "EXIT_SHORT",
-                    "price": exit_price,
-                    "qty": qty,
-                    "pnl": pnl,
-                    "balance": self.balance,
-                    "timestamp": ts,
+                    "action": "EXIT_SHORT", "price": exit_price, "qty": qty,
+                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
                     "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
                 }
 
         return None
 
     # ═══════════════════════════════════════════════════════════════════════
-    # CÁLCULO DE LOTS — replica Pine exato
-    # balance = initial_capital + netprofit
-    # lots = (risk * balance) / (fixedSL * mintick)
-    # lots = lots > maxQty ? maxQty : lots
+    # LOTS — Pine: balance = initial_capital + netprofit
+    #              lots = (risk * balance) / (fixedSL * mintick)
+    #              lots > maxQty ? maxQty : lots
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_lots(self) -> float:
         balance = self.initial_capital + self.net_profit
@@ -320,14 +323,22 @@ class AdaptiveZeroLagEMA:
     # MÉTODO PRINCIPAL
     # ═══════════════════════════════════════════════════════════════════════
     def next(self, candle: Dict) -> List[Dict]:
+        """
+        Processa um candle. Durante warmup_bars barras iniciais, calcula
+        indicadores mas NÃO abre posições (equivalente ao histórico do TradingView).
+        """
         open_p = candle['open']
         idx    = candle.get('index', 0)
         ts     = candle.get('timestamp')
         actions = []
 
+        # Incrementa contador de barras processadas pela estratégia
+        self._bar_count += 1
+        in_warmup = self._bar_count <= self.warmup_bars
+
         # ══════════════════════════════════════════════════════════════════
-        # PINE STEP 1: pendingBuy := nz(pendingBuy[1])
-        #              if buy_signal[1] → pendingBuy := true
+        # PINE: pendingBuy := nz(pendingBuy[1])
+        #       if buy_signal[1]: pendingBuy := true
         # ══════════════════════════════════════════════════════════════════
         if self.buy_signal_prev:
             self.pending_buy = True
@@ -335,81 +346,86 @@ class AdaptiveZeroLagEMA:
             self.pending_sell = True
 
         # ══════════════════════════════════════════════════════════════════
-        # PINE STEP 2: Executa entradas agendadas no OPEN
-        # (strategy.entry do Pine executa no OPEN do candle seguinte)
+        # Executa entradas agendadas no OPEN (só fora do warmup)
         # ══════════════════════════════════════════════════════════════════
-        if self.entry_scheduled_long:
-            if self.position_size <= 0 and (self.initial_capital + self.net_profit) > 0:
-                # Fecha short se houver
-                if self.position_size < 0:
-                    qty = abs(self.position_size)
-                    pnl = (self.position_avg_price - open_p) * qty
-                    self.net_profit += pnl
-                    self.balance = self.initial_capital + self.net_profit
-                    actions.append({
-                        "action": "EXIT_SHORT",
-                        "price": open_p, "qty": qty, "pnl": pnl,
-                        "balance": self.balance, "timestamp": ts,
-                        "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
-                    })
-                    self.position_size = 0.0
-                    self.exit_active = False
-                    self.trailing_active = False
+        if not in_warmup:
+            balance = self.initial_capital + self.net_profit
 
-                lots = self._calc_lots()
-                if lots > 0:
-                    self.position_size = lots
-                    self.position_avg_price = open_p
-                    self.highest_price = open_p
-                    self.lowest_price = 0.0
-                    self.trailing_active = False
-                    self.exit_active = True
-                    self.balance = self.initial_capital + self.net_profit
-                    actions.append({
-                        "action": "BUY", "qty": lots, "price": open_p,
-                        "comment": "ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7",
-                        "balance": self.balance, "timestamp": ts
-                    })
-                    print(f"✅ LONG [{idx}] @ {open_p:.2f} qty={lots:.4f} bal={self.balance:.2f}")
+            if self.entry_scheduled_long and balance > 0:
+                if self.position_size <= 0:
+                    # Fecha short se houver
+                    if self.position_size < 0:
+                        qty = abs(self.position_size)
+                        pnl = (self.position_avg_price - open_p) * qty
+                        self.net_profit += pnl
+                        self.balance = self.initial_capital + self.net_profit
+                        actions.append({
+                            "action": "EXIT_SHORT", "price": open_p, "qty": qty,
+                            "pnl": pnl, "balance": self.balance, "timestamp": ts,
+                            "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
+                        })
+                        self.position_size = 0.0
+                        self.exit_active = False
+                        self.trailing_active = False
+
+                    lots = self._calc_lots()
+                    if lots > 0:
+                        self.position_size = lots
+                        self.position_avg_price = open_p
+                        self.highest_price = open_p
+                        self.lowest_price = 0.0
+                        self.trailing_active = False
+                        self.exit_active = True
+                        self.balance = self.initial_capital + self.net_profit
+                        actions.append({
+                            "action": "BUY", "qty": lots, "price": open_p,
+                            "comment": "ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7",
+                            "balance": self.balance, "timestamp": ts
+                        })
+                        print(f"✅ LONG [{idx}] @ {open_p:.2f} qty={lots:.4f} bal={self.balance:.2f}")
+                self.entry_scheduled_long = False
+
+            if self.entry_scheduled_short and balance > 0:
+                if self.position_size >= 0:
+                    # Fecha long se houver
+                    if self.position_size > 0:
+                        qty = self.position_size
+                        pnl = (open_p - self.position_avg_price) * qty
+                        self.net_profit += pnl
+                        self.balance = self.initial_capital + self.net_profit
+                        actions.append({
+                            "action": "EXIT_LONG", "price": open_p, "qty": qty,
+                            "pnl": pnl, "balance": self.balance, "timestamp": ts,
+                            "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
+                        })
+                        self.position_size = 0.0
+                        self.exit_active = False
+                        self.trailing_active = False
+
+                    lots = self._calc_lots()
+                    if lots > 0:
+                        self.position_size = -lots
+                        self.position_avg_price = open_p
+                        self.lowest_price = open_p
+                        self.highest_price = float('inf')
+                        self.trailing_active = False
+                        self.exit_active = True
+                        self.balance = self.initial_capital + self.net_profit
+                        actions.append({
+                            "action": "SELL", "qty": lots, "price": open_p,
+                            "comment": "ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7",
+                            "balance": self.balance, "timestamp": ts
+                        })
+                        print(f"✅ SHORT [{idx}] @ {open_p:.2f} qty={lots:.4f} bal={self.balance:.2f}")
+                self.entry_scheduled_short = False
+
+        else:
+            # No warmup: descarta entradas agendadas (não foram abertas ainda)
             self.entry_scheduled_long = False
-
-        if self.entry_scheduled_short:
-            if self.position_size >= 0 and (self.initial_capital + self.net_profit) > 0:
-                # Fecha long se houver
-                if self.position_size > 0:
-                    qty = self.position_size
-                    pnl = (open_p - self.position_avg_price) * qty
-                    self.net_profit += pnl
-                    self.balance = self.initial_capital + self.net_profit
-                    actions.append({
-                        "action": "EXIT_LONG",
-                        "price": open_p, "qty": qty, "pnl": pnl,
-                        "balance": self.balance, "timestamp": ts,
-                        "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
-                    })
-                    self.position_size = 0.0
-                    self.exit_active = False
-                    self.trailing_active = False
-
-                lots = self._calc_lots()
-                if lots > 0:
-                    self.position_size = -lots
-                    self.position_avg_price = open_p
-                    self.lowest_price = open_p
-                    self.highest_price = float('inf')
-                    self.trailing_active = False
-                    self.exit_active = True
-                    self.balance = self.initial_capital + self.net_profit
-                    actions.append({
-                        "action": "SELL", "qty": lots, "price": open_p,
-                        "comment": "ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7",
-                        "balance": self.balance, "timestamp": ts
-                    })
-                    print(f"✅ SHORT [{idx}] @ {open_p:.2f} qty={lots:.4f} bal={self.balance:.2f}")
             self.entry_scheduled_short = False
 
         # ══════════════════════════════════════════════════════════════════
-        # PINE STEP 3: Calcula indicadores no CLOSE
+        # Calcula indicadores com CLOSE (sempre, inclusive no warmup)
         # ══════════════════════════════════════════════════════════════════
         src = candle['close']
 
@@ -432,7 +448,7 @@ class AdaptiveZeroLagEMA:
 
         ema_prev, ec_prev, ema_new, ec_new = self._calc_zero_lag_ema(src, self.Period)
 
-        # crossover(EC, EMA) = EC[1] <= EMA[1] and EC > EMA
+        # crossover(EC, EMA): EC[1] <= EMA[1] AND EC > EMA
         crossover  = (ec_prev <= ema_prev) and (ec_new > ema_new)
         crossunder = (ec_prev >= ema_prev) and (ec_new < ema_new)
         error_pct  = 100.0 * self.LeastError / src if src != 0 else 0.0
@@ -440,39 +456,42 @@ class AdaptiveZeroLagEMA:
         sell_signal = crossunder and (error_pct > self.threshold)
 
         # ══════════════════════════════════════════════════════════════════
-        # PINE STEP 4: Trailing stop / SL intra-candle
+        # Trailing stop / SL (só fora do warmup, mas posição só existe fora)
         # ══════════════════════════════════════════════════════════════════
         exit_action = self._check_exit(candle)
         if exit_action:
             actions.append(exit_action)
 
         # ══════════════════════════════════════════════════════════════════
-        # PINE STEP 5: Agenda entrada se pendingBuy/pendingSell
-        # Pine: if pendingBuy and pos<=0 → strategy.entry (executa no próximo OPEN)
+        # Agenda entrada para próximo candle
+        # Pine: if pendingBuy and pos<=0: strategy.entry (→ entra no próximo open)
+        # Durante warmup: processa pending mas descarta (entry_scheduled vai ser
+        # limpo no início do próximo next())
         # ══════════════════════════════════════════════════════════════════
         if self.pending_buy and self.position_size <= 0:
             self.entry_scheduled_long = True
             self.entry_scheduled_short = False
             self.pending_buy = False
-            print(f"🚀 Long agendado p/ barra {idx+1}")
+            if not in_warmup:
+                print(f"🚀 Long agendado → barra {idx+1}")
 
         if self.pending_sell and self.position_size >= 0:
             self.entry_scheduled_short = True
             self.entry_scheduled_long = False
             self.pending_sell = False
-            print(f"🚀 Short agendado p/ barra {idx+1}")
+            if not in_warmup:
+                print(f"🚀 Short agendado → barra {idx+1}")
 
-        # ══════════════════════════════════════════════════════════════════
-        # PINE STEP 6: Salva sinais desta barra → serão [1] na próxima
-        # ══════════════════════════════════════════════════════════════════
+        # Salva sinais para próxima barra
         self.buy_signal_prev  = buy_signal
         self.sell_signal_prev = sell_signal
 
-        if idx % 50 == 0:
+        if idx % 100 == 0:
+            warmup_str = " [WARMUP]" if in_warmup else ""
             print(
-                f"📊 [{idx}] P={self.Period} EC={ec_new:.2f} EMA={ema_new:.2f} "
-                f"diff={ec_new-ema_new:.4f} xo={crossover} xu={crossunder} "
-                f"err%={error_pct:.4f} pB={self.pending_buy} pS={self.pending_sell} "
+                f"📊 [{idx}]{warmup_str} P={self.Period} "
+                f"EC={ec_new:.2f} EMA={ema_new:.2f} diff={ec_new-ema_new:.4f} "
+                f"xo={crossover} xu={crossunder} err%={error_pct:.4f} "
                 f"pos={self.position_size:.4f} bal={self.balance:.2f}"
             )
 
