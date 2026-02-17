@@ -4,6 +4,7 @@
 # ✅ AGENDAMENTO DE ENTRADA NO PRÓXIMO CANDLE
 # ✅ FLAGS PERSISTENTES IGUAL AO PINE
 # ✅ RETORNA LISTA DE AÇÕES POR CANDLE
+# ✅ LOG DA DIFERENÇA EC-EMA PARA DIAGNÓSTICO
 # ═══════════════════════════════════════════════════════════════════════════
 
 import math
@@ -428,9 +429,12 @@ class AdaptiveZeroLagEMA:
         self.buy_signal_prev = buy_signal
         self.sell_signal_prev = sell_signal
 
-        # Log a cada 50 candles (opcional)
+        # ====================================================================
+        # 6. LOGS DE DIAGNÓSTICO (incluindo diferença EC-EMA)
+        # ====================================================================
         if bar_index % 50 == 0:
+            diff = self.EC - self.EMA
             print(f"📊 Barra {bar_index}: Period={self.Period}, EC={self.EC:.2f}, EMA={self.EMA:.2f}, "
-                  f"crossover={crossover}, crossunder={crossunder}, error%={error_percent:.4f}")
+                  f"crossover={crossover}, crossunder={crossunder}, error%={error_percent:.4f}, diff={diff:.4f}")
 
         return actions
