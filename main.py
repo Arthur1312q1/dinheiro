@@ -35,7 +35,7 @@ def normalize_symbol(symbol: str) -> str:
 # ============================================================================
 # CONFIGURAÇÕES DA ESTRATÉGIA
 # ============================================================================
-FORCE_PERIOD = env_int("FORCE_PERIOD", None)  # NOVO: se definido no ambiente, usa período fixo
+FORCE_PERIOD = env_int("FORCE_PERIOD", None)  # se definido, usa período fixo
 
 STRATEGY_CONFIG = {
     "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
@@ -56,8 +56,13 @@ STRATEGY_CONFIG = {
 RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
-BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 1000)
+
+# ✅ 2000 candles para dar tempo ao adaptativo convergir
+BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 2000)
 CANDLE_LIMIT = BACKTEST_CANDLES
+
+# ✅ Warm-up configurável (padrão 100, pode ser 0 para desligar)
+WARMUP_CANDLES = env_int("WARMUP_CANDLES", 100)
 
 # ============================================================================
 # CRIAÇÃO DA APLICAÇÃO FLASK
@@ -74,33 +79,34 @@ def backtest_web():
     try:
         print("📍 Rota /backtest acessada")
         print("📍 Executando backtest...")
-        
+
         collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = collector.fetch_ohlcv()
-        
+
         if df.empty:
             return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
-        
-        # Warm-up: remove primeiras 100 barras
-        df = df.iloc[100:].reset_index(drop=True)
-        print(f"📈 {len(df)} candles após warm-up")
-        
+
+        # ✅ Warm-up removendo as primeiras WARMUP_CANDLES barras
+        if WARMUP_CANDLES > 0:
+            df = df.iloc[WARMUP_CANDLES:].reset_index(drop=True)
+        print(f"📈 {len(df)} candles após warm-up de {WARMUP_CANDLES}")
+
         # Adiciona índice para logs
         df['index'] = df.index
-        
+
         print("⚙️ Estratégia inicializada")
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-        
+
         engine = BacktestEngine(strategy, df)
         results = engine.run()
-        
+
         print(f"📊 Gerando relatório com {len(df)} candles e {results['total_trades']} trades")
         reporter = BacktestReporter(results, df)
         html_content = reporter.generate_html()
-        
+
         print("✅ Backtest concluído")
         return render_template_string(html_content)
-    
+
     except Exception as e:
         tb = traceback.format_exc()
         print(f"ERRO NO BACKTEST:\n{tb}")
@@ -114,17 +120,18 @@ def run_backtest():
     collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
     df = collector.fetch_ohlcv()
     print(f"✅ Obtidos {len(df)} candles reais da OKX")
-    
-    df = df.iloc[100:].reset_index(drop=True)
-    print(f"📈 {len(df)} candles após warm-up")
-    
+
+    if WARMUP_CANDLES > 0:
+        df = df.iloc[WARMUP_CANDLES:].reset_index(drop=True)
+    print(f"📈 {len(df)} candles após warm-up de {WARMUP_CANDLES}")
+
     df['index'] = df.index
     print("⚙️ Estratégia inicializada")
     strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-    
+
     engine = BacktestEngine(strategy, df)
     results = engine.run()
-    
+
     print(f"📊 Gerando relatório com {len(df)} candles e {results['total_trades']} trades")
     reporter = BacktestReporter(results, df)
     report_path = reporter.save_html('azlema_backtest_report.html')
