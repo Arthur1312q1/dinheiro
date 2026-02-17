@@ -11,8 +11,7 @@ class OKXDataCollector:
         self.timeframe = self._convert_timeframe(timeframe)
         self.limit = limit
         self.base_url = "https://www.okx.com"
-        # OKX máximo por request é 300 candles
-        self.MAX_PER_REQUEST = 300
+        self.MAX_PER_REQUEST = 300  # OKX máximo por página
 
     def _convert_timeframe(self, tf: str) -> str:
         mapping = {
@@ -34,47 +33,24 @@ class OKXDataCollector:
             change = random.uniform(-volatility, volatility)
             price *= (1 + change)
             price = max(price, base_price * 0.7)
-            high = price * (1 + random.uniform(0, 0.005))
-            low = price * (1 - random.uniform(0, 0.005))
+            high  = price * (1 + random.uniform(0, 0.005))
+            low   = price * (1 - random.uniform(0, 0.005))
             close = price * (1 + random.uniform(-0.002, 0.002))
             volume = random.uniform(5000, 15000)
             timestamp = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
-            candles.append([timestamp, round(price, 2), round(high, 2), round(low, 2), round(close, 2), round(volume, 2)])
-        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
+        df = pd.DataFrame(candles, columns=['timestamp','open','high','low','close','volume'])
         df = df.copy()
-        df.loc[:, 'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.loc[:,'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
-
-    def _fetch_page(self, after: Optional[str] = None) -> list:
-        """
-        Busca uma página de até MAX_PER_REQUEST candles.
-        `after` é o timestamp (ms) do candle mais antigo da página anterior,
-        usado para paginar para trás no tempo.
-        """
-        endpoint = "/api/v5/market/candles"
-        params = {
-            'instId': self.symbol,
-            'bar': self.timeframe,
-            'limit': self.MAX_PER_REQUEST
-        }
-        if after:
-            params['after'] = after  # OKX: retorna candles ANTES deste timestamp
-
-        response = requests.get(self.base_url + endpoint, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get('code') != '0':
-            raise ValueError(f"Erro na API OKX: {data.get('msg')}")
-
-        return data.get('data', [])
 
     def fetch_ohlcv(self) -> pd.DataFrame:
         """
-        Busca até `self.limit` candles da OKX usando paginação.
-        OKX retorna candles do mais recente para o mais antigo por padrão.
+        Busca candles da OKX com paginação automática.
+        OKX retorna no máximo 300 candles por request.
+        Usa o parâmetro 'after' para paginar para trás no tempo.
         """
-        print(f"🔍 Buscando até {self.limit} candles de {self.symbol} ({self.timeframe}) com paginação...")
+        print(f"🔍 Buscando {self.limit} candles de {self.symbol} ({self.timeframe})...")
 
         all_candles = []
         after = None
@@ -82,49 +58,54 @@ class OKXDataCollector:
 
         try:
             while len(all_candles) < self.limit:
-                needed = self.limit - len(all_candles)
-                page_data = self._fetch_page(after=after)
+                params = {
+                    'instId': self.symbol,
+                    'bar':    self.timeframe,
+                    'limit':  min(self.MAX_PER_REQUEST, self.limit - len(all_candles))
+                }
+                if after:
+                    params['after'] = after  # candles mais antigos que este timestamp
 
+                response = requests.get(
+                    self.base_url + "/api/v5/market/candles",
+                    params=params, timeout=10
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if data.get('code') != '0':
+                    print(f"⚠️ Erro OKX: {data.get('msg')}")
+                    return self._generate_mock_candles()
+
+                page_data = data.get('data', [])
                 if not page_data:
                     break
 
                 all_candles.extend(page_data)
                 pages += 1
-                print(f"  📄 Página {pages}: +{len(page_data)} candles (total: {len(all_candles)})")
+                print(f"  📄 Página {pages}: +{len(page_data)} (total: {len(all_candles)})")
 
                 if len(page_data) < self.MAX_PER_REQUEST:
-                    # Não há mais páginas
-                    break
+                    break  # não há mais páginas
 
-                # O candle mais antigo é o último da lista (OKX retorna mais recente primeiro)
-                oldest_ts = page_data[-1][0]
-                after = oldest_ts
+                # oldest timestamp desta página → próxima página vai antes dele
+                after = page_data[-1][0]
 
             if not all_candles:
-                print("⚠️ Nenhum candle retornado pela API, usando mock.")
+                print("⚠️ Nenhum candle da API, usando mock.")
                 return self._generate_mock_candles()
 
-            # OKX retorna mais recente primeiro → invertemos para ordem cronológica
+            # OKX retorna mais recente primeiro → inverte para ordem cronológica
             all_candles.reverse()
+            all_candles = all_candles[-self.limit:]  # garante exatamente `limit` candles
 
-            # Pegar apenas os últimos `limit` candles (caso tenha paginado a mais)
-            all_candles = all_candles[-self.limit:]
+            processed = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                         for c in all_candles]
 
-            processed = []
-            for c in all_candles:
-                processed.append([
-                    int(c[0]),
-                    float(c[1]),
-                    float(c[2]),
-                    float(c[3]),
-                    float(c[4]),
-                    float(c[5])
-                ])
-
-            df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = pd.DataFrame(processed, columns=['timestamp','open','high','low','close','volume'])
             df = df.copy()
-            df.loc[:, 'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            print(f"✅ Obtidos {len(df)} candles reais da OKX ({pages} página(s))")
+            df.loc[:,'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            print(f"✅ {len(df)} candles reais da OKX ({pages} página(s))")
             return df
 
         except Exception as e:
