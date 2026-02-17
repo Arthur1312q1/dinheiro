@@ -39,8 +39,9 @@ class OKXDataCollector:
             timestamp = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
             candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # ✅ CORREÇÃO: atribuição direta, sem .loc
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # ✅ CORREÇÃO: usar .copy() e .loc para evitar FutureWarning
+        df = df.copy()
+        df.loc[:, 'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
 
     def fetch_ohlcv(self) -> pd.DataFrame:
@@ -60,8 +61,9 @@ class OKXDataCollector:
             for c in candles_data:
                 processed.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
             df = pd.DataFrame(processed, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            # ✅ CORREÇÃO: atribuição direta
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # ✅ CORREÇÃO: usar .copy() e .loc para evitar FutureWarning
+            df = df.copy()
+            df.loc[:, 'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             print(f"✅ Obtidos {len(df)} candles reais da OKX")
             return df
         except Exception as e:
