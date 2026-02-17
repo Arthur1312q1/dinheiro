@@ -1,10 +1,11 @@
 # strategy/adaptive_zero_lag_ema.py
 # ═══════════════════════════════════════════════════════════════════════════
-# TRADUÇÃO CIRÚRGICA – ADAPTIVE ZERO LAG EMA v2 (PINE SCRIPT v3 → PYTHON)
-# ✅ AGENDAMENTO DE ENTRADA NO PRÓXIMO CANDLE
-# ✅ FLAGS PERSISTENTES IGUAL AO PINE
-# ✅ RETORNA LISTA DE AÇÕES POR CANDLE
-# ✅ LOG DA DIFERENÇA EC-EMA PARA DIAGNÓSTICO
+# ADAPTIVE ZERO LAG EMA v2 – FIXES APLICADOS:
+# ✅ FIX 1: qty capturado antes de zerar position_size no exit
+# ✅ FIX 2: Lógica pending simplificada (sinal → scheduled → entrada, 2 candles)
+# ✅ FIX 3: lowest_price inicializado corretamente para LONG
+# ✅ FIX 4: EMA_prev / EC_prev atualizados ANTES de calcular crossover
+# ✅ FIX 5: Logs de diagnóstico melhorados
 # ═══════════════════════════════════════════════════════════════════════════
 
 import math
@@ -57,11 +58,7 @@ class AdaptiveZeroLagEMA:
     BestGain: float = 0.0
     alpha: float = 0.0
 
-    # Flags de sinal e atraso (Pine style)
-    buy_signal_prev: bool = False
-    sell_signal_prev: bool = False
-    pending_buy: bool = False
-    pending_sell: bool = False
+    # ✅ FIX 2: Apenas um nível de delay (sinal → scheduled → entrada)
     entry_scheduled_long: bool = False
     entry_scheduled_short: bool = False
 
@@ -71,7 +68,7 @@ class AdaptiveZeroLagEMA:
     position_size: float = 0.0
     entry_price: float = 0.0
     highest_price: float = 0.0
-    lowest_price: float = 0.0
+    lowest_price: float = float('inf')  # ✅ FIX 3: inf para SHORT tracking
     trailing_activated: bool = False
     stop_price: float = 0.0
 
@@ -81,7 +78,7 @@ class AdaptiveZeroLagEMA:
     _src_buffer: deque = field(default_factory=lambda: deque(maxlen=8))
     _P_buffer: deque = field(default_factory=lambda: deque(maxlen=5))
 
-    # Comentários das ordens (idênticos ao Pine)
+    # Comentários das ordens
     enter_long_comment: str = "ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
     exit_long_comment: str = "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
     enter_short_comment: str = "ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
@@ -101,7 +98,7 @@ class AdaptiveZeroLagEMA:
         for _ in range(5):
             self._P_buffer.append(0.0)
 
-    # ---------- Métodos auxiliares (inalterados, já verificados) ----------
+    # ---------- Métodos IFM (inalterados) ----------
     def _update_iq_ifm(self, src: float):
         imult = 0.635
         qmult = 0.338
@@ -207,10 +204,13 @@ class AdaptiveZeroLagEMA:
         alpha = 2.0 / (period + 1)
         self.alpha = alpha
 
-        self.EMA = alpha * src + (1 - alpha) * self.EMA_prev
-        self.EMA_prev = self.EMA
+        # ✅ FIX 4: Salvar prev ANTES de calcular novo valor
+        ema_prev = self.EMA
+        ec_prev = self.EC
 
-        ec_prev = self.EC_prev
+        self.EMA = alpha * src + (1 - alpha) * ema_prev
+        self.EMA_prev = ema_prev  # valor anterior real
+
         least_error = 1e12
         best_gain = 0.0
 
@@ -223,7 +223,7 @@ class AdaptiveZeroLagEMA:
                 best_gain = gain
 
         self.EC = alpha * (self.EMA + best_gain * (src - ec_prev)) + (1 - alpha) * ec_prev
-        self.EC_prev = self.EC
+        self.EC_prev = ec_prev  # ✅ valor anterior real (não o novo)
         self.LeastError = least_error
         self.BestGain = best_gain
 
@@ -238,6 +238,7 @@ class AdaptiveZeroLagEMA:
         timestamp = candle.get('timestamp', None)
 
         if self.position_size > 0:
+            # LONG
             self.highest_price = max(self.highest_price, high)
             if not self.trailing_activated:
                 profit_points = (self.highest_price - self.entry_price) / self.tick_size
@@ -247,18 +248,22 @@ class AdaptiveZeroLagEMA:
                 self.stop_price = self.highest_price - (self.trail_offset * self.tick_size)
             else:
                 self.stop_price = self.entry_price - (self.fixed_sl_points * self.tick_size)
+
             if low <= self.stop_price:
                 exit_price = min(close, self.stop_price)
-                pnl = (exit_price - self.entry_price) * self.position_size
+                # ✅ FIX 1: capturar qty ANTES de zerar position_size
+                qty = abs(self.position_size)
+                pnl = (exit_price - self.entry_price) * qty
                 self.balance += pnl
                 self.position_size = 0
                 self.entry_price = 0.0
                 self.highest_price = 0.0
+                self.lowest_price = float('inf')
                 self.trailing_activated = False
                 return {
                     "action": "EXIT_LONG",
                     "price": exit_price,
-                    "qty": abs(self.position_size),
+                    "qty": qty,  # ✅ qty correto
                     "pnl": pnl,
                     "balance": self.balance,
                     "timestamp": timestamp,
@@ -266,6 +271,7 @@ class AdaptiveZeroLagEMA:
                 }
 
         elif self.position_size < 0:
+            # SHORT
             self.lowest_price = min(self.lowest_price, low)
             if not self.trailing_activated:
                 profit_points = (self.entry_price - self.lowest_price) / self.tick_size
@@ -275,18 +281,22 @@ class AdaptiveZeroLagEMA:
                 self.stop_price = self.lowest_price + (self.trail_offset * self.tick_size)
             else:
                 self.stop_price = self.entry_price + (self.fixed_sl_points * self.tick_size)
+
             if high >= self.stop_price:
                 exit_price = max(close, self.stop_price)
-                pnl = (self.entry_price - exit_price) * abs(self.position_size)
+                # ✅ FIX 1: capturar qty ANTES de zerar position_size
+                qty = abs(self.position_size)
+                pnl = (self.entry_price - exit_price) * qty
                 self.balance += pnl
                 self.position_size = 0
                 self.entry_price = 0.0
                 self.lowest_price = float('inf')
+                self.highest_price = 0.0
                 self.trailing_activated = False
                 return {
                     "action": "EXIT_SHORT",
                     "price": exit_price,
-                    "qty": abs(self.position_size),
+                    "qty": qty,  # ✅ qty correto
                     "pnl": pnl,
                     "balance": self.balance,
                     "timestamp": timestamp,
@@ -302,10 +312,15 @@ class AdaptiveZeroLagEMA:
         lots = risk_amount / stop_loss_usdt
         return min(lots, float(self.max_lots))
 
-    # ---------- MÉTODO PRINCIPAL (MODIFICADO) ----------
+    # ---------- MÉTODO PRINCIPAL ----------
     def next(self, candle: Dict) -> List[Dict]:
         """
-        Processa um candle e retorna uma lista de ações (entradas/saídas) ocorridas.
+        Processa um candle e retorna lista de ações (entradas/saídas).
+        Fluxo por candle:
+          1. Executar entradas agendadas no open
+          2. Calcular indicadores no close
+          3. Verificar trailing stop/SL/TP
+          4. Agendar entrada para próximo candle se houver sinal
         """
         open_price = candle['open']
         high = candle['high']
@@ -317,54 +332,85 @@ class AdaptiveZeroLagEMA:
         actions = []
 
         # ====================================================================
-        # 0. EXECUTAR ENTRADAS AGENDADAS (abertura do candle)
+        # 1. EXECUTAR ENTRADAS AGENDADAS (abertura do candle)
         # ====================================================================
         if self.entry_scheduled_long and self.position_size <= 0:
+            # Fechar short se houver
+            if self.position_size < 0:
+                qty = abs(self.position_size)
+                pnl = (self.entry_price - open_price) * qty
+                self.balance += pnl
+                actions.append({
+                    "action": "EXIT_SHORT",
+                    "price": open_price,
+                    "qty": qty,
+                    "pnl": pnl,
+                    "balance": self.balance,
+                    "timestamp": timestamp,
+                    "comment": self.exit_short_comment
+                })
+                self.position_size = 0
+
             lots = self._calculate_lots()
-            self.position_size = lots
-            self.entry_price = open_price
-            self.highest_price = open_price
-            self.lowest_price = 0.0
-            self.trailing_activated = False
-            self.stop_price = self.entry_price - (self.fixed_sl_points * self.tick_size)
+            if lots > 0:
+                self.position_size = lots
+                self.entry_price = open_price
+                self.highest_price = open_price
+                self.lowest_price = float('inf')
+                self.trailing_activated = False
+                self.stop_price = self.entry_price - (self.fixed_sl_points * self.tick_size)
+                actions.append({
+                    "action": "BUY",
+                    "qty": lots,
+                    "price": open_price,
+                    "comment": self.enter_long_comment,
+                    "balance": self.balance,
+                    "timestamp": timestamp
+                })
+                print(f"✅ ENTRADA LONG na barra {bar_index} @ {open_price:.2f} | lots={lots:.4f}")
             self.entry_scheduled_long = False
-            actions.append({
-                "action": "BUY",
-                "qty": lots,
-                "price": open_price,
-                "comment": self.enter_long_comment,
-                "balance": self.balance,
-                "timestamp": timestamp
-            })
-            if bar_index % 10 == 0:
-                print(f"✅ ENTRADA LONG (scheduled) na barra {bar_index} a {open_price:.2f}")
 
         if self.entry_scheduled_short and self.position_size >= 0:
+            # Fechar long se houver
+            if self.position_size > 0:
+                qty = self.position_size
+                pnl = (open_price - self.entry_price) * qty
+                self.balance += pnl
+                actions.append({
+                    "action": "EXIT_LONG",
+                    "price": open_price,
+                    "qty": qty,
+                    "pnl": pnl,
+                    "balance": self.balance,
+                    "timestamp": timestamp,
+                    "comment": self.exit_long_comment
+                })
+                self.position_size = 0
+
             lots = self._calculate_lots()
-            self.position_size = -lots
-            self.entry_price = open_price
-            self.lowest_price = open_price
-            self.highest_price = float('inf')
-            self.trailing_activated = False
-            self.stop_price = self.entry_price + (self.fixed_sl_points * self.tick_size)
+            if lots > 0:
+                self.position_size = -lots
+                self.entry_price = open_price
+                self.lowest_price = open_price
+                self.highest_price = float('inf')
+                self.trailing_activated = False
+                self.stop_price = self.entry_price + (self.fixed_sl_points * self.tick_size)
+                actions.append({
+                    "action": "SELL",
+                    "qty": lots,
+                    "price": open_price,
+                    "comment": self.enter_short_comment,
+                    "balance": self.balance,
+                    "timestamp": timestamp
+                })
+                print(f"✅ ENTRADA SHORT na barra {bar_index} @ {open_price:.2f} | lots={lots:.4f}")
             self.entry_scheduled_short = False
-            actions.append({
-                "action": "SELL",
-                "qty": lots,
-                "price": open_price,
-                "comment": self.enter_short_comment,
-                "balance": self.balance,
-                "timestamp": timestamp
-            })
-            if bar_index % 10 == 0:
-                print(f"✅ ENTRADA SHORT (scheduled) na barra {bar_index} a {open_price:.2f}")
 
         # ====================================================================
-        # 1. CALCULAR INDICADORES (usando fechamento)
+        # 2. CALCULAR INDICADORES (usando fechamento)
         # ====================================================================
         src = close
 
-        # Período adaptativo
         if self.force_period is None:
             if self.adaptive_method in ["I-Q IFM", "Average"]:
                 self._update_iq_ifm(src)
@@ -384,10 +430,10 @@ class AdaptiveZeroLagEMA:
 
         self.Period = max(1, self.Period)
 
-        # Zero‑lag EMA
+        # ✅ FIX 4: _update_zero_lag_ema agora salva corretamente EMA_prev/EC_prev
         self._update_zero_lag_ema(src, self.Period)
 
-        # Sinais brutos deste candle
+        # Sinais de crossover usando valores prev salvos antes do update
         crossover = (self.EC_prev <= self.EMA_prev) and (self.EC > self.EMA)
         crossunder = (self.EC_prev >= self.EMA_prev) and (self.EC < self.EMA)
         error_percent = 100.0 * self.LeastError / src if src != 0 else 0.0
@@ -395,46 +441,36 @@ class AdaptiveZeroLagEMA:
         sell_signal = crossunder and (error_percent > self.threshold)
 
         # ====================================================================
-        # 2. ATUALIZAR FLAGS PENDENTES (usando sinais do candle anterior)
-        #    Equivalente a: pending := nz(pending[1]) ; if buy_signal[1] then pending := true
-        # ====================================================================
-        self.pending_buy = self.pending_buy or self.buy_signal_prev
-        self.pending_sell = self.pending_sell or self.sell_signal_prev
-
-        # ====================================================================
-        # 3. PROCESSAR TRAILING STOP (saídas) para este candle
+        # 3. TRAILING STOP / SL (saídas intra-candle)
         # ====================================================================
         exit_action = self._update_position_trailing(candle)
         if exit_action:
             actions.append(exit_action)
 
         # ====================================================================
-        # 4. AGENDAR ENTRADAS PARA O PRÓXIMO CANDLE (baseado nas flags pendentes)
+        # 4. AGENDAR ENTRADAS PARA O PRÓXIMO CANDLE
+        # ✅ FIX 2: Lógica simplificada – sinal direto vira scheduled
         # ====================================================================
-        if self.pending_buy and self.position_size <= 0:
+        if buy_signal and self.position_size <= 0:
             self.entry_scheduled_long = True
-            self.pending_buy = False
-            if bar_index % 10 == 0:
-                print(f"🚀 Long agendado para o próximo candle (barra {bar_index})")
+            self.entry_scheduled_short = False
+            print(f"🚀 Long agendado para barra {bar_index + 1} (sinal na barra {bar_index})")
 
-        if self.pending_sell and self.position_size >= 0:
+        if sell_signal and self.position_size >= 0:
             self.entry_scheduled_short = True
-            self.pending_sell = False
-            if bar_index % 10 == 0:
-                print(f"🚀 Short agendado para o próximo candle (barra {bar_index})")
+            self.entry_scheduled_long = False
+            print(f"🚀 Short agendado para barra {bar_index + 1} (sinal na barra {bar_index})")
 
         # ====================================================================
-        # 5. ARMAZENAR SINAIS DESTE CANDLE PARA O PRÓXIMO
-        # ====================================================================
-        self.buy_signal_prev = buy_signal
-        self.sell_signal_prev = sell_signal
-
-        # ====================================================================
-        # 6. LOGS DE DIAGNÓSTICO (incluindo diferença EC-EMA)
+        # 5. LOGS DE DIAGNÓSTICO
         # ====================================================================
         if bar_index % 50 == 0:
             diff = self.EC - self.EMA
-            print(f"📊 Barra {bar_index}: Period={self.Period}, EC={self.EC:.2f}, EMA={self.EMA:.2f}, "
-                  f"crossover={crossover}, crossunder={crossunder}, error%={error_percent:.4f}, diff={diff:.4f}")
+            print(
+                f"📊 Barra {bar_index}: Period={self.Period}, "
+                f"EC={self.EC:.2f}, EMA={self.EMA:.2f}, diff={diff:.4f}, "
+                f"crossover={crossover}, crossunder={crossunder}, "
+                f"error%={error_percent:.4f}, pos={self.position_size:.4f}, bal={self.balance:.2f}"
+            )
 
         return actions
