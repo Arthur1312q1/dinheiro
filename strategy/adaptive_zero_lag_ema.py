@@ -2,22 +2,31 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # TRADUÇÃO FIEL DO PINE SCRIPT v3 → PYTHON
 #
-# PROBLEMA RAIZ CORRIGIDO:
-#   O TradingView processa TODOS os candles históricos para aquecer os
-#   indicadores (EMA, EC, lenC etc). Se iniciamos com EMA=EC=0, ocorre
-#   um crossover FALSO na primeira barra porque EC converge para o preço
-#   rapidamente (BestGain corrige) mas EMA começa em alpha*price (~3% do price).
+# CORREÇÕES vs VERSÃO ANTERIOR:
 #
-#   SOLUÇÃO: a estratégia recebe warmup_bars como parâmetro.
-#   Ela processa os indicadores em TODOS os candles, mas só abre posições
-#   após warmup_bars barras (equivalente ao histórico do TradingView).
+# 1. EXIT TIMING (crítico para P&L correto):
+#    - Pine: low/high toca o stop na barra N → exit executa no OPEN da N+1
+#    - Python anterior: exit executava no close da barra N (errado)
+#    - Corrigido: _check_exit() apenas AGENDA o exit; executa no próximo open
 #
-# FLUXO PINE (calc_on_every_tick=false, process_orders_on_close=false default):
-#   Barra N:   buy_signal calculado no CLOSE
-#   Barra N+1: buy_signal[1]=True → pendingBuy=True
-#              if pendingBuy and pos<=0: strategy.entry chamado
-#              → entrada executa no OPEN da barra N+2
-#   Barra N+2: posição aberta, strategy.exit monitora
+# 2. PENDING após EXIT na mesma barra:
+#    - Quando exit é agendado na barra N, position_size ainda > 0 nessa barra
+#    - Logo "if pending and pos<=0" NÃO dispara na barra N (igual ao Pine)
+#    - Na barra N+1: exit executa no open → pos=0 → pending avaliado → entry agendado
+#    - Barra N+2: re-entry no open (idêntico ao Pine)
+#
+# FLUXO POR BARRA (fiel ao Pine calc_on_every_tick=false):
+#
+#   Início da barra (OPEN):
+#     1. Execute exits agendados (position fechada ao open_price)
+#     2. Execute entries agendados (position aberta ao open_price)
+#
+#   Fim da barra (CLOSE):
+#     3. Atualiza pending com sinal da barra anterior
+#     4. Calcula indicadores (EMA, EC, Period)
+#     5. Verifica se stop/trailing foi tocado (agenda exit para próximo open)
+#     6. Se pending e pos<=0/>=0: agenda entry para próximo open
+#     7. Salva buy_signal_prev / sell_signal_prev
 # ═══════════════════════════════════════════════════════════════════════════
 
 import math
@@ -35,15 +44,15 @@ class AdaptiveZeroLagEMA:
     # ---------- PARÂMETROS ----------
     adaptive_method: str = "Cos IFM"
     threshold: float = 0.0
-    fixed_sl_points: int = 2000         # fixedSL (em ticks)
-    fixed_tp_points: int = 55           # trail_points (em ticks)
-    trail_offset: int = 15              # trail_offset (em ticks)
+    fixed_sl_points: int = 2000
+    fixed_tp_points: int = 55
+    trail_offset: int = 15
     risk_percent: float = 0.01
-    tick_size: float = 0.01             # syminfo.mintick
+    tick_size: float = 0.01
     initial_capital: float = 1000.0
     max_lots: int = 100
     force_period: Optional[int] = None
-    warmup_bars: int = 100              # barras para aquecer indicadores sem operar
+    warmup_bars: int = 300
 
     # ---------- ESTADO IFM I-Q ----------
     inphase_buffer: deque = field(default_factory=lambda: deque(maxlen=4))
@@ -76,27 +85,29 @@ class AdaptiveZeroLagEMA:
     pending_sell: bool = False
     buy_signal_prev: bool = False
     sell_signal_prev: bool = False
+
+    # Agendamentos para o próximo open
     entry_scheduled_long: bool = False
     entry_scheduled_short: bool = False
+    exit_scheduled: bool = False          # ✅ NOVO: exit agendado para próximo open
+    exit_scheduled_side: str = ""         # "long" ou "short"
 
     # ---------- POSIÇÃO ----------
     position_size: float = 0.0
     position_avg_price: float = 0.0
     net_profit: float = 0.0
 
-    # ---------- TRAILING STOP ----------
+    # ---------- TRAILING STOP (monitorado no close, executado no próximo open) ----------
     highest_price: float = 0.0
     lowest_price: float = 0.0
     trailing_active: bool = False
     exit_active: bool = False
+    _stop_price: float = 0.0             # stop calculado na barra anterior
 
-    # ---------- CONTADOR DE BARRAS ----------
+    # ---------- CONTADOR ----------
     _bar_count: int = 0
 
-    # ---------- BUFFERS AUXILIARES ----------
-    # IMPORTANTE: src_buf é SEPARADO para IFM e não compartilhado
-    # No Pine, src[7] é o mesmo para ambos os IFMs pois é calculado uma vez
-    # Como usamos "Cos IFM" por padrão (apenas _calc_cosine_ifm), isso é OK
+    # ---------- BUFFERS ----------
     _src_buf_iq: deque = field(default_factory=lambda: deque(maxlen=8))
     _P_buf: deque = field(default_factory=lambda: deque(maxlen=5))
     _src_buf_cos: deque = field(default_factory=lambda: deque(maxlen=8))
@@ -119,41 +130,33 @@ class AdaptiveZeroLagEMA:
             self._P_buf.append(0.0)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # I-Q IFM — fiel ao Pine (usa atan, não atan2)
+    # I-Q IFM
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_iq_ifm(self, src: float):
         imult = 0.635
         qmult = 0.338
-
         self._src_buf_iq.append(src)
-        P = src - self._src_buf_iq[0]  # src - src[7]
+        P = src - self._src_buf_iq[0]
         self._P_buf.append(P)
-
         P_list = list(self._P_buf)
         P_4 = P_list[0]
         P_2 = P_list[2] if len(P_list) >= 3 else 0.0
-
         ib = list(self.inphase_buffer)
         qb = list(self.quadrature_buffer)
         inphase_3    = ib[0]  if len(ib) >= 4 else 0.0
         inphase_1    = ib[-2] if len(ib) >= 2 else 0.0
         quadrature_2 = qb[0]  if len(qb) >= 3 else 0.0
         quadrature_1 = qb[-2] if len(qb) >= 2 else 0.0
-
         inphase    = 1.25 * (P_4 - imult * P_2) + imult * inphase_3
         quadrature = P_2 - qmult * P + qmult * quadrature_2
-
         self.inphase_buffer.append(inphase)
         self.quadrature_buffer.append(quadrature)
-
         re = 0.2 * (inphase * inphase_1 + quadrature * quadrature_1) + 0.8 * self.re_prev
         im = 0.2 * (inphase * quadrature_1 - inphase_1 * quadrature) + 0.8 * self.im_prev
         self.re_prev = re
         self.im_prev = im
-
-        deltaIQ = math.atan(im / re) if re != 0.0 else 0.0  # Pine: atan (não atan2)
+        deltaIQ = math.atan(im / re) if re != 0.0 else 0.0
         self.deltaIQ_buffer.append(deltaIQ)
-
         d_list = list(self.deltaIQ_buffer)
         V = 0.0
         instIQ = 0.0
@@ -163,33 +166,28 @@ class AdaptiveZeroLagEMA:
                 V += d_list[idx]
                 if V > 2 * PI and instIQ == 0.0:
                     instIQ = float(i)
-
         if instIQ == 0.0:
             instIQ = self.instIQ
         self.instIQ = instIQ
         self.lenIQ = 0.25 * instIQ + 0.75 * self.lenIQ
 
     # ═══════════════════════════════════════════════════════════════════════
-    # COSINE IFM — fiel ao Pine
+    # COSINE IFM
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_cosine_ifm(self, src: float):
         self._src_buf_cos.append(src)
-        v1 = src - self._src_buf_cos[0]  # src - src[7]
+        v1 = src - self._src_buf_cos[0]
         v1_1 = self.v1_prev
         self.v1_prev = v1
-
         self.s2 = 0.2 * (v1_1 + v1) ** 2 + 0.8 * self.s2
         self.s3 = 0.2 * (v1_1 - v1) ** 2 + 0.8 * self.s3
-
         v2 = 0.0
         if self.s2 != 0.0:
             ratio = self.s3 / self.s2
             if ratio >= 0.0:
                 v2 = math.sqrt(ratio)
-
         deltaC = 2 * math.atan(v2) if self.s3 != 0.0 else 0.0
         self.deltaC_buffer.append(deltaC)
-
         d_list = list(self.deltaC_buffer)
         v4 = 0.0
         instC = 0.0
@@ -198,23 +196,20 @@ class AdaptiveZeroLagEMA:
             if abs(idx) <= len(d_list):
                 v4 += d_list[idx]
                 if v4 > 2 * PI and instC == 0.0:
-                    instC = float(i - 1)  # Pine: i - 1
-
+                    instC = float(i - 1)
         if instC == 0.0:
-            instC = self.instC  # instC[1]
+            instC = self.instC
         self.instC = instC
         self.lenC = 0.25 * instC + 0.75 * self.lenC
 
     # ═══════════════════════════════════════════════════════════════════════
-    # ZERO-LAG EMA — retorna (ema_prev, ec_prev, ema_new, ec_new)
+    # ZERO-LAG EMA
     # ═══════════════════════════════════════════════════════════════════════
     def _calc_zero_lag_ema(self, src: float, period: int):
         alpha = 2.0 / (period + 1)
-        ema_prev = self.EMA   # nz(EMA[1])
-        ec_prev  = self.EC    # nz(EC[1])
-
+        ema_prev = self.EMA
+        ec_prev  = self.EC
         ema_new = alpha * src + (1 - alpha) * ema_prev
-
         least_error = 1_000_000.0
         best_gain = 0.0
         for i in range(-GAIN_LIMIT, GAIN_LIMIT + 1):
@@ -224,92 +219,111 @@ class AdaptiveZeroLagEMA:
             if error < least_error:
                 least_error = error
                 best_gain = gain
-
         ec_new = alpha * (ema_new + best_gain * (src - ec_prev)) + (1 - alpha) * ec_prev
-
         self.EMA = ema_new
         self.EC  = ec_new
         self.LeastError = least_error
         self.BestGain   = best_gain
-
         return ema_prev, ec_prev, ema_new, ec_new
 
     # ═══════════════════════════════════════════════════════════════════════
-    # TRAILING STOP — replica strategy.exit do Pine
-    # loss=fixedSL ticks, trail_points=fixedTP ticks, trail_offset=15 ticks
+    # VERIFICA SE STOP FOI TOCADO (no close da barra)
+    # Agenda exit para o OPEN da próxima barra (igual ao Pine)
     # ═══════════════════════════════════════════════════════════════════════
-    def _check_exit(self, candle: Dict) -> Optional[Dict]:
-        if self.position_size == 0 or not self.exit_active:
-            return None
+    def _check_stop_touched(self, candle: Dict):
+        """
+        Verifica se high/low tocou o stop price nesta barra.
+        Se sim, AGENDA o exit para o próximo open (NÃO fecha agora).
+        Retorna True se exit foi agendado.
+        """
+        if self.position_size == 0 or not self.exit_active or self.exit_scheduled:
+            return False
 
-        high  = candle['high']
-        low   = candle['low']
-        close = candle['close']
-        ts    = candle.get('timestamp')
+        high = candle['high']
+        low  = candle['low']
 
         if self.position_size > 0:
-            # LONG
+            # LONG: atualiza pico e recalcula stop
             self.highest_price = max(self.highest_price, high)
             profit_ticks = (self.highest_price - self.position_avg_price) / self.tick_size
             if profit_ticks >= self.fixed_tp_points:
                 self.trailing_active = True
-
             stop = (self.highest_price - self.trail_offset * self.tick_size
                     if self.trailing_active
                     else self.position_avg_price - self.fixed_sl_points * self.tick_size)
-
+            self._stop_price = stop
             if low <= stop:
-                exit_price = min(close, stop)
-                qty = self.position_size
-                pnl = (exit_price - self.position_avg_price) * qty
-                self.net_profit += pnl
-                self.balance = self.initial_capital + self.net_profit
-                self.position_size = 0.0
-                self.position_avg_price = 0.0
-                self.highest_price = 0.0
-                self.trailing_active = False
-                self.exit_active = False
-                return {
-                    "action": "EXIT_LONG", "price": exit_price, "qty": qty,
-                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
-                    "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
-                }
+                self.exit_scheduled = True
+                self.exit_scheduled_side = "long"
+                return True
 
         elif self.position_size < 0:
-            # SHORT
+            # SHORT: atualiza fundo e recalcula stop
             self.lowest_price = min(self.lowest_price, low)
             profit_ticks = (self.position_avg_price - self.lowest_price) / self.tick_size
             if profit_ticks >= self.fixed_tp_points:
                 self.trailing_active = True
-
             stop = (self.lowest_price + self.trail_offset * self.tick_size
                     if self.trailing_active
                     else self.position_avg_price + self.fixed_sl_points * self.tick_size)
-
+            self._stop_price = stop
             if high >= stop:
-                exit_price = max(close, stop)
-                qty = abs(self.position_size)
-                pnl = (self.position_avg_price - exit_price) * qty
-                self.net_profit += pnl
-                self.balance = self.initial_capital + self.net_profit
-                self.position_size = 0.0
-                self.position_avg_price = 0.0
-                self.lowest_price = float('inf')
-                self.trailing_active = False
-                self.exit_active = False
-                return {
-                    "action": "EXIT_SHORT", "price": exit_price, "qty": qty,
-                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
-                    "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
-                }
+                self.exit_scheduled = True
+                self.exit_scheduled_side = "short"
+                return True
+
+        return False
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # EXECUTA EXIT AGENDADO no open da barra seguinte
+    # ═══════════════════════════════════════════════════════════════════════
+    def _execute_scheduled_exit(self, open_price: float, ts) -> Optional[Dict]:
+        if not self.exit_scheduled:
+            return None
+
+        # Pine: exit_price = stop_price (exceto se gapou além do stop)
+        if self.exit_scheduled_side == "long":
+            # Para long: min(stop, open) — se gapou para baixo, pega o open
+            exit_price = min(self._stop_price, open_price)
+            qty = self.position_size
+            pnl = (exit_price - self.position_avg_price) * qty
+            self.net_profit += pnl
+            self.balance = self.initial_capital + self.net_profit
+            self.position_size = 0.0
+            self.position_avg_price = 0.0
+            self.highest_price = 0.0
+            self.trailing_active = False
+            self.exit_active = False
+            self.exit_scheduled = False
+            self.exit_scheduled_side = ""
+            return {
+                "action": "EXIT_LONG", "price": exit_price, "qty": qty,
+                "pnl": pnl, "balance": self.balance, "timestamp": ts,
+                "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
+            }
+
+        elif self.exit_scheduled_side == "short":
+            # Para short: max(stop, open) — se gapou para cima, pega o open
+            exit_price = max(self._stop_price, open_price)
+            qty = abs(self.position_size)
+            pnl = (self.position_avg_price - exit_price) * qty
+            self.net_profit += pnl
+            self.balance = self.initial_capital + self.net_profit
+            self.position_size = 0.0
+            self.position_avg_price = 0.0
+            self.lowest_price = float('inf')
+            self.trailing_active = False
+            self.exit_active = False
+            self.exit_scheduled = False
+            self.exit_scheduled_side = ""
+            return {
+                "action": "EXIT_SHORT", "price": exit_price, "qty": qty,
+                "pnl": pnl, "balance": self.balance, "timestamp": ts,
+                "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"
+            }
 
         return None
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # LOTS — Pine: balance = initial_capital + netprofit
-    #              lots = (risk * balance) / (fixedSL * mintick)
-    #              lots > maxQty ? maxQty : lots
-    # ═══════════════════════════════════════════════════════════════════════
     def _calc_lots(self) -> float:
         balance = self.initial_capital + self.net_profit
         risk_amount    = self.risk_percent * balance
@@ -323,37 +337,37 @@ class AdaptiveZeroLagEMA:
     # MÉTODO PRINCIPAL
     # ═══════════════════════════════════════════════════════════════════════
     def next(self, candle: Dict) -> List[Dict]:
-        """
-        Processa um candle. Durante warmup_bars barras iniciais, calcula
-        indicadores mas NÃO abre posições (equivalente ao histórico do TradingView).
-        """
         open_p = candle['open']
         idx    = candle.get('index', 0)
         ts     = candle.get('timestamp')
         actions = []
 
-        # Incrementa contador de barras processadas pela estratégia
         self._bar_count += 1
         in_warmup = self._bar_count <= self.warmup_bars
 
         # ══════════════════════════════════════════════════════════════════
-        # PINE: pendingBuy := nz(pendingBuy[1])
-        #       if buy_signal[1]: pendingBuy := true
+        # OPEN: executa exits e entries agendados na barra anterior
         # ══════════════════════════════════════════════════════════════════
+
+        # 1. Exit agendado executa PRIMEIRO no open (Pine: exits antes de entries)
+        if not in_warmup:
+            exit_action = self._execute_scheduled_exit(open_p, ts)
+            if exit_action:
+                actions.append(exit_action)
+
+        # 2. Atualiza pending com sinal da barra anterior
         if self.buy_signal_prev:
             self.pending_buy = True
         if self.sell_signal_prev:
             self.pending_sell = True
 
-        # ══════════════════════════════════════════════════════════════════
-        # Executa entradas agendadas no OPEN (só fora do warmup)
-        # ══════════════════════════════════════════════════════════════════
+        # 3. Entries agendados executam no open (após o exit acima)
         if not in_warmup:
             balance = self.initial_capital + self.net_profit
 
             if self.entry_scheduled_long and balance > 0:
                 if self.position_size <= 0:
-                    # Fecha short se houver
+                    # Fecha short se houver (reversão)
                     if self.position_size < 0:
                         qty = abs(self.position_size)
                         pnl = (self.position_avg_price - open_p) * qty
@@ -366,6 +380,7 @@ class AdaptiveZeroLagEMA:
                         })
                         self.position_size = 0.0
                         self.exit_active = False
+                        self.exit_scheduled = False
                         self.trailing_active = False
 
                     lots = self._calc_lots()
@@ -376,6 +391,8 @@ class AdaptiveZeroLagEMA:
                         self.lowest_price = 0.0
                         self.trailing_active = False
                         self.exit_active = True
+                        self.exit_scheduled = False
+                        self._stop_price = open_p - self.fixed_sl_points * self.tick_size
                         self.balance = self.initial_capital + self.net_profit
                         actions.append({
                             "action": "BUY", "qty": lots, "price": open_p,
@@ -387,7 +404,7 @@ class AdaptiveZeroLagEMA:
 
             if self.entry_scheduled_short and balance > 0:
                 if self.position_size >= 0:
-                    # Fecha long se houver
+                    # Fecha long se houver (reversão)
                     if self.position_size > 0:
                         qty = self.position_size
                         pnl = (open_p - self.position_avg_price) * qty
@@ -400,6 +417,7 @@ class AdaptiveZeroLagEMA:
                         })
                         self.position_size = 0.0
                         self.exit_active = False
+                        self.exit_scheduled = False
                         self.trailing_active = False
 
                     lots = self._calc_lots()
@@ -410,6 +428,8 @@ class AdaptiveZeroLagEMA:
                         self.highest_price = float('inf')
                         self.trailing_active = False
                         self.exit_active = True
+                        self.exit_scheduled = False
+                        self._stop_price = open_p + self.fixed_sl_points * self.tick_size
                         self.balance = self.initial_capital + self.net_profit
                         actions.append({
                             "action": "SELL", "qty": lots, "price": open_p,
@@ -420,12 +440,13 @@ class AdaptiveZeroLagEMA:
                 self.entry_scheduled_short = False
 
         else:
-            # No warmup: descarta entradas agendadas (não foram abertas ainda)
+            # Warmup: descarta entradas/saídas agendadas
             self.entry_scheduled_long = False
             self.entry_scheduled_short = False
+            self.exit_scheduled = False
 
         # ══════════════════════════════════════════════════════════════════
-        # Calcula indicadores com CLOSE (sempre, inclusive no warmup)
+        # CLOSE: calcula indicadores
         # ══════════════════════════════════════════════════════════════════
         src = candle['close']
 
@@ -434,7 +455,6 @@ class AdaptiveZeroLagEMA:
                 self._calc_iq_ifm(src)
             if self.adaptive_method in ("Cos IFM", "Average"):
                 self._calc_cosine_ifm(src)
-
             if self.adaptive_method == "Cos IFM":
                 self.Period = max(1, int(round(self.lenC)))
             elif self.adaptive_method == "I-Q IFM":
@@ -448,7 +468,6 @@ class AdaptiveZeroLagEMA:
 
         ema_prev, ec_prev, ema_new, ec_new = self._calc_zero_lag_ema(src, self.Period)
 
-        # crossover(EC, EMA): EC[1] <= EMA[1] AND EC > EMA
         crossover  = (ec_prev <= ema_prev) and (ec_new > ema_new)
         crossunder = (ec_prev >= ema_prev) and (ec_new < ema_new)
         error_pct  = 100.0 * self.LeastError / src if src != 0 else 0.0
@@ -456,17 +475,15 @@ class AdaptiveZeroLagEMA:
         sell_signal = crossunder and (error_pct > self.threshold)
 
         # ══════════════════════════════════════════════════════════════════
-        # Trailing stop / SL (só fora do warmup, mas posição só existe fora)
+        # CLOSE: verifica se stop foi tocado → agenda exit para próximo open
         # ══════════════════════════════════════════════════════════════════
-        exit_action = self._check_exit(candle)
-        if exit_action:
-            actions.append(exit_action)
+        self._check_stop_touched(candle)
 
         # ══════════════════════════════════════════════════════════════════
-        # Agenda entrada para próximo candle
-        # Pine: if pendingBuy and pos<=0: strategy.entry (→ entra no próximo open)
-        # Durante warmup: processa pending mas descarta (entry_scheduled vai ser
-        # limpo no início do próximo next())
+        # CLOSE: agenda entry para próximo open se pending
+        # Pine: if pendingBuy and pos<=0: strategy.entry (→ executa no próximo open)
+        # Nota: se exit_scheduled=True nesta barra, position_size ainda > 0,
+        # então "pos<=0" é False → pending NÃO é consumido (igual ao Pine!)
         # ══════════════════════════════════════════════════════════════════
         if self.pending_buy and self.position_size <= 0:
             self.entry_scheduled_long = True
@@ -487,12 +504,11 @@ class AdaptiveZeroLagEMA:
         self.sell_signal_prev = sell_signal
 
         if idx % 100 == 0:
-            warmup_str = " [WARMUP]" if in_warmup else ""
+            wstr = " [WU]" if in_warmup else ""
             print(
-                f"📊 [{idx}]{warmup_str} P={self.Period} "
-                f"EC={ec_new:.2f} EMA={ema_new:.2f} diff={ec_new-ema_new:.4f} "
-                f"xo={crossover} xu={crossunder} err%={error_pct:.4f} "
-                f"pos={self.position_size:.4f} bal={self.balance:.2f}"
+                f"📊 [{idx}]{wstr} P={self.Period} EC={ec_new:.2f} EMA={ema_new:.2f} "
+                f"diff={ec_new-ema_new:.4f} xo={crossover} xu={crossunder} "
+                f"err%={error_pct:.4f} pos={self.position_size:.4f} bal={self.balance:.2f}"
             )
 
         return actions
