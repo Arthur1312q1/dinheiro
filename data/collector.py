@@ -6,12 +6,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 class OKXDataCollector:
-    def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 1500):
+    def __init__(self, symbol: str = "ETH-USDT", timeframe: str = "30m", limit: int = 4500):
         self.symbol = symbol.strip().upper().replace('/', '-').replace('_', '-')
         self.timeframe = self._convert_timeframe(timeframe)
         self.limit = limit
         self.base_url = "https://www.okx.com"
-        self.MAX_PER_REQUEST = 300  # OKX máximo por página
+        self.MAX_PER_REQUEST = 300
 
     def _convert_timeframe(self, tf: str) -> str:
         mapping = {
@@ -23,8 +23,8 @@ class OKXDataCollector:
 
     def _generate_mock_candles(self) -> pd.DataFrame:
         print("📊 Usando dados mockados (fallback)...")
-        base_price = 3200.0
-        volatility = 0.015
+        base_price = 2500.0
+        volatility = 0.012
         end_time = datetime.utcnow()
         delta = timedelta(minutes=30)
         candles = []
@@ -32,13 +32,13 @@ class OKXDataCollector:
         for i in range(self.limit):
             change = random.uniform(-volatility, volatility)
             price *= (1 + change)
-            price = max(price, base_price * 0.7)
-            high  = price * (1 + random.uniform(0, 0.005))
-            low   = price * (1 - random.uniform(0, 0.005))
+            price = max(price, base_price * 0.5)
+            high  = price * (1 + random.uniform(0, 0.004))
+            low   = price * (1 - random.uniform(0, 0.004))
             close = price * (1 + random.uniform(-0.002, 0.002))
             volume = random.uniform(5000, 15000)
-            timestamp = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
-            candles.append([timestamp, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
+            ts = int((end_time - delta * (self.limit - i)).timestamp() * 1000)
+            candles.append([ts, round(price,2), round(high,2), round(low,2), round(close,2), round(volume,2)])
         df = pd.DataFrame(candles, columns=['timestamp','open','high','low','close','volume'])
         df = df.copy()
         df.loc[:,'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -46,68 +46,60 @@ class OKXDataCollector:
 
     def fetch_ohlcv(self) -> pd.DataFrame:
         """
-        Busca candles da OKX com paginação automática.
-        OKX retorna no máximo 300 candles por request.
-        Usa o parâmetro 'after' para paginar para trás no tempo.
+        Busca candles da OKX com paginação automática (máx 300/request).
+        Usa parâmetro 'after' para paginar para trás no tempo.
         """
         print(f"🔍 Buscando {self.limit} candles de {self.symbol} ({self.timeframe})...")
-
         all_candles = []
         after = None
         pages = 0
 
         try:
             while len(all_candles) < self.limit:
-                params = {
-                    'instId': self.symbol,
-                    'bar':    self.timeframe,
-                    'limit':  min(self.MAX_PER_REQUEST, self.limit - len(all_candles))
-                }
+                batch = min(self.MAX_PER_REQUEST, self.limit - len(all_candles))
+                params = {'instId': self.symbol, 'bar': self.timeframe, 'limit': batch}
                 if after:
-                    params['after'] = after  # candles mais antigos que este timestamp
+                    params['after'] = after
 
-                response = requests.get(
-                    self.base_url + "/api/v5/market/candles",
-                    params=params, timeout=10
-                )
-                response.raise_for_status()
-                data = response.json()
+                resp = requests.get(self.base_url + "/api/v5/market/candles",
+                                    params=params, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
 
                 if data.get('code') != '0':
                     print(f"⚠️ Erro OKX: {data.get('msg')}")
                     return self._generate_mock_candles()
 
-                page_data = data.get('data', [])
-                if not page_data:
+                page = data.get('data', [])
+                if not page:
                     break
 
-                all_candles.extend(page_data)
+                all_candles.extend(page)
                 pages += 1
-                print(f"  📄 Página {pages}: +{len(page_data)} (total: {len(all_candles)})")
+                print(f"  📄 Página {pages}: +{len(page)} (total: {len(all_candles)})")
 
-                if len(page_data) < self.MAX_PER_REQUEST:
-                    break  # não há mais páginas
+                if len(page) < self.MAX_PER_REQUEST:
+                    break  # sem mais páginas
 
-                # oldest timestamp desta página → próxima página vai antes dele
-                after = page_data[-1][0]
+                after = page[-1][0]  # timestamp do candle mais antigo desta página
 
             if not all_candles:
-                print("⚠️ Nenhum candle da API, usando mock.")
+                print("⚠️ Sem dados, usando mock.")
                 return self._generate_mock_candles()
 
             # OKX retorna mais recente primeiro → inverte para ordem cronológica
             all_candles.reverse()
-            all_candles = all_candles[-self.limit:]  # garante exatamente `limit` candles
+            all_candles = all_candles[-self.limit:]
 
-            processed = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
-                         for c in all_candles]
+            rows = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                    for c in all_candles]
 
-            df = pd.DataFrame(processed, columns=['timestamp','open','high','low','close','volume'])
+            df = pd.DataFrame(rows, columns=['timestamp','open','high','low','close','volume'])
             df = df.copy()
             df.loc[:,'timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             print(f"✅ {len(df)} candles reais da OKX ({pages} página(s))")
             return df
 
         except Exception as e:
-            print(f"⚠️ Falha na API OKX: {e}")
+            print(f"⚠️ Falha OKX: {e}")
             return self._generate_mock_candles()
