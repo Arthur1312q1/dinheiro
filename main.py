@@ -15,7 +15,7 @@ from keepalive.webhook_receiver import webhook_bp
 from utils.env_loader import env, env_int, env_float
 
 # ============================================================================
-# FUNÇÃO AUXILIAR: NORMALIZA SÍMBOLO
+# NORMALIZA SÍMBOLO
 # ============================================================================
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
@@ -33,14 +33,15 @@ def normalize_symbol(symbol: str) -> str:
     return symbol
 
 # ============================================================================
-# CONFIGURAÇÕES DA ESTRATÉGIA
+# CONFIGURAÇÕES
 # ============================================================================
 FORCE_PERIOD = env_int("FORCE_PERIOD", None)
 
-# ✅ WARMUP_CANDLES: passado para a estratégia, NÃO removido do dataframe.
-# A estratégia processa esses candles para aquecer os indicadores
-# mas não abre posições neles — igual ao TradingView que usa todo o histórico.
-WARMUP_CANDLES = env_int("WARMUP_CANDLES", 200)
+# ✅ WARMUP: passado para a estratégia, NÃO removido do DataFrame.
+# A estratégia calcula indicadores no warmup mas NÃO abre posições.
+# Isso replica o comportamento do TradingView (que usa todo histórico disponível).
+# 300 candles de 30m ≈ 6 dias → suficiente para lenC convergir.
+WARMUP_CANDLES = env_int("WARMUP_CANDLES", 300)
 
 STRATEGY_CONFIG = {
     "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
@@ -53,23 +54,24 @@ STRATEGY_CONFIG = {
     "initial_capital": env_float("INITIAL_CAPITAL", 1000.0),
     "max_lots": env_int("MAX_LOTS", 100),
     "force_period": FORCE_PERIOD,
-    "warmup_bars": WARMUP_CANDLES,   # ← estratégia gerencia o warmup internamente
+    "warmup_bars": WARMUP_CANDLES,
 }
 
 # ============================================================================
-# CONFIGURAÇÕES DE COLETA DE DADOS
+# DADOS
 # ============================================================================
 RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
 SYMBOL = normalize_symbol(RAW_SYMBOL)
 TIMEFRAME = env("TIMEFRAME", "30m")
 
-# Total de candles = warmup + candles de backtest real
-# Ex: 200 warmup + 1300 reais = 1500 total
-BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 1500)
-CANDLE_LIMIT = BACKTEST_CANDLES
+# ✅ 4500 candles total:
+#    - 300 warmup
+#    - 4200 candles efetivos ≈ 2.9 meses de 30m
+#    Isso é equivalente ao período que gera ~800 trades no TradingView.
+BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 4500)
 
 # ============================================================================
-# CRIAÇÃO DA APLICAÇÃO FLASK
+# FLASK
 # ============================================================================
 app = Flask(__name__)
 app.register_blueprint(webhook_bp)
@@ -82,65 +84,58 @@ def root():
 def backtest_web():
     try:
         print("📍 Executando backtest...")
-
-        collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=BACKTEST_CANDLES)
         df = collector.fetch_ohlcv()
 
         if df.empty:
             return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
 
-        # ✅ NÃO removemos candles do df. O df completo vai para o engine.
-        # A estratégia usa warmup_bars internamente para não operar nas
-        # primeiras N barras, mas ainda processa os indicadores nelas.
         df['index'] = df.index
-
-        print(f"📈 {len(df)} candles totais ({WARMUP_CANDLES} warmup + {len(df)-WARMUP_CANDLES} backtest)")
+        effective = len(df) - WARMUP_CANDLES
+        print(f"📈 {len(df)} candles totais | warmup={WARMUP_CANDLES} | efetivos={effective}")
 
         strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-        engine = BacktestEngine(strategy, df)
-        results = engine.run()
+        engine   = BacktestEngine(strategy, df)
+        results  = engine.run()
 
-        print(f"📊 Relatório: {len(df)} candles, {results['total_trades']} trades")
+        print(f"📊 {results['total_trades']} trades em {effective} candles efetivos")
 
-        # Para o relatório, mostramos apenas os candles pós-warmup
+        # Relatório mostra apenas candles pós-warmup
         df_report = df.iloc[WARMUP_CANDLES:].reset_index(drop=True)
-        reporter = BacktestReporter(results, df_report)
-        html_content = reporter.generate_html()
+        reporter  = BacktestReporter(results, df_report)
+        html      = reporter.generate_html()
 
-        print("✅ Backtest concluído")
-        return render_template_string(html_content)
+        return render_template_string(html)
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"ERRO NO BACKTEST:\n{tb}")
+        print(f"ERRO:\n{tb}")
         return jsonify({"error": str(e), "traceback": tb.split('\n'), "status": "failed"}), 500
 
 # ============================================================================
 # BACKTEST LOCAL
 # ============================================================================
 def run_backtest():
-    print(f"🔍 Buscando {CANDLE_LIMIT} candles de {SYMBOL} ({TIMEFRAME})...")
-    collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+    print(f"🔍 Buscando {BACKTEST_CANDLES} candles de {SYMBOL} ({TIMEFRAME})...")
+    collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=BACKTEST_CANDLES)
     df = collector.fetch_ohlcv()
     print(f"✅ {len(df)} candles obtidos")
 
     df['index'] = df.index
-    print(f"📈 {WARMUP_CANDLES} candles de warmup interno, {len(df)-WARMUP_CANDLES} para backtest")
-
     strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-    engine = BacktestEngine(strategy, df)
-    results = engine.run()
+    engine   = BacktestEngine(strategy, df)
+    results  = engine.run()
 
     df_report = df.iloc[WARMUP_CANDLES:].reset_index(drop=True)
-    reporter = BacktestReporter(results, df_report)
+    reporter  = BacktestReporter(results, df_report)
     report_path = reporter.save_html('azlema_backtest_report.html')
-    print(f"✅ Relatório salvo: {report_path}")
+    print(f"✅ {results['total_trades']} trades | Relatório: {report_path}")
 
 # ============================================================================
-# PONTO DE ENTRADA
+# ENTRY POINT
 # ============================================================================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='AZLEMA Backtesting System')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
     args = parser.parse_args()
 
