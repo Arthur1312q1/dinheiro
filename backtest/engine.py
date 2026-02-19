@@ -1,5 +1,6 @@
 # backtest/engine.py
 import pandas as pd
+import numpy as np
 from typing import List, Dict, Any
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 
@@ -39,12 +40,30 @@ class BacktestEngine:
                 elif action['action'] in ('EXIT_LONG', 'EXIT_SHORT'):
                     # Encontra o último trade aberto (assumindo pyramiding=1)
                     if self.trades and 'exit_time' not in self.trades[-1]:
-                        self.trades[-1].update({
-                            'exit_time': action['timestamp'],
-                            'exit_price': action['price'],
-                            'pnl_usdt': action.get('pnl', 0),
-                            'pnl_percent': (action['price'] / self.trades[-1]['entry_price'] - 1) * 100,
-                            'exit_comment': action['comment']
+                        entry_trade = self.trades[-1]
+                        exit_action = action
+                        
+                        # Cálculo de PnL em USDT (já feito pela estratégia)
+                        pnl_usdt = exit_action.get('pnl', 0)
+                        
+                        # Cálculo de PnL em % (corrigido para LONG e SHORT)
+                        entry_price = entry_trade['entry_price']
+                        exit_price = exit_action['price']
+                        qty = entry_trade['qty']
+                        
+                        if entry_trade['action'] == 'BUY':
+                            # LONG: ganho quando preço sobe
+                            pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+                        else:
+                            # SHORT: ganho quando preço cai
+                            pnl_percent = ((entry_price - exit_price) / entry_price) * 100
+                        
+                        entry_trade.update({
+                            'exit_time': exit_action['timestamp'],
+                            'exit_price': exit_price,
+                            'pnl_usdt': pnl_usdt,
+                            'pnl_percent': pnl_percent,
+                            'exit_comment': exit_action['comment']
                         })
 
             self.equity_curve.append(self.strategy.balance)
@@ -71,22 +90,55 @@ class BacktestEngine:
         }
 
     def _calculate_max_drawdown(self) -> float:
-        if not self.equity_curve:
+        """
+        Calcula o máximo drawdown em % da curva de capital.
+        
+        Drawdown = (Peak - Current) / Peak * 100
+        Max Drawdown = máximo drawdown observado
+        """
+        if not self.equity_curve or len(self.equity_curve) < 2:
             return 0.0
+        
         peak = self.equity_curve[0]
         max_dd = 0.0
+        
         for value in self.equity_curve:
             if value > peak:
                 peak = value
-            dd = (peak - value) / peak * 100
+            
+            dd = ((peak - value) / peak) * 100
             if dd > max_dd:
                 max_dd = dd
+        
         return max_dd
 
-    def _calculate_sharpe(self) -> float:
+    def _calculate_sharpe(self, risk_free_rate: float = 0.0, periods_per_year: int = 252) -> float:
+        """
+        Calcula o Sharpe Ratio anualizado.
+        
+        Sharpe = (retorno médio - taxa livre de risco) / desvio padrão * sqrt(períodos por ano)
+        
+        Args:
+            risk_free_rate: Taxa livre de risco (padrão 0% a.a.)
+            periods_per_year: Períodos por ano (252 para diário, 252*24 para horário, etc)
+        """
         if len(self.equity_curve) < 2:
             return 0.0
-        returns = pd.Series(self.equity_curve).pct_change().dropna()
-        if returns.std() == 0:
+        
+        # Calcula retornos diários (ou periódicos)
+        equity_array = np.array(self.equity_curve)
+        returns = np.diff(equity_array) / equity_array[:-1]
+        
+        # Evita divisão por zero e valores muito pequenos
+        if len(returns) == 0 or np.std(returns) == 0:
             return 0.0
-        return (returns.mean() / returns.std()) * (48 * 365) ** 0.5
+        
+        # Sharpe ratio anualizado
+        excess_return = np.mean(returns) - (risk_free_rate / periods_per_year)
+        std_return = np.std(returns)
+        
+        if std_return == 0:
+            return 0.0
+        
+        sharpe = (excess_return / std_return) * np.sqrt(periods_per_year)
+        return float(sharpe)
