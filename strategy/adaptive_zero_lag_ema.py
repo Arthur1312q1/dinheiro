@@ -1,600 +1,542 @@
 # strategy/adaptive_zero_lag_ema.py
-# ═══════════════════════════════════════════════════════════════════════════
-# TRADUÇÃO FIEL AO PINE SCRIPT v3 - VERSÃO FINAL DEFINITIVA
 #
-# TODOS OS BUGS IDENTIFICADOS E CORRIGIDOS:
+# TRADUÇÃO EXATA DO PINE SCRIPT v3 — LINHA POR LINHA
+# Sem herança, sem complexidade, sem abstrações.
+# Cada variável aqui corresponde a uma variável do Pine.
 #
-# BUG #1 [CRÍTICO] ─ Python bloqueava pending quando exit_scheduled=True
-#   Pine: avalia pending no close usando position_size ATUAL (antes do exit)
-#   Não há bloqueio por exit_scheduled. Entry contrário cancela exit.
-#   Correção: remover bloqueio, processar pending normalmente no close.
+# Pine original (estrutura de execução):
+# ─────────────────────────────────────────────────────────────────────
+#   [CLOSE de cada barra, Pine executa:]
+#   1. Calcula src, IFM, Period
+#   2. Calcula EMA, EC (ZLEMA)
+#   3. buy_signal = crossover(EC,EMA) and threshold
+#   4. sell_signal = crossunder(EC,EMA) and threshold
+#   5. pendingBuy  := nz(pendingBuy[1])   ← herda da barra anterior
+#   6. pendingSell := nz(pendingSell[1])
+#   7. if buy_signal[1]:  pendingBuy  := true
+#   8. if sell_signal[1]: pendingSell := true
+#   9. if pendingBuy  and pos<=0: strategy.entry("BUY");  pendingBuy=false
+#  10. if pendingSell and pos>=0: strategy.entry("SELL"); pendingSell=false
 #
-# BUG #2 [CRÍTICO] ─ Crossover/Crossunder com < ao invés de <=
-#   Pine v3: crossover(x,y) = x[1] <= y[1] AND x > y  (usa <=)
-#             crossunder(x,y) = x[1] >= y[1] AND x < y  (usa >=)
-#   Correção: usar <= e >= nas comparações.
+#   [OPEN da barra seguinte, Pine executa as ordens agendadas]
+#   → entry orders têm prioridade: cancelam exits contrários
+#   → trailing stop executa se não houver entry contrário
 #
-# BUG #3 [MÉDIO] ─ Preço de execução do trailing stop
-#   Pine com calc_on_every_tick=false, slippage=0:
-#   Stop detectado no close → executa ao OPEN da próxima barra.
-#   O stop_price determina QUANDO ativa, não o preço de fill.
-#   Correção: exec_price = open_p (sempre o open).
-#
-# BUG #4 [MÉDIO] ─ Pine "last wins" quando pendingBuy e pendingSell simultâneos
-#   Se pos=0 e ambos pending: Pine agenda ambos, SELL vence (último call).
-#   Correção: se ambos pending com pos=0, apenas SELL é agendado.
-#
-# ═══════════════════════════════════════════════════════════════════════════
+# REGRAS FUNDAMENTAIS DO PINE (pyramiding=1, calc_on_every_tick=false):
+# ─────────────────────────────────────────────────────────────────────
+# R1: strategy.entry() contrário fecha posição atual e abre nova, tudo no open
+# R2: trailing stop detectado no close → executa no OPEN (ao preço do OPEN)
+# R3: crossover(a,b) = a[1] <= b[1] AND a > b  (Pine v3 usa <=)
+# R4: crossunder(a,b)= a[1] >= b[1] AND a < b  (Pine v3 usa >=)
+# R5: pending persiste de barra a barra até ser consumido (pos satisfeita)
+# R6: strategy.exit declarado na mesma barra do entry → trailing começa na entrada
+# R7: entry cancela exit agendado na mesma barra (entry vence)
+# R8: balance = initial_capital + netprofit (atualizado a cada trade)
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-PI = 3.14159265359
-RANGE = 50
-GAIN_LIMIT = 900
+_PI       = 3.14159265359
+_RANGE    = 50          # Pine: range = 50
+_GL       = 900         # Pine: GainLimit = 900
 
 
-@dataclass
 class AdaptiveZeroLagEMA:
-    # ── Parâmetros (idênticos ao Pine) ───────────────────────────────────
-    adaptive_method: str = "Cos IFM"
-    threshold: float = 0.0
-    fixed_sl_points: int = 2000
-    fixed_tp_points: int = 55
-    trail_offset: int = 15
-    risk_percent: float = 0.01
-    tick_size: float = 0.01
-    initial_capital: float = 1000.0
-    max_lots: int = 100
-    force_period: Optional[int] = None
-    warmup_bars: int = 300
 
-    # ── I-Q IFM ──────────────────────────────────────────────────────────
-    inphase_buffer: deque = field(default_factory=lambda: deque(maxlen=4))
-    quadrature_buffer: deque = field(default_factory=lambda: deque(maxlen=3))
-    re_prev: float = 0.0
-    im_prev: float = 0.0
-    deltaIQ_buffer: deque = field(default_factory=lambda: deque(maxlen=RANGE + 1))
-    instIQ: float = 0.0
-    lenIQ: float = 0.0
+    def __init__(
+        self,
+        adaptive_method: str   = "Cos IFM",
+        threshold:       float = 0.0,
+        fixed_sl_points: int   = 2000,
+        fixed_tp_points: int   = 55,
+        trail_offset:    int   = 15,
+        risk_percent:    float = 0.01,
+        tick_size:       float = 0.01,
+        initial_capital: float = 1000.0,
+        max_lots:        int   = 100,
+        force_period:    Optional[int] = None,
+        warmup_bars:     int   = 300,
+    ):
+        # ── config ───────────────────────────────────────────────────────
+        self.adaptive_method = adaptive_method
+        self.threshold       = threshold
+        self.fixed_sl        = fixed_sl_points
+        self.fixed_tp        = fixed_tp_points
+        self.trail_off       = trail_offset
+        self.risk            = risk_percent
+        self.tick            = tick_size
+        self.initial_capital = initial_capital
+        self.max_lots        = float(max_lots)
+        self.force_period    = force_period
+        self.warmup_bars     = warmup_bars
 
-    # ── Cosine IFM ────────────────────────────────────────────────────────
-    v1_prev: float = 0.0
-    s2: float = 0.0
-    s3: float = 0.0
-    deltaC_buffer: deque = field(default_factory=lambda: deque(maxlen=RANGE + 1))
-    instC: float = 0.0
-    lenC: float = 0.0
+        # ── Cosine IFM ───────────────────────────────────────────────────
+        self._src7  = deque([0.0]*8, maxlen=8)   # src - src[7]
+        self._v1p   = 0.0
+        self._s2    = 0.0
+        self._s3    = 0.0
+        self._dC    = deque([0.0]*(_RANGE+1), maxlen=_RANGE+1)
+        self._instC = 0.0
+        self._lenC  = 0.0
 
-    # ── ZLEMA ─────────────────────────────────────────────────────────────
-    EMA: float = 0.0
-    EC: float = 0.0
-    LeastError: float = 0.0
-    BestGain: float = 0.0
-    Period: int = 20
+        # ── I-Q IFM ──────────────────────────────────────────────────────
+        self._src7q = deque([0.0]*8, maxlen=8)
+        self._Pbuf  = deque([0.0]*5, maxlen=5)
+        self._ipbuf = deque([0.0]*4, maxlen=4)   # inphase history
+        self._qbuf  = deque([0.0]*3, maxlen=3)   # quadrature history
+        self._re    = 0.0
+        self._im    = 0.0
+        self._dIQ   = deque([0.0]*(_RANGE+1), maxlen=_RANGE+1)
+        self._instIQ= 0.0
+        self._lenIQ = 0.0
 
-    # ── Estado de sinal (Pine pendingBuy/pendingSell) ─────────────────────
-    pending_buy: bool = False
-    pending_sell: bool = False
-    buy_signal_prev: bool = False
-    sell_signal_prev: bool = False
+        # ── ZLEMA ────────────────────────────────────────────────────────
+        self.Period = 20
+        self._EMA   = 0.0   # EMA[1] (barra anterior)
+        self._EC    = 0.0   # EC[1]  (barra anterior)
+        self.LeastError = 0.0
 
-    # ── Agendamento (avaliado no close, executa no open seguinte) ─────────
-    entry_scheduled_long: bool = False
-    entry_scheduled_short: bool = False
-    exit_scheduled: bool = False
-    exit_scheduled_side: str = ""
-    exit_scheduled_reason: str = ""
+        # ── Sinais da barra anterior (Pine: buy_signal[1]) ───────────────
+        self._buy_prev  = False
+        self._sell_prev = False
 
-    # ── Estado da posição ────────────────────────────────────────────────
-    position_size: float = 0.0       # >0 long, <0 short, 0 flat
-    position_avg_price: float = 0.0
-    net_profit: float = 0.0
+        # ── Pending flags Pine (persistem entre barras) ───────────────────
+        self._pBuy  = False   # pendingBuy
+        self._pSell = False   # pendingSell
 
-    # ── Trailing stop ─────────────────────────────────────────────────────
-    highest_price: float = 0.0
-    lowest_price: float = 0.0
-    trailing_active: bool = False
-    exit_active: bool = False
-    _stop_price: float = 0.0
-    _bar_count: int = 0
+        # ── Orders agendadas para o próximo OPEN ──────────────────────────
+        # (zerados após execução)
+        self._el = False   # entry long  agendado
+        self._es = False   # entry short agendado
+        self._xe = False   # exit  agendado
+        self._xe_side = "" # "long" ou "short"
+        self._xe_stop = 0.0
 
-    # ── Buffers ───────────────────────────────────────────────────────────
-    _src_buf_iq: deque = field(default_factory=lambda: deque(maxlen=8))
-    _P_buf: deque = field(default_factory=lambda: deque(maxlen=5))
-    _src_buf_cos: deque = field(default_factory=lambda: deque(maxlen=8))
+        # ── Posição ───────────────────────────────────────────────────────
+        self.position_size  = 0.0    # >0 long, <0 short, 0 flat
+        self.position_price = 0.0    # preço médio de entrada
+        self.net_profit     = 0.0
+        self.balance        = initial_capital
 
-    balance: float = field(init=False)
+        # ── Trailing ─────────────────────────────────────────────────────
+        self._highest = 0.0
+        self._lowest  = float('inf')
+        self._trailing_active = False
+        self._exit_monitored  = False  # True quando strategy.exit está ativo
 
-    def __post_init__(self):
-        self.balance = self.initial_capital
-        for _ in range(4): self.inphase_buffer.append(0.0)
-        for _ in range(3): self.quadrature_buffer.append(0.0)
-        for _ in range(RANGE + 1):
-            self.deltaIQ_buffer.append(0.0)
-            self.deltaC_buffer.append(0.0)
-        for _ in range(8):
-            self._src_buf_iq.append(0.0)
-            self._src_buf_cos.append(0.0)
-        for _ in range(5): self._P_buf.append(0.0)
+        self._bar = 0   # contador de barras
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # IFM - I-Q Method
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════
+    # IFM Cosine — Pine v3 exato
+    # ═════════════════════════════════════════════════════════════════════
+    def _cosine_ifm(self, src: float) -> float:
+        self._src7.append(src)
+        v1   = src - self._src7[0]          # src - src[7]
+        v1_1 = self._v1p;  self._v1p = v1
 
-    def _calc_iq_ifm(self, src: float):
-        imult, qmult = 0.635, 0.338
-        self._src_buf_iq.append(src)
-        P = src - self._src_buf_iq[0]              # src - src[7]
-        self._P_buf.append(P)
-        pl = list(self._P_buf)                     # [P-4, P-3, P-2, P-1, P]
-        P_4, P_2, P_0 = pl[0], pl[2], pl[4]
-
-        ib = list(self.inphase_buffer)             # [ip-3, ip-2, ip-1, ip_last]
-        inphase_3, inphase_1 = ib[0], ib[2]
-
-        qb = list(self.quadrature_buffer)          # [q-2, q-1, q_last]
-        quad_2, quad_1 = qb[0], qb[1]
-
-        inph = 1.25 * (P_4 - imult * P_2) + imult * inphase_3
-        quad = P_2 - qmult * P_0 + qmult * quad_2
-        self.inphase_buffer.append(inph)
-        self.quadrature_buffer.append(quad)
-
-        re = 0.2 * (inph * inphase_1 + quad * quad_1) + 0.8 * self.re_prev
-        im = 0.2 * (inph * quad_1 - inphase_1 * quad) + 0.8 * self.im_prev
-        self.re_prev, self.im_prev = re, im
-
-        dIQ = math.atan(im / re) if re != 0.0 else 0.0
-        self.deltaIQ_buffer.append(dIQ)
-
-        dl = list(self.deltaIQ_buffer)
-        V = inst = 0.0
-        for i in range(RANGE + 1):
-            j = -(i + 1)
-            if abs(j) <= len(dl):
-                V += dl[j]
-                if V > 2 * PI and inst == 0.0:
-                    inst = float(i)
-        if inst == 0.0: inst = self.instIQ
-        self.instIQ = inst
-        self.lenIQ = 0.25 * inst + 0.75 * self.lenIQ
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # IFM - Cosine Method
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _calc_cosine_ifm(self, src: float):
-        self._src_buf_cos.append(src)
-        v1   = src - self._src_buf_cos[0]          # src - src[7]
-        v1_1 = self.v1_prev
-        self.v1_prev = v1
-
-        self.s2 = 0.2 * (v1_1 + v1) ** 2 + 0.8 * self.s2
-        self.s3 = 0.2 * (v1_1 - v1) ** 2 + 0.8 * self.s3
+        self._s2 = 0.2*(v1_1+v1)**2 + 0.8*self._s2
+        self._s3 = 0.2*(v1_1-v1)**2 + 0.8*self._s3
 
         v2 = 0.0
-        if self.s2 != 0.0:
-            r = self.s3 / self.s2
+        if self._s2 != 0.0:
+            r = self._s3/self._s2
             if r >= 0.0: v2 = math.sqrt(r)
 
-        dC = 2 * math.atan(v2) if self.s3 != 0.0 else 0.0
-        self.deltaC_buffer.append(dC)
+        dC = 2.0*math.atan(v2) if self._s3 != 0.0 else 0.0
+        self._dC.append(dC)
 
-        dl = list(self.deltaC_buffer)
-        v4 = inst = 0.0
-        for i in range(RANGE + 1):
-            j = -(i + 1)
+        dl   = list(self._dC)
+        v4   = 0.0
+        inst = 0.0
+        for i in range(_RANGE+1):           # i = 0..50 (51 iter)
+            j = -(i+1)
             if abs(j) <= len(dl):
                 v4 += dl[j]
-                if v4 > 2 * PI and inst == 0.0:
-                    inst = float(i - 1)
-        if inst == 0.0: inst = self.instC
-        self.instC = inst
-        self.lenC = 0.25 * inst + 0.75 * self.lenC
+                if v4 > 2*_PI and inst == 0.0:
+                    inst = float(i-1)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Zero-Lag EMA
-    # ═══════════════════════════════════════════════════════════════════════
+        if inst == 0.0: inst = self._instC
+        self._instC = inst
+        self._lenC  = 0.25*inst + 0.75*self._lenC
+        return self._lenC
 
-    def _calc_zero_lag_ema(self, src: float, period: int):
-        """
-        Fiel ao Pine v3.
-        Loop usa EC[1] = ec_prev (mesmo para todas as iterações).
-        """
-        alpha = 2.0 / (period + 1)
-        ema_prev = self.EMA
-        ec_prev  = self.EC
+    # ═════════════════════════════════════════════════════════════════════
+    # IFM I-Q — Pine v3 exato
+    # ═════════════════════════════════════════════════════════════════════
+    def _iq_ifm(self, src: float) -> float:
+        imult, qmult = 0.635, 0.338
+        self._src7q.append(src)
+        P = src - self._src7q[0]            # src - src[7]
+        self._Pbuf.append(P)
+        pl = list(self._Pbuf)               # [P-4, P-3, P-2, P-1, P]
 
-        ema = alpha * src + (1 - alpha) * ema_prev
+        ib = list(self._ipbuf)              # [ip-3, ip-2, ip-1, ip_last] before append
+        qb = list(self._qbuf)
 
-        le, bg = 1_000_000.0, 0.0
-        for i in range(-GAIN_LIMIT, GAIN_LIMIT + 1):
-            g    = i / 10.0
-            ec_c = alpha * (ema + g * (src - ec_prev)) + (1 - alpha) * ec_prev
+        inph = 1.25*(pl[0] - imult*pl[2]) + imult*ib[0]
+        quad = pl[2] - qmult*pl[4] + qmult*qb[0]
+
+        inph_1 = ib[2]
+        quad_1 = qb[1]
+
+        self._ipbuf.append(inph)
+        self._qbuf.append(quad)
+
+        re = 0.2*(inph*inph_1 + quad*quad_1) + 0.8*self._re
+        im = 0.2*(inph*quad_1 - inph_1*quad) + 0.8*self._im
+        self._re, self._im = re, im
+
+        dIQ = math.atan(im/re) if re != 0.0 else 0.0
+        self._dIQ.append(dIQ)
+
+        dl = list(self._dIQ)
+        V = 0.0; inst = 0.0
+        for i in range(_RANGE+1):
+            j = -(i+1)
+            if abs(j) <= len(dl):
+                V += dl[j]
+                if V > 2*_PI and inst == 0.0:
+                    inst = float(i)
+
+        if inst == 0.0: inst = self._instIQ
+        self._instIQ = inst
+        self._lenIQ  = 0.25*inst + 0.75*self._lenIQ
+        return self._lenIQ
+
+    # ═════════════════════════════════════════════════════════════════════
+    # ZLEMA — Pine v3 exato
+    # EC usa EC[1] (self._EC = barra anterior) para TODAS as iterações do loop
+    # ═════════════════════════════════════════════════════════════════════
+    def _zlema(self, src: float, period: int):
+        alpha   = 2.0 / (period + 1)
+        ema_prv = self._EMA
+        ec_prv  = self._EC
+
+        ema = alpha*src + (1-alpha)*ema_prv
+
+        le = 1_000_000.0; bg = 0.0
+        for i in range(-_GL, _GL+1):       # -900..900 (1801 iter)
+            g    = i/10.0
+            ec_c = alpha*(ema + g*(src - ec_prv)) + (1-alpha)*ec_prv
             e    = abs(src - ec_c)
-            if e < le:
-                le, bg = e, g
+            if e < le: le = e; bg = g
 
-        ec = alpha * (ema + bg * (src - ec_prev)) + (1 - alpha) * ec_prev
-        self.EMA, self.EC = ema, ec
-        self.LeastError, self.BestGain = le, bg
+        ec = alpha*(ema + bg*(src - ec_prv)) + (1-alpha)*ec_prv
+        self._EMA = ema
+        self._EC  = ec
+        self.LeastError = le
 
-        return ema_prev, ec_prev, ema, ec   # (prev, prev, curr, curr)
+        return ema_prv, ec_prv, ema, ec   # retorna ANTERIOR e ATUAL
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Trailing Stop / Stop Loss
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════
+    # OPEN: executa ordens agendadas
+    #
+    # ORDEM NO PINE (pyramiding=1):
+    # 1. Se entry contrário agendado → entry VENCE (cancela _xe, reverte)
+    # 2. Se exit agendado sem entry contrário → exit executa
+    # 3. Se entry mesmo lado com pos=0 → entry executa
+    # ═════════════════════════════════════════════════════════════════════
+    def _execute_open(self, open_p: float, ts) -> List[Dict]:
+        acts = []
+        el, es = self._el, self._es
+        
+        bal = self.initial_capital + self.net_profit
+        if bal <= 0:
+            self._el = self._es = False
+            return acts
 
-    def _check_stop_touched(self, candle: Dict) -> bool:
-        """
-        Verifica HIGH/LOW do candle para ativação do stop/trail.
-        Se ativado: exit_scheduled=True → executa no open da próxima barra.
-        """
-        if self.position_size == 0 or not self.exit_active or self.exit_scheduled:
-            return False
+        # ── Entry contrário → reversão (cancela exit, fecha e reabre) ────
+        if el and self.position_size < 0:
+            # fecha SHORT
+            acts.append(self._close_pos(open_p, ts, "REVERSAL"))
+            # abre LONG
+            a = self._open_long(open_p, ts)
+            if a: acts.append(a)
+            self._el = False
 
-        h, l = candle['high'], candle['low']
+        elif es and self.position_size > 0:
+            # fecha LONG
+            acts.append(self._close_pos(open_p, ts, "REVERSAL"))
+            # abre SHORT
+            a = self._open_short(open_p, ts)
+            if a: acts.append(a)
+            self._es = False
 
-        if self.position_size > 0:                             # LONG
-            self.highest_price = max(self.highest_price, h)
-            pt = (self.highest_price - self.position_avg_price) / self.tick_size
-            if pt >= self.fixed_tp_points:
-                self.trailing_active = True
-            stop = (self.highest_price - self.trail_offset * self.tick_size
-                    if self.trailing_active
-                    else self.position_avg_price - self.fixed_sl_points * self.tick_size)
-            self._stop_price = stop
+        # ── Exit agendado (sem entry contrário) ───────────────────────────
+        elif self._xe and self.position_size != 0.0:
+            a = self._do_exit(open_p, ts)
+            if a: acts.append(a)
+
+        # ── Entry flat (pos=0) ────────────────────────────────────────────
+        if el and self.position_size == 0.0:
+            a = self._open_long(open_p, ts)
+            if a: acts.append(a)
+            self._el = False
+
+        if es and self.position_size == 0.0:
+            a = self._open_short(open_p, ts)
+            if a: acts.append(a)
+            self._es = False
+
+        return acts
+
+    # ═════════════════════════════════════════════════════════════════════
+    # CLOSE: verifica trailing stop
+    # Pine: verifica HIGH/LOW do candle
+    # Se ativado: exit agendado para próximo OPEN (exec_price = open)
+    # ═════════════════════════════════════════════════════════════════════
+    def _check_trail(self, h: float, l: float):
+        if self.position_size == 0.0 or not self._exit_monitored or self._xe:
+            return
+
+        if self.position_size > 0:   # LONG
+            self._highest = max(self._highest, h)
+            pt = (self._highest - self.position_price) / self.tick
+            if pt >= self.fixed_tp:
+                self._trailing_active = True
+            stop = (self._highest - self.trail_off*self.tick
+                    if self._trailing_active
+                    else self.position_price - self.fixed_sl*self.tick)
             if l <= stop:
-                self.exit_scheduled      = True
-                self.exit_scheduled_side = "long"
-                self.exit_scheduled_reason = "TRAIL" if self.trailing_active else "SL"
-                return True
+                self._xe      = True
+                self._xe_side = "long"
+                self._xe_stop = stop
+                self._xe_rsn  = "TRAIL" if self._trailing_active else "SL"
 
-        elif self.position_size < 0:                           # SHORT
-            self.lowest_price = min(self.lowest_price, l)
-            pt = (self.position_avg_price - self.lowest_price) / self.tick_size
-            if pt >= self.fixed_tp_points:
-                self.trailing_active = True
-            stop = (self.lowest_price + self.trail_offset * self.tick_size
-                    if self.trailing_active
-                    else self.position_avg_price + self.fixed_sl_points * self.tick_size)
-            self._stop_price = stop
+        elif self.position_size < 0:  # SHORT
+            self._lowest = min(self._lowest, l)
+            pt = (self.position_price - self._lowest) / self.tick
+            if pt >= self.fixed_tp:
+                self._trailing_active = True
+            stop = (self._lowest + self.trail_off*self.tick
+                    if self._trailing_active
+                    else self.position_price + self.fixed_sl*self.tick)
             if h >= stop:
-                self.exit_scheduled      = True
-                self.exit_scheduled_side = "short"
-                self.exit_scheduled_reason = "TRAIL" if self.trailing_active else "SL"
-                return True
+                self._xe      = True
+                self._xe_side = "short"
+                self._xe_stop = stop
+                self._xe_rsn  = "TRAIL" if self._trailing_active else "SL"
 
-        return False
+    # ═════════════════════════════════════════════════════════════════════
+    # CLOSE: agenda entries (EXATAMENTE como Pine)
+    # ═════════════════════════════════════════════════════════════════════
+    def _schedule_entries(self, in_warmup: bool, idx: int):
+        # Pine: propaga sinais da barra anterior para pending
+        if self._buy_prev:  self._pBuy  = True
+        if self._sell_prev: self._pSell = True
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Helpers de execução
-    # ═══════════════════════════════════════════════════════════════════════
+        if in_warmup:
+            # Pine não tem warmup, mas iniciamos indicadores.
+            # Durante warmup, consumimos pending sem executar.
+            if self._pBuy  and self.position_size <= 0.0: self._pBuy  = False
+            if self._pSell and self.position_size >= 0.0: self._pSell = False
+            return
 
-    def _exec_exit(self, open_p: float, ts) -> Optional[Dict]:
+        # ── Pine if #1: pendingBuy and pos<=0 ─────────────────────────
+        if self._pBuy and self.position_size <= 0.0:
+            self._el   = True
+            self._pBuy = False
+
+        # ── Pine if #2: pendingSell and pos>=0 (INDEPENDENTE do #1) ───
+        # Se pos=0 e ambos: SELL sobrescreve BUY (Pine "last wins")
+        if self._pSell and self.position_size >= 0.0:
+            self._es    = True
+            self._pSell = False
+            # Pine last-wins: se BUY também foi agendado e pos=0, SELL cancela BUY
+            if self._el and self.position_size == 0.0:
+                self._el = False
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Helpers de posição
+    # ═════════════════════════════════════════════════════════════════════
+    def _calc_lots(self) -> float:
+        bal    = self.initial_capital + self.net_profit
+        sl_usd = self.fixed_sl * self.tick
+        if sl_usd <= 0.0 or bal <= 0.0: return 0.0
+        return min((self.risk * bal) / sl_usd, self.max_lots)
+
+    def _open_long(self, price: float, ts) -> Optional[Dict]:
+        lots = self._calc_lots()
+        if lots <= 0.0: return None
+        self.position_size  =  lots
+        self.position_price =  price
+        self._highest       =  price
+        self._lowest        =  float('inf')
+        self._trailing_active = False
+        self._exit_monitored  = True
+        self._xe              = False   # cancela exit pendente anterior
+        self.balance = self.initial_capital + self.net_profit
+        return {"action": "BUY", "price": price, "qty": lots,
+                "balance": self.balance, "timestamp": ts,
+                "comment": "ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
+
+    def _open_short(self, price: float, ts) -> Optional[Dict]:
+        lots = self._calc_lots()
+        if lots <= 0.0: return None
+        self.position_size  = -lots
+        self.position_price =  price
+        self._lowest        =  price
+        self._highest       =  float('inf')
+        self._trailing_active = False
+        self._exit_monitored  = True
+        self._xe              = False
+        self.balance = self.initial_capital + self.net_profit
+        return {"action": "SELL", "price": price, "qty": lots,
+                "balance": self.balance, "timestamp": ts,
+                "comment": "ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
+
+    def _close_pos(self, price: float, ts, reason: str = "REVERSAL") -> Dict:
+        """Fecha posição ao preço de open (reversão ou exit)."""
+        # Cancela exit pendente — entry vence
+        self._xe = False
+
+        if self.position_size > 0:
+            qty = self.position_size
+            pnl = (price - self.position_price) * qty
+            side = "EXIT_LONG"
+        else:
+            qty = abs(self.position_size)
+            pnl = (self.position_price - price) * qty
+            side = "EXIT_SHORT"
+
+        self.net_profit += pnl
+        self.balance     = self.initial_capital + self.net_profit
+        self._reset_pos()
+        return {"action": side, "price": price, "qty": qty, "pnl": pnl,
+                "balance": self.balance, "timestamp": ts, "exit_reason": reason,
+                "comment": f"EXIT-{'LONG' if side=='EXIT_LONG' else 'SHORT'}_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
+
+    def _do_exit(self, open_p: float, ts) -> Optional[Dict]:
         """
-        Executa exit por stop/trail.
-        Pine calc_on_every_tick=false, slippage=0 → exec_price = open_p.
+        Executa exit por trailing/SL.
+        Pine calc_on_every_tick=false, slippage=0:
+          exec_price = open_p (sempre o open da próxima barra)
         """
-        side = self.exit_scheduled_side
-        r    = self.exit_scheduled_reason
+        side = self._xe_side
+        rsn  = self._xe_rsn
 
         if side == "long" and self.position_size > 0:
             qty = self.position_size
-            pnl = (open_p - self.position_avg_price) * qty
+            pnl = (open_p - self.position_price) * qty
             self.net_profit += pnl
-            self.balance = self.initial_capital + self.net_profit
+            self.balance     = self.initial_capital + self.net_profit
             self._reset_pos()
             return {"action": "EXIT_LONG", "price": open_p, "qty": qty,
-                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
-                    "exit_reason": r,
+                    "pnl": pnl, "balance": self.balance,
+                    "timestamp": ts, "exit_reason": rsn,
                     "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
 
         elif side == "short" and self.position_size < 0:
             qty = abs(self.position_size)
-            pnl = (self.position_avg_price - open_p) * qty
+            pnl = (self.position_price - open_p) * qty
             self.net_profit += pnl
-            self.balance = self.initial_capital + self.net_profit
+            self.balance     = self.initial_capital + self.net_profit
             self._reset_pos()
             return {"action": "EXIT_SHORT", "price": open_p, "qty": qty,
-                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
-                    "exit_reason": r,
+                    "pnl": pnl, "balance": self.balance,
+                    "timestamp": ts, "exit_reason": rsn,
                     "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
         return None
 
-    def _exec_close(self, open_p: float, ts, reason: str = "REVERSAL") -> Optional[Dict]:
-        """
-        Fecha posição ao open_price (reversão).
-        Cancela qualquer exit agendado (Pine: entry cancela exit).
-        """
-        if self.position_size == 0:
-            return None
-        self.exit_scheduled = False
-        self.exit_scheduled_side = ""
-        self.exit_scheduled_reason = ""
-
-        if self.position_size > 0:
-            qty = self.position_size
-            pnl = (open_p - self.position_avg_price) * qty
-            self.net_profit += pnl
-            self.balance = self.initial_capital + self.net_profit
-            self._reset_pos()
-            return {"action": "EXIT_LONG", "price": open_p, "qty": qty,
-                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
-                    "exit_reason": reason,
-                    "comment": "EXIT-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
-        else:
-            qty = abs(self.position_size)
-            pnl = (self.position_avg_price - open_p) * qty
-            self.net_profit += pnl
-            self.balance = self.initial_capital + self.net_profit
-            self._reset_pos()
-            return {"action": "EXIT_SHORT", "price": open_p, "qty": qty,
-                    "pnl": pnl, "balance": self.balance, "timestamp": ts,
-                    "exit_reason": reason,
-                    "comment": "EXIT-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
-
-    def _exec_long(self, open_p: float, ts, idx: int) -> Optional[Dict]:
-        lots = self._calc_lots()
-        if lots <= 0: return None
-        self.position_size      = lots
-        self.position_avg_price = open_p
-        self.highest_price      = open_p
-        self.lowest_price       = float('inf')
-        self.trailing_active    = False
-        self.exit_active        = True
-        self.exit_scheduled     = False
-        self._stop_price        = open_p - self.fixed_sl_points * self.tick_size
-        self.balance            = self.initial_capital + self.net_profit
-        print(f"✅ LONG  [{idx}] @ {open_p:.2f} qty={lots:.4f} bal={self.balance:.2f}")
-        return {"action": "BUY", "qty": lots, "price": open_p, "balance": self.balance,
-                "timestamp": ts,
-                "comment": "ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
-
-    def _exec_short(self, open_p: float, ts, idx: int) -> Optional[Dict]:
-        lots = self._calc_lots()
-        if lots <= 0: return None
-        self.position_size      = -lots
-        self.position_avg_price = open_p
-        self.lowest_price       = open_p
-        self.highest_price      = float('inf')
-        self.trailing_active    = False
-        self.exit_active        = True
-        self.exit_scheduled     = False
-        self._stop_price        = open_p + self.fixed_sl_points * self.tick_size
-        self.balance            = self.initial_capital + self.net_profit
-        print(f"✅ SHORT [{idx}] @ {open_p:.2f} qty={lots:.4f} bal={self.balance:.2f}")
-        return {"action": "SELL", "qty": lots, "price": open_p, "balance": self.balance,
-                "timestamp": ts,
-                "comment": "ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7"}
-
     def _reset_pos(self):
-        self.position_size      = 0.0
-        self.position_avg_price = 0.0
-        self.highest_price      = 0.0
-        self.lowest_price       = float('inf')
-        self.trailing_active    = False
-        self.exit_active        = False
-        self.exit_scheduled     = False
-        self.exit_scheduled_side = ""
-        self.exit_scheduled_reason = ""
+        self.position_size    = 0.0
+        self.position_price   = 0.0
+        self._highest         = 0.0
+        self._lowest          = float('inf')
+        self._trailing_active = False
+        self._exit_monitored  = False
+        self._xe              = False
+        self._xe_side         = ""
 
-    def _calc_lots(self) -> float:
-        bal    = self.initial_capital + self.net_profit
-        sl_usd = self.fixed_sl_points * self.tick_size
-        if sl_usd <= 0: return 0.0
-        return min((self.risk_percent * bal) / sl_usd, float(self.max_lots))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # MAIN LOOP
-    # ═══════════════════════════════════════════════════════════════════════
-
+    # ═════════════════════════════════════════════════════════════════════
+    # MAIN — chamado pelo engine para cada candle
+    # ═════════════════════════════════════════════════════════════════════
     def next(self, candle: Dict) -> List[Dict]:
         """
-        Processa um candle.
+        Processa um candle. Retorna lista de ações (trades).
 
-        ━━━━ FLUXO FIEL AO PINE v3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        OPEN (início de cada barra):
-        ┌─────────────────────────────────────────────────────────────────┐
-        │ Pine executa ordens na seguinte ordem de prioridade:            │
-        │                                                                 │
-        │ PRIORIDADE 1: Entry contrário agendado                         │
-        │   → Cancela exit_scheduled                                     │
-        │   → Fecha posição atual ao open (reversão)                     │
-        │   → Abre nova posição ao open                                  │
-        │                                                                 │
-        │ PRIORIDADE 2: Exit por stop/trail (se não há entry contrário)  │
-        │   → Executa ao open (slippage=0, calc_on_every_tick=false)     │
-        │                                                                 │
-        │ PRIORIDADE 3: Entry novo (flat → posição)                      │
-        │   → Executa ao open                                            │
-        └─────────────────────────────────────────────────────────────────┘
-
-        CLOSE (fim de cada barra):
-        ┌─────────────────────────────────────────────────────────────────┐
-        │ 1. Calcula IFM (período adaptativo)                             │
-        │ 2. Calcula ZLEMA (EC e EMA)                                     │
-        │ 3. Crossover/crossunder (com <=/>= como Pine v3)               │
-        │ 4. Verifica stop/trail no H/L → exit_scheduled                 │
-        │ 5. Propaga sinais: buy_signal_prev → pending_buy               │
-        │ 6. Avalia pending → agenda entry para próximo open             │
-        │                                                                 │
-        │ CRÍTICO: pending é avaliado com position_size ATUAL.            │
-        │ exit_scheduled NÃO bloqueia o agendamento de entries!          │
-        │ (Pine não faz isso - entry contrário cancela exit no open)     │
-        │                                                                 │
-        │ PINE "LAST WINS": se pos=0 e ambos pending, SELL vence         │
-        └─────────────────────────────────────────────────────────────────┘
+        SEQUÊNCIA FIEL AO PINE:
+        ┌─────────────────────────────────────────────────────────────┐
+        │ OPEN:  executa ordens agendadas no close anterior           │
+        │ CLOSE: calcula indicadores → sinais → trailing → agenda     │
+        └─────────────────────────────────────────────────────────────┘
         """
-        open_p  = candle['open']
-        idx     = candle.get('index', 0)
-        ts      = candle.get('timestamp')
+        self._bar += 1
+        in_warmup = (self._bar <= self.warmup_bars)
+
+        open_p = candle['open']
+        h      = candle['high']
+        l      = candle['low']
+        src    = candle['close']
+        ts     = candle.get('timestamp', self._bar)
+        idx    = candle.get('index',     self._bar)
+
         actions: List[Dict] = []
 
-        self._bar_count += 1
-        in_warmup = self._bar_count <= self.warmup_bars
-
-        # ──────────────────────────────────────────────────────────────────
-        # FASE OPEN
-        # ──────────────────────────────────────────────────────────────────
-        if not in_warmup and (self.initial_capital + self.net_profit) > 0:
-
-            el = self.entry_scheduled_long
-            es = self.entry_scheduled_short
-
-            # ── Prioridade 1: entry contrário → reversão ──────────────────
-            # Entry contrário cancela exit_scheduled e inverte posição.
-            # Pine strategy.entry() com pyramiding=1 é sempre atômico.
-            if el and self.position_size < 0:
-                # Estava SHORT → reverte para LONG
-                rev = self._exec_close(open_p, ts, "REVERSAL")
-                if rev: actions.append(rev)
-                act = self._exec_long(open_p, ts, idx)
-                if act: actions.append(act)
-                self.entry_scheduled_long = False
-
-            elif es and self.position_size > 0:
-                # Estava LONG → reverte para SHORT
-                rev = self._exec_close(open_p, ts, "REVERSAL")
-                if rev: actions.append(rev)
-                act = self._exec_short(open_p, ts, idx)
-                if act: actions.append(act)
-                self.entry_scheduled_short = False
-
-            # ── Prioridade 2: exit por stop/trail ─────────────────────────
-            # Só executa se não houve reversão acima
-            elif self.exit_scheduled and self.position_size != 0:
-                act = self._exec_exit(open_p, ts)
-                if act: actions.append(act)
-                # Limpa flags de entry que possam existir
-                # (não deveria ter entry após exit sem reversão, mas por segurança)
-
-            # ── Prioridade 3: entry novo (flat) ───────────────────────────
-            # Executa se pos=0 (pode ter chegado aqui direto ou após exit acima)
-            if el and self.position_size == 0:
-                act = self._exec_long(open_p, ts, idx)
-                if act: actions.append(act)
-                self.entry_scheduled_long = False
-
-            if es and self.position_size == 0:
-                act = self._exec_short(open_p, ts, idx)
-                if act: actions.append(act)
-                self.entry_scheduled_short = False
-
-        else:
-            self.entry_scheduled_long  = False
-            self.entry_scheduled_short = False
-
-        # ──────────────────────────────────────────────────────────────────
-        # FASE CLOSE: Indicadores
-        # ──────────────────────────────────────────────────────────────────
-        src = candle['close']
-
-        if self.force_period is None:
-            if self.adaptive_method in ("I-Q IFM", "Average"):
-                self._calc_iq_ifm(src)
-            if self.adaptive_method in ("Cos IFM", "Average"):
-                self._calc_cosine_ifm(src)
-            if   self.adaptive_method == "Cos IFM":
-                self.Period = max(1, int(round(self.lenC)))
-            elif self.adaptive_method == "I-Q IFM":
-                self.Period = max(1, int(round(self.lenIQ)))
-            elif self.adaptive_method == "Average":
-                self.Period = max(1, int(round((self.lenC + self.lenIQ) / 2)))
-            else:
-                self.Period = 20
-        else:
-            self.Period = max(1, self.force_period)
-
-        ema_prev, ec_prev, ema, ec = self._calc_zero_lag_ema(src, self.Period)
-
-        # ── Crossover / Crossunder (Pine v3: usa <= e >=) ─────────────────
-        buy_signal  = (ec_prev <= ema_prev) and (ec > ema)
-        sell_signal = (ec_prev >= ema_prev) and (ec < ema)
-
-        # Filtro de threshold
-        err = 100.0 * self.LeastError / src if src != 0 else 0.0
-        buy_signal  = buy_signal  and (err > self.threshold)
-        sell_signal = sell_signal and (err > self.threshold)
-
-        # ── Verifica stop/trail no candle ─────────────────────────────────
-        self._check_stop_touched(candle)
-
-        # ──────────────────────────────────────────────────────────────────
-        # FASE CLOSE: Agenda entries (FIEL AO PINE v3)
-        # ──────────────────────────────────────────────────────────────────
-        #
-        # Pine executa no close (avalia pending com position_size atual):
-        #
-        #   pendingBuy  := nz(pendingBuy[1])       ← herda
-        #   pendingSell := nz(pendingSell[1])       ← herda
-        #   if buy_signal[1]:  pendingBuy  := true
-        #   if sell_signal[1]: pendingSell := true
-        #
-        #   if (pendingBuy  and pos <= 0): strategy.entry("BUY");  pendingBuy=false
-        #   if (pendingSell and pos >= 0): strategy.entry("SELL"); pendingSell=false
-        #
-        # NOTAS:
-        # 1. exit_scheduled NÃO bloqueia avaliação de pending.
-        #    Pine avalia pending com position_size atual (antes do exit).
-        #    Se entry contrário → cancela exit no próximo open (reversão).
-        #
-        # 2. Pine usa dois IFs independentes (não elif).
-        #    Se pos=0 e ambos pending → ambos seriam agendados.
-        #    Pine "last wins": SELL sobrescreve BUY.
-        #
-        # 3. Pine não zera pending se a condição não foi satisfeita.
-        #    (ex: pending_buy com pos>0 → pending_buy permanece True)
-
-        # Propaga sinais da barra anterior
-        if self.buy_signal_prev:
-            self.pending_buy = True
-        if self.sell_signal_prev:
-            self.pending_sell = True
-
+        # ── OPEN ──────────────────────────────────────────────────────────
         if not in_warmup:
-            # Pine if #1: pendingBuy and pos <= 0
-            if self.pending_buy and self.position_size <= 0:
-                self.entry_scheduled_long = True
-                self.pending_buy = False
-                print(f"🚀 Long agendado → [{idx + 1}] pos={self.position_size:.3f}")
-
-            # Pine if #2: pendingSell and pos >= 0 (independente do if #1!)
-            # Se pos=0 e ambos pending: SELL sobrescreve LONG (last wins)
-            if self.pending_sell and self.position_size >= 0:
-                self.entry_scheduled_short = True
-                # Se BUY foi agendado acima E pos era 0: SELL cancela BUY (Pine last wins)
-                if self.entry_scheduled_long and self.position_size == 0:
-                    self.entry_scheduled_long = False
-                self.pending_sell = False
-                print(f"🚀 Short agendado → [{idx + 1}] pos={self.position_size:.3f}")
-
+            actions.extend(self._execute_open(open_p, ts))
         else:
-            # Warmup: consome pending sem executar
-            if self.pending_buy and self.position_size <= 0:
-                self.pending_buy = False
-            if self.pending_sell and self.position_size >= 0:
-                self.pending_sell = False
+            # Warmup: cancela ordens sem executar
+            self._el = self._es = False
 
-        # Salva sinais para próxima barra (Pine: buy_signal[1])
-        self.buy_signal_prev  = buy_signal
-        self.sell_signal_prev = sell_signal
+        # ── CLOSE: IFM ────────────────────────────────────────────────────
+        if self.force_period is not None:
+            self.Period = max(1, self.force_period)
+        else:
+            if self.adaptive_method in ("Cos IFM", "Average"):
+                lenC = self._cosine_ifm(src)
+            if self.adaptive_method in ("I-Q IFM", "Average"):
+                lenIQ = self._iq_ifm(src)
 
-        # Debug periódico
-        if idx % 100 == 0:
-            wstr = " [WU]" if in_warmup else ""
+            if   self.adaptive_method == "Cos IFM":
+                self.Period = max(1, int(round(self._lenC)))
+            elif self.adaptive_method == "I-Q IFM":
+                self.Period = max(1, int(round(self._lenIQ)))
+            elif self.adaptive_method == "Average":
+                self.Period = max(1, int(round((self._lenC + self._lenIQ)/2)))
+
+        # ── CLOSE: ZLEMA ──────────────────────────────────────────────────
+        ema_prv, ec_prv, ema, ec = self._zlema(src, self.Period)
+
+        # ── CLOSE: Sinais ─────────────────────────────────────────────────
+        # Pine v3: crossover(EC,EMA)  = EC[1] <= EMA[1] AND EC > EMA
+        #          crossunder(EC,EMA) = EC[1] >= EMA[1] AND EC < EMA
+        buy_sig  = (ec_prv <= ema_prv) and (ec > ema)
+        sell_sig = (ec_prv >= ema_prv) and (ec < ema)
+
+        # Filtro threshold: 100*LeastError/src > Threshold (0 → sempre passa)
+        if self.threshold > 0:
+            err = 100.0 * self.LeastError / src if src != 0 else 0.0
+            buy_sig  = buy_sig  and (err > self.threshold)
+            sell_sig = sell_sig and (err > self.threshold)
+
+        # ── CLOSE: Trailing stop (strategy.exit verifica HIGH/LOW) ────────
+        # Pine: monitora a cada barra enquanto posição aberta
+        # Detectado no close → exit agendado → executa no OPEN seguinte
+        self._check_trail(h, l)
+
+        # ── CLOSE: Agenda entries ─────────────────────────────────────────
+        # (usa sinais da barra ANTERIOR: buy_signal[1] = self._buy_prev)
+        self._schedule_entries(in_warmup, idx)
+
+        # ── Salva sinais para próxima barra ───────────────────────────────
+        self._buy_prev  = buy_sig
+        self._sell_prev = sell_sig
+
+        # ── Log periódico ─────────────────────────────────────────────────
+        if idx % 200 == 0:
+            wu = "[WU]" if in_warmup else "    "
             print(
-                f"📊 [{idx}]{wstr} P={self.Period} "
-                f"EC={ec:.4f} EMA={ema:.4f} diff={ec - ema:+.6f} "
-                f"xo={buy_signal} xu={sell_signal} "
-                f"pos={self.position_size:.4f} bal={self.balance:.2f} "
-                f"trail={'ON' if self.trailing_active else 'off'} "
-                f"exitS={self.exit_scheduled} "
-                f"pB={self.pending_buy} pS={self.pending_sell}"
+                f"{wu}[{idx:5d}] P={self.Period:3d} "
+                f"EC={ec:.4f} EMA={ema:.4f} "
+                f"xo={buy_sig} xu={sell_sig} "
+                f"pos={self.position_size:+.4f} "
+                f"trail={'ON' if self._trailing_active else 'off'} "
+                f"xe={self._xe} el={self._el} es={self._es} "
+                f"pB={self._pBuy} pS={self._pSell} "
+                f"bal={self.balance:.2f}"
             )
 
         return actions
