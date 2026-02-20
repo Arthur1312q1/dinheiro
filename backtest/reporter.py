@@ -1,5 +1,4 @@
 # backtest/reporter.py
-import os
 import json
 from datetime import datetime
 from pathlib import Path
@@ -8,41 +7,18 @@ import pandas as pd
 
 
 class BacktestReporter:
-    """
-    Gera relatório HTML do backtest com gráfico de equity e tabela de trades.
-    """
-
     def __init__(self, results: Dict[str, Any], df_report: pd.DataFrame):
-        self.results  = results
-        self.df       = df_report
-        self.template = self._load_template()
+        self.results = results
+        self.df      = df_report
 
-    def _load_template(self) -> str:
-        """Lê template HTML (busca em múltiplos locais)."""
-        candidates = [
-            Path(__file__).parent / "templates" / "report_template.html",
-            Path("backtest/templates/report_template.html"),
-            Path("templates/report_template.html"),
-        ]
-        for path in candidates:
-            if path.exists():
-                return path.read_text(encoding="utf-8")
-        return ""   # fallback: gera inline
-
-    # ──────────────────────────────────────────────────────────────────────
-    # HTML inline (não depende de template externo)
-    # ──────────────────────────────────────────────────────────────────────
     def generate_html(self) -> str:
-        """Gera HTML completo do relatório."""
-        stats  = self._build_stats()
-        trades = self.results.get("trades", [])
-        equity = self.results.get("equity_curve", [])
+        stats   = self._build_stats()
+        trades  = self.results.get("trades", [])
+        equity  = self.results.get("equity_curve", [])
         ts_list = self.results.get("timestamps", [])
 
-        # Serializa timestamps para JS
         ts_str = [str(t) for t in ts_list]
 
-        # Candles para o gráfico de preço
         candles_js = []
         for _, row in self.df.iterrows():
             candles_js.append({
@@ -53,18 +29,16 @@ class BacktestReporter:
                 "close": float(row.get("close", 0)),
             })
 
-        # Markers de trades
         markers_js = []
         for t in trades:
             if t.get("entry_time"):
                 markers_js.append({
-                    "time":    str(t["entry_time"]),
-                    "price":   float(t.get("entry_price", 0)),
-                    "type":    t.get("action", ""),
-                    "label":   "B" if t.get("action") == "BUY" else "S",
+                    "time":  str(t["entry_time"]),
+                    "price": float(t.get("entry_price", 0)),
+                    "type":  t.get("action", ""),
+                    "label": "B" if t.get("action") == "BUY" else "S",
                 })
 
-        # Equity curve
         equity_js = [
             {"time": ts_str[i], "value": float(v)}
             for i, v in enumerate(equity)
@@ -72,52 +46,51 @@ class BacktestReporter:
         ]
 
         ultimo_candle = candles_js[-1] if candles_js else None
-
         return self._render(stats, trades, candles_js, markers_js, equity_js, ultimo_candle)
 
     def _build_stats(self) -> Dict:
-        r = self.results
+        r      = self.results
         trades = r.get("trades", [])
 
-        # Calcula profit factor
-        gross_win  = sum(t.get("pnl_usdt", 0) for t in trades if t.get("pnl_usdt", 0) > 0)
-        gross_loss = abs(sum(t.get("pnl_usdt", 0) for t in trades if t.get("pnl_usdt", 0) < 0))
+        # FIX: filtra apenas trades fechados (pnl_usdt não None)
+        closed = [t for t in trades if t.get("pnl_usdt") is not None]
+
+        gross_win  = sum(t["pnl_usdt"] for t in closed if t["pnl_usdt"] > 0)
+        gross_loss = abs(sum(t["pnl_usdt"] for t in closed if t["pnl_usdt"] < 0))
         pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
 
-        # Avg win / avg loss
-        wins   = [t.get("pnl_usdt", 0) for t in trades if t.get("pnl_usdt", 0) > 0]
-        losses = [t.get("pnl_usdt", 0) for t in trades if t.get("pnl_usdt", 0) < 0]
-        avg_win  = sum(wins)  / len(wins)  if wins  else 0
-        avg_loss = sum(losses) / len(losses) if losses else 0
+        wins   = [t["pnl_usdt"] for t in closed if t["pnl_usdt"] > 0]
+        losses = [t["pnl_usdt"] for t in closed if t["pnl_usdt"] < 0]
+        avg_win  = sum(wins)   / len(wins)   if wins   else 0.0
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
 
         return {
-            "total_pnl_usdt":  r.get("total_pnl_usdt", 0),
-            "final_balance":   r.get("final_balance", 0),
-            "win_rate":        r.get("win_rate", 0),
-            "total_trades":    r.get("total_trades", 0),
-            "max_drawdown":    r.get("max_drawdown", 0),
-            "sharpe":          r.get("sharpe", 0),
-            "profit_factor":   pf,
-            "avg_win":         avg_win,
-            "avg_loss":        avg_loss,
+            "total_pnl_usdt": r.get("total_pnl_usdt", 0),
+            "final_balance":  r.get("final_balance",  0),
+            "win_rate":       r.get("win_rate",        0),
+            "total_trades":   r.get("total_trades",    0),
+            "max_drawdown":   r.get("max_drawdown",    0),
+            "sharpe":         r.get("sharpe",          0),
+            "profit_factor":  pf,
+            "avg_win":        avg_win,
+            "avg_loss":       avg_loss,
         }
 
     def _render(self, stats, trades, candles_js, markers_js, equity_js, ultimo_candle) -> str:
-        now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-        pnl_color = "#00c864" if stats["total_pnl_usdt"] >= 0 else "#f04c4c"
+        now    = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         pf_str = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float("inf") else "∞"
 
         rows_html = ""
         for t in trades:
-            pnl = t.get("pnl_usdt")
+            pnl       = t.get("pnl_usdt")
             pnl_str   = f"{pnl:.2f}" if pnl is not None else "--"
-            pnl_class = "positive" if (pnl or 0) > 0 else ("negative" if (pnl or 0) < 0 else "")
-            ep = t.get("exit_price")
-            ep_str = f"{ep:.2f}" if ep else "--"
-            badge = 'buy' if t.get('action') == 'BUY' else 'sell'
-            label = 'LONG'  if t.get('action') == 'BUY' else 'SHORT'
-            reason = t.get("exit_comment", t.get("exit_reason", "--"))
+            pnl_class = ("positive" if (pnl or 0) > 0
+                         else "negative" if (pnl or 0) < 0 else "")
+            ep        = t.get("exit_price")
+            ep_str    = f"{ep:.2f}" if ep is not None else "--"
+            badge     = "buy" if t.get("action") == "BUY" else "sell"
+            label     = "LONG" if t.get("action") == "BUY" else "SHORT"
+            reason    = t.get("exit_comment") or t.get("exit_reason") or "--"
             rows_html += f"""
             <tr>
                 <td>{t.get('entry_time','--')}</td>
@@ -137,6 +110,9 @@ class BacktestReporter:
                        f"High: {ultimo_candle['high']:.2f} | "
                        f"Low: {ultimo_candle['low']:.2f} | "
                        f"Close: {ultimo_candle['close']:.2f}")
+
+        pnl_color_class = "positive" if stats["total_pnl_usdt"] >= 0 else "negative"
+        pf_color_class  = "positive" if stats["profit_factor"] > 1   else "negative"
 
         return f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -161,8 +137,7 @@ class BacktestReporter:
   .debug-box {{ background:#1e2329; border-radius:8px; padding:12px 15px; margin-bottom:25px;
                 font-family:'Courier New',monospace; font-size:13px; border-left:5px solid #3b82f6; }}
   .debug-box strong {{ color:#f0b90b; }}
-  .chart-container {{ background:#1e2329; border-radius:8px; padding:20px; margin-bottom:25px; height:380px; }}
-  .chart-container.equity {{ height:280px; }}
+  .chart-container {{ background:#1e2329; border-radius:8px; padding:20px; margin-bottom:25px; height:320px; }}
   .trades-section {{ background:#1e2329; border-radius:8px; padding:20px; }}
   table {{ width:100%; border-collapse:collapse; }}
   th {{ background:#2c3137; color:#f0b90b; padding:11px 12px; text-align:left; font-weight:600; font-size:13px; }}
@@ -181,13 +156,13 @@ class BacktestReporter:
   <h1>📈 Adaptive Zero Lag EMA v2 – Backtest Report</h1>
 
   <div class="debug-box">
-    <strong>🔍 Último candle:</strong> {uc_html if uc_html else "N/D"}
+    <strong>🔍 Último candle:</strong> {uc_html or "N/D"}
   </div>
 
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Total PnL (USDT)</div>
-      <div class="stat-value {'positive' if stats['total_pnl_usdt']>=0 else 'negative'}">{stats['total_pnl_usdt']:.2f}</div>
+      <div class="stat-value {pnl_color_class}">{stats['total_pnl_usdt']:.2f}</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Saldo Final</div>
@@ -211,11 +186,11 @@ class BacktestReporter:
     </div>
     <div class="stat-card">
       <div class="stat-label">Profit Factor</div>
-      <div class="stat-value {'positive' if stats['profit_factor']>1 else 'negative'}">{pf_str}</div>
+      <div class="stat-value {pf_color_class}">{pf_str}</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Avg Win / Avg Loss</div>
-      <div class="stat-value" style="font-size:18px;">
+      <div class="stat-value" style="font-size:18px">
         <span class="positive">{stats['avg_win']:.2f}</span>
         &nbsp;/&nbsp;
         <span class="negative">{stats['avg_loss']:.2f}</span>
@@ -223,17 +198,14 @@ class BacktestReporter:
     </div>
   </div>
 
-  <!-- Equity Curve -->
-  <div class="chart-container equity">
+  <div class="chart-container">
     <canvas id="equityChart"></canvas>
   </div>
 
-  <!-- Price Chart -->
   <div class="chart-container">
     <canvas id="priceChart"></canvas>
   </div>
 
-  <!-- Tabela de trades -->
   <div class="trades-section">
     <h2>📋 Histórico de Trades</h2>
     <table>
@@ -241,7 +213,7 @@ class BacktestReporter:
         <tr>
           <th>Entrada</th><th>Saída</th><th>Dir</th>
           <th>Qtd</th><th>Preço Entrada</th><th>Preço Saída</th>
-          <th>PnL (USDT)</th><th>Motivo Saída</th>
+          <th>PnL (USDT)</th><th>Motivo</th>
         </tr>
       </thead>
       <tbody>
@@ -256,64 +228,47 @@ class BacktestReporter:
 </div>
 
 <script>
-const candles = {json.dumps(candles_js)};
 const equity  = {json.dumps(equity_js)};
-const markers = {json.dumps(markers_js)};
+const candles = {json.dumps(candles_js)};
 
-// ── EQUITY CURVE ──────────────────────────────────────────────────────────
 const ctxE = document.getElementById('equityChart').getContext('2d');
 new Chart(ctxE, {{
   type: 'line',
   data: {{
     labels: equity.map(e => e.time),
-    datasets: [{{
-      label: 'Equity (USDT)',
-      data: equity.map(e => e.value),
-      borderColor: '#f0b90b',
-      backgroundColor: 'rgba(240,185,11,0.08)',
-      borderWidth: 2,
-      pointRadius: 0,
-      tension: 0.1,
-    }}]
+    datasets: [{{ label: 'Equity (USDT)', data: equity.map(e => e.value),
+      borderColor: '#f0b90b', backgroundColor: 'rgba(240,185,11,0.08)',
+      borderWidth: 2, pointRadius: 0, tension: 0.1 }}]
   }},
   options: {{
     responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ labels: {{ color:'#e0e0e0' }} }} }},
     scales: {{
       x: {{ type:'time', time: {{ unit:'day', tooltipFormat:'yyyy-MM-dd HH:mm',
-               displayFormats: {{ day:'dd/MM' }} }},
-            grid: {{ color:'rgba(255,255,255,0.07)' }}, ticks: {{ color:'#a0a8b5' }} }},
-      y: {{ position:'right', grid: {{ color:'rgba(255,255,255,0.07)' }},
-            ticks: {{ color:'#a0a8b5' }} }}
+            displayFormats:{{day:'dd/MM'}} }}, grid:{{color:'rgba(255,255,255,0.07)'}},
+            ticks:{{color:'#a0a8b5'}} }},
+      y: {{ position:'right', grid:{{color:'rgba(255,255,255,0.07)'}}, ticks:{{color:'#a0a8b5'}} }}
     }}
   }}
 }});
 
-// ── PRICE CHART ────────────────────────────────────────────────────────────
 const ctxP = document.getElementById('priceChart').getContext('2d');
 new Chart(ctxP, {{
   type: 'line',
   data: {{
     labels: candles.map(c => c.time),
-    datasets: [{{
-      label: 'Preço de Fechamento',
-      data: candles.map(c => c.close),
-      borderColor: '#3b82f6',
-      backgroundColor: 'rgba(59,130,246,0.08)',
-      borderWidth: 1.5,
-      pointRadius: 0,
-      tension: 0.1,
-    }}]
+    datasets: [{{ label: 'Preço de Fechamento', data: candles.map(c => c.close),
+      borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)',
+      borderWidth: 1.5, pointRadius: 0, tension: 0.1 }}]
   }},
   options: {{
     responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ labels: {{ color:'#e0e0e0' }} }} }},
     scales: {{
       x: {{ type:'time', time: {{ unit:'day', tooltipFormat:'yyyy-MM-dd HH:mm',
-               displayFormats: {{ day:'dd/MM' }} }},
-            grid: {{ color:'rgba(255,255,255,0.07)' }}, ticks: {{ color:'#a0a8b5' }} }},
-      y: {{ position:'right', grid: {{ color:'rgba(255,255,255,0.07)' }},
-            ticks: {{ color:'#a0a8b5' }} }}
+            displayFormats:{{day:'dd/MM'}} }}, grid:{{color:'rgba(255,255,255,0.07)'}},
+            ticks:{{color:'#a0a8b5'}} }},
+      y: {{ position:'right', grid:{{color:'rgba(255,255,255,0.07)'}}, ticks:{{color:'#a0a8b5'}} }}
     }}
   }}
 }});
