@@ -1,146 +1,194 @@
 # main.py
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# BUG CORRIGIDO (causa dos 41 trades faltantes):
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ANTES (ERRADO):
+#   BACKTEST_CANDLES = 4500
+#   WARMUP_CANDLES   = 300
+#   collector.fetch(limit=4500)   ← busca só 4500 candles
+#   strategy(warmup_bars=300)     ← usa 300 do trading para warmup!
+#   → efetivo de trading: 4200 candles (-300 = -18.8 trades perdidos)
+#
+# AGORA (CORRETO):
+#   BACKTEST_CANDLES = 4500       ← período de trading (igual ao TradingView)
+#   WARMUP_CANDLES   = 1000       ← pré-história para IFM/EC convergir
+#   collector.fetch(limit=5500)   ← busca BACKTEST + WARMUP
+#   strategy(warmup_bars=1000)    ← warmup sobre dados extras
+#   → efetivo de trading: 4500 candles (IGUAL ao TradingView) ✅
+#
+# POR QUE 1000 WARMUP? Pine Script computa indicadores da história INTEIRA
+# da OKX (anos de dados) antes de iniciar o trading. O IFM (Cosine) usa
+# EMA com α=0.25, que converge em ~20 barras. EC/EMA do ZLEMA com α≈0.2
+# converge em ~20 barras. 1000 barras = 20+ dias de pré-história → garante
+# IFM e ZLEMA completamente convergidos antes do trading iniciar. ✅
+#
+# DURANTE WARMUP: IFM, ZLEMA, signals são computados normalmente.
+# Pending flags também propagam (para o estado na 1ª barra de trading
+# refletir corretamente o sinal da última barra do warmup — igual ao Pine).
+# Apenas TRADES não são executados.
+# ═══════════════════════════════════════════════════════════════════════════════
+
 import os
 import argparse
 import traceback
-from pathlib import Path
+from flask import Flask, jsonify
 import pandas as pd
-from flask import Flask, jsonify, render_template_string
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
-from data.collector import OKXDataCollector
+from data.collector import DataCollector
 from backtest.engine import BacktestEngine
 from backtest.reporter import BacktestReporter
-from keepalive.pinger import KeepAlivePinger
-from keepalive.webhook_receiver import webhook_bp
-from utils.env_loader import env, env_int, env_float
 
-# ============================================================================
-# NORMALIZA SÍMBOLO
-# ============================================================================
-def normalize_symbol(symbol: str) -> str:
-    symbol = symbol.strip().upper()
-    symbol = symbol.replace('/', '-').replace('_', '-').replace(' ', '-')
-    if '-' not in symbol and symbol.endswith('USDT'):
-        base = symbol[:-4]
-        symbol = f"{base}-USDT"
-    if not symbol.endswith('-USDT'):
-        if '-' in symbol:
-            base, quote = symbol.split('-')
-            if quote != 'USDT':
-                symbol = f"{base}-USDT"
-        else:
-            symbol = f"{symbol}-USDT"
-    return symbol
 
-# ============================================================================
-# CONFIGURAÇÕES
-# ============================================================================
-FORCE_PERIOD = env_int("FORCE_PERIOD", None)
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def env(k, d=None):
+    return os.environ.get(k, d)
 
-# ✅ WARMUP: passado para a estratégia, NÃO removido do DataFrame.
-# A estratégia calcula indicadores no warmup mas NÃO abre posições.
-# Isso replica o comportamento do TradingView (que usa todo histórico disponível).
-# 300 candles de 30m ≈ 6 dias → suficiente para lenC convergir.
-WARMUP_CANDLES = env_int("WARMUP_CANDLES", 300)
+def env_int(k, d=0):
+    v = os.environ.get(k)
+    if v is None: return d
+    try: return int(v)
+    except: return d
+
+def env_float(k, d=0.0):
+    v = os.environ.get(k)
+    if v is None: return d
+    try: return float(v)
+    except: return d
+
+def normalize_symbol(s: str) -> str:
+    """Normaliza símbolo para formato OKX (ETH-USDT)."""
+    s = s.strip().upper().replace('/', '-').replace('_', '-').replace(' ', '-')
+    if '-' not in s and s.endswith('USDT'):
+        s = s[:-4] + '-USDT'
+    return s
+
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+SYMBOL           = normalize_symbol(env("SYMBOL", "ETH-USDT"))
+TIMEFRAME        = env("TIMEFRAME", "30m")
+EXCHANGE         = env("EXCHANGE", "okx")       # OKX = mesma fonte do TradingView
+
+# BACKTEST_CANDLES = candles de TRADING (deve ser igual ao período do TradingView)
+# WARMUP_CANDLES   = candles EXTRAS para IFM/ZLEMA convergir antes do trading
+# TOTAL buscado da exchange: BACKTEST_CANDLES + WARMUP_CANDLES
+BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 4500)   # 93.75 dias de trading
+WARMUP_CANDLES   = env_int("WARMUP_CANDLES",  1000)    # ~20.8 dias de pré-história
 
 STRATEGY_CONFIG = {
     "adaptive_method": env("ADAPTIVE_METHOD", "Cos IFM"),
-    "threshold": env_float("THRESHOLD", 0.0),
-    "fixed_sl_points": env_int("FIXED_SL", 2000),
-    "fixed_tp_points": env_int("FIXED_TP", 55),
-    "trail_offset": env_int("TRAIL_OFFSET", 15),
-    "risk_percent": env_float("RISK_PERCENT", 0.01),
-    "tick_size": env_float("TICK_SIZE", 0.01),
+    "threshold":       env_float("THRESHOLD",    0.0),
+    "fixed_sl_points": env_int("FIXED_SL",    2000),
+    "fixed_tp_points": env_int("FIXED_TP",      55),
+    "trail_offset":    env_int("TRAIL_OFFSET",   15),
+    "risk_percent":    env_float("RISK_PERCENT", 0.01),
+    "tick_size":       env_float("TICK_SIZE",    0.01),
     "initial_capital": env_float("INITIAL_CAPITAL", 1000.0),
-    "max_lots": env_int("MAX_LOTS", 100),
-    "force_period": FORCE_PERIOD,
-    "warmup_bars": WARMUP_CANDLES,
+    "max_lots":        env_int("MAX_LOTS",      100),
+    "default_period":  env_int("DEFAULT_PERIOD", 20),
+    "warmup_bars":     WARMUP_CANDLES,   # ← usa os candles extras de pré-história
 }
+if env("FORCE_PERIOD"):
+    STRATEGY_CONFIG["force_period"] = env_int("FORCE_PERIOD", None)
 
-# ============================================================================
-# DADOS
-# ============================================================================
-RAW_SYMBOL = env("SYMBOL", "ETH-USDT")
-SYMBOL = normalize_symbol(RAW_SYMBOL)
-TIMEFRAME = env("TIMEFRAME", "30m")
 
-# ✅ 4500 candles total:
-#    - 300 warmup
-#    - 4200 candles efetivos ≈ 2.9 meses de 30m
-#    Isso é equivalente ao período que gera ~800 trades no TradingView.
-BACKTEST_CANDLES = env_int("BACKTEST_CANDLES", 4500)
-
-# ============================================================================
-# FLASK
-# ============================================================================
+# ─── Flask ───────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.register_blueprint(webhook_bp)
 
-@app.route('/')
-def root():
-    return backtest_web()
 
-@app.route('/backtest')
-def backtest_web():
-    try:
-        print("📍 Executando backtest...")
-        collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=BACKTEST_CANDLES)
-        df = collector.fetch_ohlcv()
+def run_full_backtest():
+    total_candles = BACKTEST_CANDLES + WARMUP_CANDLES   # ← FIX: busca TOTAL
 
-        if df.empty:
-            return jsonify({"error": "Nenhum candle obtido", "status": "failed"}), 500
+    print(f"═══════════════════════════════════════════")
+    print(f"Exchange:  {EXCHANGE.upper()} | {SYMBOL} {TIMEFRAME}")
+    print(f"Candles:   {total_candles} ({WARMUP_CANDLES} warmup + {BACKTEST_CANDLES} trading)")
+    print(f"Período trading: {BACKTEST_CANDLES * 30 / 60 / 24:.1f} dias")
+    print(f"Pré-história:    {WARMUP_CANDLES * 30 / 60 / 24:.1f} dias")
+    print(f"═══════════════════════════════════════════")
 
-        df['index'] = df.index
-        effective = len(df) - WARMUP_CANDLES
-        print(f"📈 {len(df)} candles totais | warmup={WARMUP_CANDLES} | efetivos={effective}")
+    # Converte símbolo para formato da exchange
+    if EXCHANGE == "okx":
+        sym = SYMBOL   # já em formato ETH-USDT
+    else:
+        sym = SYMBOL.replace('-', '')   # Binance/Bybit: ETHUSDT
 
-        strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
-        engine   = BacktestEngine(strategy, df)
-        results  = engine.run()
-
-        print(f"📊 {results['total_trades']} trades em {effective} candles efetivos")
-
-        # Relatório mostra apenas candles pós-warmup
-        df_report = df.iloc[WARMUP_CANDLES:].reset_index(drop=True)
-        reporter  = BacktestReporter(results, df_report)
-        html      = reporter.generate_html()
-
-        return render_template_string(html)
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"ERRO:\n{tb}")
-        return jsonify({"error": str(e), "traceback": tb.split('\n'), "status": "failed"}), 500
-
-# ============================================================================
-# BACKTEST LOCAL
-# ============================================================================
-def run_backtest():
-    print(f"🔍 Buscando {BACKTEST_CANDLES} candles de {SYMBOL} ({TIMEFRAME})...")
-    collector = OKXDataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=BACKTEST_CANDLES)
+    collector = DataCollector(
+        symbol    = sym,
+        timeframe = TIMEFRAME,
+        limit     = total_candles,   # ← FIX: BACKTEST + WARMUP
+        exchange  = EXCHANGE,
+    )
     df = collector.fetch_ohlcv()
-    print(f"✅ {len(df)} candles obtidos")
 
+    if df.empty:
+        raise ValueError("Nenhum candle obtido da exchange")
+
+    # Adiciona coluna index para logging interno
+    df = df.reset_index(drop=True)
     df['index'] = df.index
+
+    print(f"\n📅 Período completo:  {df['timestamp'].iloc[0]} → {df['timestamp'].iloc[-1]}")
+    print(f"📅 Período trading:   {df['timestamp'].iloc[WARMUP_CANDLES]} → {df['timestamp'].iloc[-1]}")
+
+    # Executa backtest
     strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
     engine   = BacktestEngine(strategy, df)
     results  = engine.run()
 
+    print(f"\n📊 Resultados:")
+    print(f"   Trades: {results['total_trades']}")
+    print(f"   Win Rate: {results['win_rate']:.1f}%")
+    print(f"   PnL: {results['total_pnl_usdt']:.2f} USDT")
+    print(f"   Balance: ${results['final_balance']:.2f}")
+    print(f"   Profit Factor: {results.get('profit_factor', 0):.2f}")
+    print(f"   Max Drawdown: {results.get('max_drawdown_pct', 0):.2f}%")
+
+    # Reporter usa APENAS os candles de trading (sem o warmup)
     df_report = df.iloc[WARMUP_CANDLES:].reset_index(drop=True)
     reporter  = BacktestReporter(results, df_report)
-    report_path = reporter.save_html('azlema_backtest_report.html')
-    print(f"✅ {results['total_trades']} trades | Relatório: {report_path}")
+    return reporter
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
+
+@app.route('/')
+@app.route('/backtest')
+def backtest_web():
+    try:
+        reporter = run_full_backtest()
+        return reporter.generate_html()
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"ERRO:\n{tb}")
+        return jsonify({"error": str(e), "traceback": tb.split('\n')}), 500
+
+
+@app.route('/ping')
+def ping():
+    return "pong", 200
+
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "exchange": EXCHANGE,
+                    "symbol": SYMBOL, "timeframe": TIMEFRAME}), 200
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+def run_local_backtest():
+    reporter    = run_full_backtest()
+    report_path = reporter.save_html('azlema_backtest_report.html')
+    print(f"\n✅ Relatório salvo: {report_path}")
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='AZLEMA Backtest')
     parser.add_argument('--mode', choices=['backtest', 'server'], default='backtest')
     args = parser.parse_args()
 
     if args.mode == 'backtest':
-        run_backtest()
+        run_local_backtest()
     else:
         port = env_int("PORT", 5000)
-        app.run(host='0.0.0.0', port=port)
+        print(f"🚀 Servidor na porta {port}")
+        app.run(host='0.0.0.0', port=port, debug=False)
