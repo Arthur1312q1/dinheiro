@@ -62,10 +62,27 @@ class OKX:
         return requests.post(self.BASE+path, headers=self._h("POST",path,b), data=b, timeout=10).json()
 
     def balance(self):
+        """Retorna saldo USDT disponível para trading (conta unificada OKX)."""
         try:
-            for d in self._get("/api/v5/account/balance",{"ccy":"USDT"})["data"][0]["details"]:
-                if d["ccy"] == "USDT": return float(d["availBal"])
-        except: pass
+            data = self._get("/api/v5/account/balance", {"ccy": "USDT"})
+            acct = data["data"][0]
+            # Tenta availBal direto; se zero, usa availEq (saldo ajustado cross)
+            for d in acct.get("details", []):
+                if d["ccy"] == "USDT":
+                    avail = float(d.get("availBal", 0) or 0)
+                    if avail > 0:
+                        return avail
+                    # availEq inclui PnL não realizado em cross margin
+                    eq = float(d.get("availEq", 0) or 0)
+                    if eq > 0:
+                        return eq
+            # Fallback: equity total da conta em USDT
+            total = float(acct.get("totalEq", 0) or 0)
+            if total > 0:
+                log.info(f"  ℹ️  Usando totalEq={total:.4f} USDT (conta unificada)")
+                return total
+        except Exception as e:
+            log.error(f"  ❌ Erro ao buscar saldo: {e}")
         return 0.0
 
     def position(self):
@@ -89,10 +106,19 @@ class OKX:
     def _cts(self, eth): return max(1, int(eth / self.ct_val()))
 
     def _order(self, side, ps, sz):
-        r = self._post("/api/v5/trade/order",
-                       {"instId":self.INST,"tdMode":"cross","side":side,"posSide":ps,"ordType":"market","sz":str(sz)})
-        ok = r.get("code") == "0"
-        log.info(f"  {'✅' if ok else '❌'} ORDER {side}/{ps} sz={sz} | {r.get('data',[{}])[0].get('sCode') if ok else r.get('msg')}")
+        body = {"instId":self.INST,"tdMode":"cross","side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
+        r    = self._post("/api/v5/trade/order", body)
+        ok   = r.get("code") == "0"
+        if ok:
+            sc = r.get("data",[{}])[0].get("sCode","")
+            log.info(f"  ✅ ORDER {side}/{ps} sz={sz} sCode={sc}")
+        else:
+            # Log COMPLETO para diagnóstico
+            d0 = r.get("data",[{}])[0] if r.get("data") else {}
+            log.error(f"  ❌ ORDER {side}/{ps} sz={sz} FALHOU")
+            log.error(f"     code={r.get('code')} msg={r.get('msg')}")
+            log.error(f"     sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
+            log.error(f"     body={body}")
         return r
 
     def _fill(self, r):
@@ -101,16 +127,57 @@ class OKX:
             return float(self._get("/api/v5/trade/order",{"instId":self.INST,"ordId":oid})["data"][0]["avgPx"])
         except: return None
 
-    def open_long(self, qty):  r=self._order("buy","long",self._cts(qty));   return r, qty
-    def open_short(self, qty): r=self._order("sell","short",self._cts(qty)); return r, qty
-    def close_long(self, qty):  return self._order("sell","long",self._cts(qty))
-    def close_short(self, qty): return self._order("buy","short",self._cts(qty))
+    def _ps(self, side_long):
+        """Retorna posSide correto conforme o modo de posição."""
+        mode = getattr(self, '_pos_mode', 'long_short_mode')
+        if mode == 'net_mode':
+            return 'net'
+        return 'long' if side_long else 'short'
+
+    def open_long(self, qty):
+        r = self._order("buy",  self._ps(True),  self._cts(qty)); return r, qty
+    def open_short(self, qty):
+        r = self._order("sell", self._ps(False), self._cts(qty)); return r, qty
+    def close_long(self, qty):
+        return self._order("sell", self._ps(True),  self._cts(qty))
+    def close_short(self, qty):
+        return self._order("buy",  self._ps(False), self._cts(qty))
+
+    def get_pos_mode(self):
+        """Retorna o modo de posição atual: 'long_short_mode' ou 'net_mode'."""
+        try:
+            r = self._get("/api/v5/account/config")
+            return r["data"][0].get("posMode", "net_mode")
+        except:
+            return "net_mode"
 
     def setup(self):
-        self._post("/api/v5/account/set-position-mode", {"posMode":"long_short_mode"})
-        self._post("/api/v5/account/set-leverage", {"instId":self.INST,"lever":"1","mgnMode":"cross"})
+        # Detectar modo atual antes de tentar mudar
+        current_mode = self.get_pos_mode()
+        log.info(f"  ℹ️  Position mode atual: {current_mode}")
+
+        # Tentar mudar para hedge mode (long_short_mode)
+        r = self._post("/api/v5/account/set-position-mode", {"posMode":"long_short_mode"})
+        if r.get("code") == "0":
+            self._pos_mode = "long_short_mode"
+            log.info("  ✅ Modo hedge (long_short_mode) ativado")
+        else:
+            # Conta pode não suportar ou já ter posição aberta → usar modo atual
+            self._pos_mode = current_mode
+            log.warning(f"  ⚠️  Não mudou position mode: {r.get('msg')} → usando {current_mode}")
+
+        # Alavancagem 1x
+        rl = self._post("/api/v5/account/set-leverage",
+                        {"instId":self.INST,"lever":"1","mgnMode":"cross"})
+        if rl.get("code") == "0":
+            log.info("  ✅ Alavancagem 1x configurada")
+        else:
+            log.warning(f"  ⚠️  set-leverage: {rl.get('msg')}")
+
         bal = self.balance()
-        log.info(f"  ✅ OKX conectada | Saldo: {bal:.4f} USDT | 1x alavancagem")
+        log.info(f"  ✅ OKX conectada | Saldo: {bal:.4f} USDT")
+        if bal < 20:
+            log.warning(f"  ⚠️  Saldo baixo ({bal:.2f} USDT) — mínimo ~20 USDT para 1 contrato ETH-USDT-SWAP 1x")
         return bal > 0
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -124,6 +191,7 @@ class LiveTrader:
         self.strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         self._running = False
         self.log: List[Dict] = []
+        self._pnl_baseline = 0.0  # PnL histórico do warmup (excluído do live PnL)
 
     def _qty(self):
         bal = self.okx.balance(); px = self.okx.mark_price()
@@ -148,13 +216,22 @@ class LiveTrader:
                          "price":price,"qty":qty,"reason":reason})
 
     def warmup(self, df):
-        log.info(f"🔄 Warmup: {len(df)} candles...")
+        log.info(f"🔄 Warmup: {len(df)} candles (sem execução real)...")
         for _, row in df.iterrows():
             self.strategy.next({'open':float(row['open']),'high':float(row['high']),
                 'low':float(row['low']),'close':float(row['close']),
                 'timestamp':row.get('timestamp',0),'index':int(row.get('index',0))})
-        log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} EC={self.strategy.EC:.2f}")
+        # Salva baseline: PnL acumulado do histórico simulado
+        # O PnL real (live) será sempre relativo a este momento
+        self._pnl_baseline = self.strategy.net_profit
+        log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} EC={self.strategy.EC:.2f} "
+                 f"| baseline_pnl={self._pnl_baseline:.2f} (histórico simulado, ignorado)")
         self._sync()
+    
+    @property
+    def live_pnl(self):
+        """PnL real acumulado APENAS das operações live (após o warmup)."""
+        return self.strategy.net_profit - self._pnl_baseline
 
     def process(self, candle):
         ts = candle.get('timestamp', datetime.utcnow())
@@ -394,7 +471,7 @@ def status():
     except: pass
     return jsonify({"status":"running" if t._running else "warming",
                     "pos":real,"bal":bal,"ct":ct,
-                    "pnl":t.strategy.net_profit,
+                    "pnl":t.live_pnl,
                     "period":t.strategy.Period,"ec":t.strategy.EC,"ema":t.strategy.EMA,
                     "tc":len(t.log),"trades":t.log[-10:],"log":_logs[-80:]})
 
