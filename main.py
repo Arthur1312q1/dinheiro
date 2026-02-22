@@ -100,10 +100,29 @@ class OKX:
         except: return 0.0
 
     def ct_val(self):
-        try: return float(self._get("/api/v5/public/instruments",{"instType":"SWAP","instId":self.INST})["data"][0]["ctVal"])
-        except: return 0.01
+        """Retorna ct_val cacheado (busca na API apenas uma vez no setup)."""
+        return getattr(self, '_ct_val', 0.001)  # ETH-USDT-SWAP: 0.001 ETH/contrato
 
-    def _cts(self, eth): return max(1, int(eth / self.ct_val()))
+    def _fetch_ct_val(self):
+        """Busca ct_val real da API e cacheia. Chamado apenas no setup()."""
+        try:
+            r = self._get("/api/v5/public/instruments",
+                          {"instType": "SWAP", "instId": self.INST})
+            val = float(r["data"][0]["ctVal"])
+            self._ct_val = val
+            log.info(f"  ✅ ct_val={val} ETH/contrato | "
+                     f"1 contrato = {val * self.mark_price():.4f} USDT")
+            return val
+        except Exception as e:
+            log.error(f"  ❌ Erro ao buscar ct_val: {e} → usando 0.001")
+            self._ct_val = 0.001
+            return 0.001
+
+    def _cts(self, eth):
+        """Converte ETH em número inteiro de contratos."""
+        ct  = self.ct_val()
+        cts = int(eth / ct)
+        return max(1, cts)
 
     def _order(self, side, ps, sz):
         body = {"instId":self.INST,"tdMode":"cross","side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
@@ -174,10 +193,17 @@ class OKX:
         else:
             log.warning(f"  ⚠️  set-leverage: {rl.get('msg')}")
 
+        # Busca ct_val real da API (cacheia para uso posterior)
+        ct  = self._fetch_ct_val()
         bal = self.balance()
-        log.info(f"  ✅ OKX conectada | Saldo: {bal:.4f} USDT")
-        if bal < 20:
-            log.warning(f"  ⚠️  Saldo baixo ({bal:.2f} USDT) — mínimo ~20 USDT para 1 contrato ETH-USDT-SWAP 1x")
+        px  = self.mark_price()
+        min_usdt = ct * px  # margem mínima para 1 contrato em 1x
+        log.info(f"  ✅ OKX conectada | Saldo: {bal:.4f} USDT | "
+                 f"Mín. 1 contrato: {min_usdt:.2f} USDT")
+        qty_eth = (bal * LiveTrader.PCT) / px if px > 0 else 0
+        cts     = max(1, int(qty_eth / ct))
+        log.info(f"  📐 95% saldo → {qty_eth:.4f} ETH → {cts} contratos "
+                 f"({cts*ct:.4f} ETH = {cts*ct*px:.2f} USDT)")
         return bal > 0
 
 # ═══════════════════════════════════════════════════════════════════════════════
