@@ -353,8 +353,9 @@ class LiveTrader:
 # ═══════════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 _trader: Optional[LiveTrader] = None
-_lock   = threading.Lock()
-_logs:  List[str] = []
+_lock      = threading.Lock()
+_logs:     List[str] = []
+_starting  = False   # flag: thread em andamento (evita duplicatas entre workers)
 
 class _LogCap(logging.Handler):
     def emit(self, r):
@@ -470,31 +471,37 @@ poll();setInterval(poll,4000);
 </body></html>"""
 
 def _thread():
-    global _trader
-    log.info("📥 Baixando histórico OKX...")
+    global _trader, _starting
+    log.info("📥 Baixando histórico OKX (300 candles)...")
     try:
-        df = DataCollector(symbol=SYMBOL,timeframe=TIMEFRAME,limit=TOTAL_CANDLES).fetch_ohlcv()
+        df = DataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=TOTAL_CANDLES).fetch_ohlcv()
+        log.info(f"  ✅ {len(df)} candles recebidos")
         if df.empty:
-            log.error("❌ Sem dados históricos")
-            _trader = None
+            log.error("❌ Sem dados — OKX não respondeu")
             return
-        df = df.reset_index(drop=True); df['index'] = df.index
+        df = df.reset_index(drop=True)
+        df['index'] = df.index
         _trader = LiveTrader()
-        _trader.run(df)
+        _trader.run(df)   # bloqueia até stop()
     except Exception as e:
-        log.error(f"❌ {e}\n{traceback.format_exc()}")
+        log.error(f"❌ Erro na thread: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
     finally:
-        # Garante que _trader volta a None se parou/falhou
-        # (permite re-iniciar pelo botão)
+        _starting = False
         if _trader and not _trader._running:
             _trader = None
-            log.info("🔄 Trader resetado — pronto para re-iniciar")
+        log.info("🔄 Thread encerrada — pronto para re-iniciar")
 
 def _auto():
+    global _starting
     if not _creds_ok():
-        log.warning("⚠️  Chaves OKX não encontradas no ambiente — use o botão Iniciar.")
+        log.warning("⚠️  Chaves OKX não encontradas — use o botão Iniciar no dashboard.")
         return
-    log.info("🚀 Chaves OKX OK — iniciando trader automaticamente...")
+    if _starting:
+        log.info("ℹ️  Thread já em andamento (outro worker), ignorando.")
+        return
+    _starting = True
+    log.info("🚀 Chaves OK — iniciando...")
     threading.Thread(target=_thread, daemon=True).start()
 
 @app.route('/')
@@ -504,7 +511,8 @@ def index(): return DASH
 def status():
     t = _trader
     if t is None:
-        return jsonify({"status":"stopped","tc":0,"trades":[],"log":_logs[-80:]})
+        st = "warming" if _starting else "stopped"
+        return jsonify({"status":st,"tc":0,"trades":[],"log":_logs[-80:]})
     real=None; bal=None; ct=0.01
     try: real=t.okx.position(); bal=t.okx.balance(); ct=t.okx.ct_val()
     except: pass
@@ -517,14 +525,17 @@ def status():
 
 @app.route('/start', methods=['POST'])
 def start():
-    global _trader
+    global _trader, _starting
     with _lock:
+        if _starting:
+            return jsonify({"message":"Já está iniciando, aguarde..."})
         if _trader and _trader._running:
             return jsonify({"message":"Já está rodando"})
         if not _creds_ok():
             return jsonify({"error":"Chaves OKX não encontradas no Render"}), 400
+        _starting = True
         threading.Thread(target=_thread, daemon=True).start()
-        return jsonify({"message":"Iniciando — aguarde ~60s para o warmup concluir"})
+        return jsonify({"message":"Iniciando — aguarde ~10s"})
 
 @app.route('/stop', methods=['POST'])
 def stop():
