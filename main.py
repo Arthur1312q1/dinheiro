@@ -369,8 +369,7 @@ class LiveTrader:
 # ═══════════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 _trader: Optional[LiveTrader] = None
-_lock      = threading.Lock()
-_starting  = False
+_lock  = threading.Lock()
 _logs: List[str] = []
 
 class _LogCap(logging.Handler):
@@ -487,15 +486,13 @@ poll();setInterval(poll,4000);
 </body></html>"""
 
 def _thread():
-    global _trader, _starting
-    _starting = True
+    global _trader
     log.info("📥 Baixando 300 candles OKX...")
     try:
         df = DataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=TOTAL_CANDLES).fetch_ohlcv()
         log.info(f"  ✅ {len(df)} candles")
         if df.empty:
-            log.error("❌ OKX sem dados")
-            return
+            log.error("❌ OKX sem dados"); return
         df = df.reset_index(drop=True)
         df['index'] = df.index
         _trader = LiveTrader()
@@ -504,16 +501,8 @@ def _thread():
         log.error(f"❌ {type(e).__name__}: {e}")
         log.error(traceback.format_exc())
     finally:
-        _trader   = None
-        _starting = False
+        _trader = None
         log.info("🔄 Pronto para re-iniciar")
-
-def _auto():
-    if not _creds_ok():
-        log.warning("⚠️  Chaves OKX não encontradas no Render.")
-        return
-    log.info("🚀 Chaves OK — iniciando trader...")
-    threading.Thread(target=_thread, daemon=True).start()
 
 @app.route('/')
 def index(): return DASH
@@ -522,9 +511,7 @@ def index(): return DASH
 def status():
     t = _trader
     if t is None:
-        st = "warming" if _starting else "stopped"
-        return jsonify({"status":st,"tc":0,"trades":[],"log":_logs[-80:]})
-    # Cache — sem HTTP aqui, não bloqueia o worker
+        return jsonify({"status":"stopped","tc":0,"trades":[],"log":_logs[-80:]})
     s = "running" if t._running else ("warming" if t._warming else "stopped")
     return jsonify({"status":s,
                     "pos":t._cache_pos,"bal":t._cache_bal,"ct":t._cache_ct,
@@ -534,10 +521,9 @@ def status():
 
 @app.route('/start', methods=['POST'])
 def start():
-    global _trader, _starting
     with _lock:
-        if _starting or (_trader and (_trader._running or _trader._warming)):
-            return jsonify({"message":"Já está rodando, aguarde..."})
+        if _trader is not None:
+            return jsonify({"message":"Já está rodando"})
         if not _creds_ok():
             return jsonify({"error":"Chaves OKX não encontradas"}), 400
         threading.Thread(target=_thread, daemon=True).start()
@@ -546,16 +532,20 @@ def start():
 @app.route('/stop', methods=['POST'])
 def stop():
     if _trader: _trader.stop()
-    return jsonify({"message":"Parado com sucesso"})
+    return jsonify({"message":"Parado"})
 
 @app.route('/ping')
 def ping(): return "pong"
 
 @app.route('/health')
-def health(): return jsonify({"ok":True,"creds":_creds_ok(),"running":bool(_trader and (_trader._running or _trader._warming))})
+def health(): return jsonify({"ok":True,"creds":_creds_ok(),"trader":_trader is not None})
 
-# Auto-start: executado quando gunicorn importa o módulo
-_auto()
+# Auto-start quando gunicorn importa o módulo
+if _creds_ok():
+    log.info("🚀 Chaves OK — iniciando trader...")
+    threading.Thread(target=_thread, daemon=True).start()
+else:
+    log.warning("⚠️  Chaves OKX não encontradas — use o botão Iniciar.")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)), debug=False)
