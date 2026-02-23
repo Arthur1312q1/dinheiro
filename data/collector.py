@@ -162,39 +162,35 @@ class DataCollector:
     # ───────────────────────────────────────────────────────────────────────────
     def fetch_ohlcv(self) -> pd.DataFrame:
         """
-        Busca exatamente `self.limit` candles históricos da OKX.
-
-        Estratégia:
-          1. Busca dados recentes (/candles) → ancora o timestamp mais recente
-          2. Busca histórico (/history-candles) para preencher o restante
-          3. Merge e deduplicação por timestamp
-          4. Retorna os `limit` candles mais recentes em ordem cronológica
-
-        Returns:
-            DataFrame com colunas: timestamp, open, high, low, close, volume, index
+        Busca candles da OKX.
+        - Se limit <= 300: uma única requisição rápida (/candles)
+        - Se limit > 300:  paginação via /history-candles + /candles
         """
-        print(f"🔍 OKX: {self.symbol} {self.timeframe} | buscando {self.limit} candles...")
+        print(f"🔍 OKX: {self.symbol} {self.timeframe} | {self.limit} candles...")
 
-        # ── Passo 1: dados recentes (âncora) ──────────────────────────────
-        print(f"   [1/2] Candles recentes...")
-        recent = self._fetch_recent(limit=300)
+        # ── Caminho rápido: até 300 candles = 1 request ───────────────────
+        if self.limit <= 300:
+            recent = self._fetch_recent(limit=self.limit)
+            if not recent:
+                print("  ⚠️ Sem dados — usando mock")
+                return self._mock()
+            all_raw = recent
+            print(f"  ✅ {len(all_raw)} candles (1 request)")
 
-        if not recent:
-            print("  ⚠️ Sem dados recentes — usando mock")
-            return self._mock()
-
-        oldest_recent_ts = int(recent[0][0])   # timestamp do mais antigo no batch recente
-        print(f"   ✓ {len(recent)} candles recentes | mais antigo: {oldest_recent_ts}")
-
-        # ── Passo 2: histórico para trás até ter `limit` candles ──────────
-        needed = self.limit - len(recent) + 50   # +50 overlap para dedup
-        print(f"   [2/2] Histórico ({needed} candles)...")
-
-        historical = self._fetch_history(limit=needed, before_ts_ms=oldest_recent_ts)
-        print(f"   ✓ {len(historical)} candles históricos")
-
-        # ── Passo 3: Merge ────────────────────────────────────────────────
-        all_raw = historical + recent
+        # ── Caminho histórico: > 300 candles ──────────────────────────────
+        else:
+            print(f"   [1/2] Candles recentes...")
+            recent = self._fetch_recent(limit=300)
+            if not recent:
+                print("  ⚠️ Sem dados recentes — usando mock")
+                return self._mock()
+            oldest_recent_ts = int(recent[0][0])
+            print(f"   ✓ {len(recent)} recentes")
+            needed = self.limit - len(recent) + 50
+            print(f"   [2/2] Histórico ({needed} candles)...")
+            historical = self._fetch_history(limit=needed, before_ts_ms=oldest_recent_ts)
+            print(f"   ✓ {len(historical)} históricos")
+            all_raw = historical + recent
 
         if not all_raw:
             print("  ⚠️ Sem dados — usando mock")
