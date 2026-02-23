@@ -19,8 +19,10 @@ log = logging.getLogger('azlema')
 # ── Config hardcoded ──────────────────────────────────────────────────────────
 SYMBOL    = "ETH-USDT"
 TIMEFRAME = "30m"
-TOTAL_CANDLES    = 5500   # 1000 warmup + 4500 trading
-WARMUP_CANDLES   = 1000
+# Live: 300 candles = 1 request OKX = startup em ~5s
+# IFM converge em ~50 bars, ZLEMA em ~20 bars → 300 é mais que suficiente
+TOTAL_CANDLES    = 300
+WARMUP_CANDLES   = 300
 STRATEGY_CONFIG  = {
     "adaptive_method": "Cos IFM", "threshold": 0.0,
     "fixed_sl_points": 2000, "fixed_tp_points": 55, "trail_offset": 15,
