@@ -218,9 +218,13 @@ class LiveTrader:
         self.okx      = OKX()
         self.strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         self._running = False
-        self._warming = False  # True apenas durante o warmup
+        self._warming = False
         self.log: List[Dict] = []
-        self._pnl_baseline = 0.0  # PnL histórico do warmup (excluído do live PnL)
+        self._pnl_baseline = 0.0
+        # Cache para /status — evita HTTP request a cada poll do dashboard
+        self._cache_pos: Optional[Dict] = None
+        self._cache_bal: float = 0.0
+        self._cache_ct:  float = 0.001
 
     def _qty(self):
         bal = self.okx.balance(); px = self.okx.mark_price()
@@ -255,6 +259,7 @@ class LiveTrader:
         # O PnL real (live) será sempre relativo a este momento
         self._pnl_baseline = self.strategy.net_profit
         self._warming = False
+        self._refresh_cache()
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} EC={self.strategy.EC:.2f} "
                  f"| baseline_pnl={self._pnl_baseline:.2f} (histórico simulado, ignorado)")
         self._sync()
@@ -341,10 +346,20 @@ class LiveTrader:
             try:
                 self._wait(tf)
                 c = self._candle()
-                if c: self.process(c)
+                if c:
+                    self._refresh_cache()
+                    self.process(c)
             except Exception as e:
                 log.error(f"❌ {e}"); time.sleep(60)
         log.info("🔴 Trader encerrado")
+
+    def _refresh_cache(self):
+        try:
+            self._cache_pos = self.okx.position()
+            self._cache_bal = self.okx.balance()
+            self._cache_ct  = self.okx.ct_val()
+        except Exception as e:
+            log.warning(f"  ⚠️ cache: {e}")
 
     def stop(self): self._running = False
 
@@ -513,12 +528,10 @@ def status():
     if t is None:
         st = "warming" if _starting else "stopped"
         return jsonify({"status":st,"tc":0,"trades":[],"log":_logs[-80:]})
-    real=None; bal=None; ct=0.01
-    try: real=t.okx.position(); bal=t.okx.balance(); ct=t.okx.ct_val()
-    except: pass
+    # Cache — sem HTTP aqui, não bloqueia o worker
     s = "running" if t._running else ("warming" if t._warming else "stopped")
     return jsonify({"status":s,
-                    "pos":real,"bal":bal,"ct":ct,
+                    "pos":t._cache_pos,"bal":t._cache_bal,"ct":t._cache_ct,
                     "pnl":t.live_pnl,
                     "period":t.strategy.Period,"ec":t.strategy.EC,"ema":t.strategy.EMA,
                     "tc":len(t.log),"trades":t.log[-10:],"log":_logs[-80:]})
