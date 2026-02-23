@@ -106,19 +106,21 @@ class OKX:
         return getattr(self, '_ct_val', 0.001)  # ETH-USDT-SWAP: 0.001 ETH/contrato
 
     def _fetch_ct_val(self):
-        """Busca ct_val real da API e cacheia. Chamado apenas no setup()."""
+        """Usa 0.001 ETH/contrato (valor correto para ETH-USDT-SWAP OKX).
+        Loga o que a API retorna para referência, mas não usa — a API às vezes
+        retorna ctVal em unidade diferente (ex: 0.1 em vez de 0.001)."""
+        CT_FIXED = 0.001  # 1 contrato = 0.001 ETH (confirmado pelo usuário)
         try:
-            r = self._get("/api/v5/public/instruments",
-                          {"instType": "SWAP", "instId": self.INST})
-            val = float(r["data"][0]["ctVal"])
-            self._ct_val = val
-            log.info(f"  ✅ ct_val={val} ETH/contrato | "
-                     f"1 contrato = {val * self.mark_price():.4f} USDT")
-            return val
+            r   = self._get("/api/v5/public/instruments",
+                            {"instType": "SWAP", "instId": self.INST})
+            api = float(r["data"][0]["ctVal"])
+            log.info(f"  ℹ️  API ctVal={api} (ignorado) → usando fixo {CT_FIXED} ETH/contrato")
         except Exception as e:
-            log.error(f"  ❌ Erro ao buscar ct_val: {e} → usando 0.001")
-            self._ct_val = 0.001
-            return 0.001
+            log.warning(f"  ⚠️  Não foi possível buscar ctVal da API: {e}")
+        self._ct_val = CT_FIXED
+        log.info(f"  ✅ ct_val={CT_FIXED} ETH/contrato | "
+                 f"1 contrato ≈ {CT_FIXED * self.mark_price():.4f} USDT")
+        return CT_FIXED
 
     def _cts(self, eth):
         """Converte ETH em número inteiro de contratos."""
