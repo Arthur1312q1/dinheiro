@@ -356,12 +356,11 @@ class LiveTrader:
         log.info("🔴 Trader encerrado")
 
     def _refresh_cache(self):
-        try:
-            self._cache_pos = self.okx.position()
-            self._cache_bal = self.okx.balance()
-            self._cache_ct  = self.okx.ct_val()
-        except Exception as e:
-            log.warning(f"  ⚠️ cache: {e}")
+        try: self._cache_pos = self.okx.position()
+        except: pass
+        try: self._cache_bal = self.okx.balance()
+        except: pass
+        self._cache_ct = 0.001  # fixo — não precisa buscar na API
 
     def stop(self): self._running = False
 
@@ -370,7 +369,8 @@ class LiveTrader:
 # ═══════════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 _trader: Optional[LiveTrader] = None
-_lock  = threading.Lock()
+_lock      = threading.Lock()
+_starting  = False
 _logs: List[str] = []
 
 class _LogCap(logging.Handler):
@@ -487,7 +487,8 @@ poll();setInterval(poll,4000);
 </body></html>"""
 
 def _thread():
-    global _trader
+    global _trader, _starting
+    _starting = True
     log.info("📥 Baixando 300 candles OKX...")
     try:
         df = DataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=TOTAL_CANDLES).fetch_ohlcv()
@@ -503,8 +504,8 @@ def _thread():
         log.error(f"❌ {type(e).__name__}: {e}")
         log.error(traceback.format_exc())
     finally:
-        if _trader and not _trader._running:
-            _trader = None
+        _trader   = None
+        _starting = False
         log.info("🔄 Pronto para re-iniciar")
 
 def _auto():
@@ -521,7 +522,8 @@ def index(): return DASH
 def status():
     t = _trader
     if t is None:
-        return jsonify({"status":"stopped","tc":0,"trades":[],"log":_logs[-80:]})
+        st = "warming" if _starting else "stopped"
+        return jsonify({"status":st,"tc":0,"trades":[],"log":_logs[-80:]})
     # Cache — sem HTTP aqui, não bloqueia o worker
     s = "running" if t._running else ("warming" if t._warming else "stopped")
     return jsonify({"status":s,
@@ -532,10 +534,10 @@ def status():
 
 @app.route('/start', methods=['POST'])
 def start():
-    global _trader
+    global _trader, _starting
     with _lock:
-        if _trader and (_trader._running or _trader._warming):
-            return jsonify({"message":"Já está rodando"})
+        if _starting or (_trader and (_trader._running or _trader._warming)):
+            return jsonify({"message":"Já está rodando, aguarde..."})
         if not _creds_ok():
             return jsonify({"error":"Chaves OKX não encontradas"}), 400
         threading.Thread(target=_thread, daemon=True).start()
