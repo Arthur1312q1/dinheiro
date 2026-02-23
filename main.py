@@ -216,6 +216,7 @@ class LiveTrader:
         self.okx      = OKX()
         self.strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         self._running = False
+        self._warming = False  # True apenas durante o warmup
         self.log: List[Dict] = []
         self._pnl_baseline = 0.0  # PnL histórico do warmup (excluído do live PnL)
 
@@ -242,6 +243,7 @@ class LiveTrader:
                          "price":price,"qty":qty,"reason":reason})
 
     def warmup(self, df):
+        self._warming = True
         log.info(f"🔄 Warmup: {len(df)} candles (sem execução real)...")
         for _, row in df.iterrows():
             self.strategy.next({'open':float(row['open']),'high':float(row['high']),
@@ -250,6 +252,7 @@ class LiveTrader:
         # Salva baseline: PnL acumulado do histórico simulado
         # O PnL real (live) será sempre relativo a este momento
         self._pnl_baseline = self.strategy.net_profit
+        self._warming = False
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} EC={self.strategy.EC:.2f} "
                  f"| baseline_pnl={self._pnl_baseline:.2f} (histórico simulado, ignorado)")
         self._sync()
@@ -469,13 +472,21 @@ def _thread():
     log.info("📥 Baixando histórico OKX...")
     try:
         df = DataCollector(symbol=SYMBOL,timeframe=TIMEFRAME,limit=TOTAL_CANDLES).fetch_ohlcv()
-        if df.empty: log.error("❌ Sem dados históricos"); return
+        if df.empty:
+            log.error("❌ Sem dados históricos")
+            _trader = None
+            return
         df = df.reset_index(drop=True); df['index'] = df.index
         _trader = LiveTrader()
         _trader.run(df)
     except Exception as e:
         log.error(f"❌ {e}\n{traceback.format_exc()}")
-        if _trader: _trader._running = False
+    finally:
+        # Garante que _trader volta a None se parou/falhou
+        # (permite re-iniciar pelo botão)
+        if _trader and not _trader._running:
+            _trader = None
+            log.info("🔄 Trader resetado — pronto para re-iniciar")
 
 def _auto():
     if not _creds_ok():
@@ -495,7 +506,8 @@ def status():
     real=None; bal=None; ct=0.01
     try: real=t.okx.position(); bal=t.okx.balance(); ct=t.okx.ct_val()
     except: pass
-    return jsonify({"status":"running" if t._running else "warming",
+    s = "running" if t._running else ("warming" if t._warming else "stopped")
+    return jsonify({"status":s,
                     "pos":real,"bal":bal,"ct":ct,
                     "pnl":t.live_pnl,
                     "period":t.strategy.Period,"ec":t.strategy.EC,"ema":t.strategy.EMA,
