@@ -63,11 +63,15 @@ class OKX:
         b = json.dumps(body)
         return requests.post(self.BASE+path, headers=self._h("POST",path,b), data=b, timeout=10).json()
 
-    def balance(self):
+    def balance(self, verbose=False):
         """Retorna saldo USDT disponível para trading (conta unificada OKX)."""
         try:
             data = self._get("/api/v5/account/balance", {"ccy": "USDT"})
             acct = data["data"][0]
+            if verbose:
+                for d in acct.get("details",[]):
+                    if d["ccy"]=="USDT":
+                        log.info(f"  📊 USDT: availBal={d.get('availBal')} availEq={d.get('availEq')} cashBal={d.get('cashBal')} frozenBal={d.get('frozenBal')} disEq={d.get('disEq')}")
             # Tenta availBal direto; se zero, usa availEq (saldo ajustado cross)
             for d in acct.get("details", []):
                 if d["ccy"] == "USDT":
@@ -129,7 +133,8 @@ class OKX:
         return max(1, cts)
 
     def _order(self, side, ps, sz):
-        body = {"instId":self.INST,"tdMode":"isolated","side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
+        td   = getattr(self, "_td_mode", "isolated")
+        body = {"instId":self.INST,"tdMode":td,"side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
         r    = self._post("/api/v5/trade/order", body)
         ok   = r.get("code") == "0"
         if ok:
@@ -175,25 +180,40 @@ class OKX:
             return "net_mode"
 
     def setup(self):
-        # Detectar modo atual antes de tentar mudar
-        current_mode = self.get_pos_mode()
-        log.info(f"  ℹ️  Position mode atual: {current_mode}")
+        # Detectar account level e modo atual
+        try:
+            cfg = self._get("/api/v5/account/config")
+            d0  = cfg["data"][0]
+            acct_lv = d0.get("acctLv", "2")
+            pos_mode = d0.get("posMode", "net_mode")
+            log.info(f"  ℹ️  acctLv={acct_lv} posMode={pos_mode}")
+        except Exception as e:
+            log.warning(f"  ⚠️  config: {e}")
+            acct_lv = "2"; pos_mode = "net_mode"
 
-        # Tentar mudar para hedge mode (long_short_mode)
+        # tdMode: UTA (acctLv=3,4) usa cross; regular usa isolated
+        self._td_mode = "cross" if acct_lv in ("3","4") else "isolated"
+        log.info(f"  ℹ️  tdMode={self._td_mode} (acctLv={acct_lv})")
+
+        # Tentar mudar para hedge mode
         r = self._post("/api/v5/account/set-position-mode", {"posMode":"long_short_mode"})
         if r.get("code") == "0":
             self._pos_mode = "long_short_mode"
-            log.info("  ✅ Modo hedge (long_short_mode) ativado")
+            log.info("  ✅ Modo hedge ativado")
         else:
-            # Conta pode não suportar ou já ter posição aberta → usar modo atual
-            self._pos_mode = current_mode
-            log.warning(f"  ⚠️  Não mudou position mode: {r.get('msg')} → usando {current_mode}")
+            self._pos_mode = pos_mode
+            log.warning(f"  ⚠️  posMode: {r.get('msg')} → usando {pos_mode}")
 
         # Alavancagem 1x
-        rl = self._post("/api/v5/account/set-leverage",
-                        {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"long"})
-        self._post("/api/v5/account/set-leverage",
-                   {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"short"})
+        mgn = self._td_mode  # cross ou isolated
+        if mgn == "isolated" and self._pos_mode == "long_short_mode":
+            self._post("/api/v5/account/set-leverage",
+                       {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"long"})
+            rl = self._post("/api/v5/account/set-leverage",
+                            {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"short"})
+        else:
+            rl = self._post("/api/v5/account/set-leverage",
+                            {"instId":self.INST,"lever":"1","mgnMode":mgn})
         if rl.get("code") == "0":
             log.info("  ✅ Alavancagem 1x configurada")
         else:
@@ -201,7 +221,7 @@ class OKX:
 
         # Busca ct_val real da API (cacheia para uso posterior)
         ct  = self._fetch_ct_val()
-        bal = self.balance()
+        bal = self.balance(verbose=True)  # loga campos completos 1x para diagnóstico
         px  = self.mark_price()
         min_usdt = ct * px  # margem mínima para 1 contrato em 1x
         log.info(f"  ✅ OKX conectada | Saldo: {bal:.4f} USDT | "
