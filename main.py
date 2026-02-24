@@ -156,20 +156,27 @@ class OKX:
         return max(1, cts)
 
     def _order(self, side, ps, sz):
-        td   = getattr(self, "_td_mode", "isolated")
-        body = {"instId":self.INST,"tdMode":td,"side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
-        r    = self._post("/api/v5/trade/order", body)
-        ok   = r.get("code") == "0"
-        if ok:
-            sc = r.get("data",[{}])[0].get("sCode","")
-            log.info(f"  ✅ ORDER {side}/{ps} sz={sz} sCode={sc}")
-        else:
-            # Log COMPLETO para diagnóstico
+        # Tenta na ordem: cross → isolated → cash (sem posSide)
+        for td in ["cross", "isolated"]:
+            body = {"instId":self.INST,"tdMode":td,"side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
+            r    = self._post("/api/v5/trade/order", body)
+            if r.get("code") == "0":
+                sc = r.get("data",[{}])[0].get("sCode","")
+                log.info(f"  ✅ ORDER {side}/{ps} sz={sz} tdMode={td} sCode={sc}")
+                self._td_mode = td   # guarda o modo que funcionou
+                return r
             d0 = r.get("data",[{}])[0] if r.get("data") else {}
-            log.error(f"  ❌ ORDER {side}/{ps} sz={sz} FALHOU")
-            log.error(f"     code={r.get('code')} msg={r.get('msg')}")
-            log.error(f"     sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
-            log.error(f"     body={body}")
+            sc = d0.get("sCode","")
+            log.warning(f"  ⚠️  tdMode={td} falhou sCode={sc} → tentando próximo...")
+        # Tentativa final: net mode (sem posSide)
+        body = {"instId":self.INST,"tdMode":"cross","side":side,"ordType":"market","sz":str(sz)}
+        r    = self._post("/api/v5/trade/order", body)
+        if r.get("code") == "0":
+            log.info(f"  ✅ ORDER {side} sz={sz} net mode OK")
+            return r
+        d0 = r.get("data",[{}])[0] if r.get("data") else {}
+        log.error(f"  ❌ ORDER {side}/{ps} sz={sz} TODAS AS TENTATIVAS FALHARAM")
+        log.error(f"     sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
         return r
 
     def _fill(self, r):
