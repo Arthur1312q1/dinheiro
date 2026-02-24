@@ -129,7 +129,7 @@ class OKX:
         return max(1, cts)
 
     def _order(self, side, ps, sz):
-        body = {"instId":self.INST,"tdMode":"cross","side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
+        body = {"instId":self.INST,"tdMode":"isolated","side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
         r    = self._post("/api/v5/trade/order", body)
         ok   = r.get("code") == "0"
         if ok:
@@ -191,7 +191,9 @@ class OKX:
 
         # Alavancagem 1x
         rl = self._post("/api/v5/account/set-leverage",
-                        {"instId":self.INST,"lever":"1","mgnMode":"cross"})
+                        {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"long"})
+        self._post("/api/v5/account/set-leverage",
+                   {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"short"})
         if rl.get("code") == "0":
             log.info("  ✅ Alavancagem 1x configurada")
         else:
