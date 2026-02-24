@@ -63,6 +63,29 @@ class OKX:
         b = json.dumps(body)
         return requests.post(self.BASE+path, headers=self._h("POST",path,b), data=b, timeout=10).json()
 
+    def transfer_to_trading(self):
+        """Transfere todo saldo USDT da conta Funding para Trading antes de operar."""
+        try:
+            # Buscar saldo na conta Funding (type=6)
+            r = requests.get(self.BASE + "/api/v5/asset/balances",
+                             headers=self._h("GET", "/api/v5/asset/balances"),
+                             params={"ccy": "USDT"}, timeout=10).json()
+            avail = 0.0
+            for d in r.get("data", []):
+                if d.get("ccy") == "USDT":
+                    avail = float(d.get("availBal", 0) or 0)
+            if avail > 0.01:
+                body = {"ccy":"USDT","amt":str(avail),"from":"6","to":"18","type":"0"}
+                t = self._post("/api/v5/asset/transfer", body)
+                if t.get("code") == "0":
+                    log.info(f"  ✅ Transferido {avail:.4f} USDT Funding → Trading")
+                else:
+                    log.warning(f"  ⚠️  Transfer: {t.get('msg')}")
+            else:
+                log.info(f"  ℹ️  Funding USDT={avail:.4f} (nada a transferir)")
+        except Exception as e:
+            log.warning(f"  ⚠️  transfer_to_trading: {e}")
+
     def balance(self, verbose=False):
         """Retorna saldo USDT disponível para trading (conta unificada OKX)."""
         try:
@@ -219,6 +242,8 @@ class OKX:
         else:
             log.warning(f"  ⚠️  set-leverage: {rl.get('msg')}")
 
+        # Tentar transferir Funding → Trading antes de checar saldo
+        self.transfer_to_trading()
         # Busca ct_val real da API (cacheia para uso posterior)
         ct  = self._fetch_ct_val()
         bal = self.balance(verbose=True)  # loga campos completos 1x para diagnóstico
@@ -251,6 +276,7 @@ class LiveTrader:
         self._cache_ct:  float = 0.001
 
     def _qty(self):
+        self.okx.transfer_to_trading()   # garante saldo na conta Trading
         bal = self.okx.balance(); px = self.okx.mark_price()
         if bal <= 0 or px <= 0: return 0.0
         q = (bal * self.PCT) / px
