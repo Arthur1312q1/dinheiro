@@ -156,27 +156,22 @@ class OKX:
         return max(1, cts)
 
     def _order(self, side, ps, sz):
-        # Tenta na ordem: cross → isolated → cash (sem posSide)
+        # ps='net' = conta em one-way mode: NÃO incluir posSide no body
+        net_mode = (ps == 'net')
         for td in ["cross", "isolated"]:
-            body = {"instId":self.INST,"tdMode":td,"side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
-            r    = self._post("/api/v5/trade/order", body)
+            if net_mode:
+                body = {"instId":self.INST,"tdMode":td,"side":side,"ordType":"market","sz":str(sz)}
+            else:
+                body = {"instId":self.INST,"tdMode":td,"side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
+            r  = self._post("/api/v5/trade/order", body)
             if r.get("code") == "0":
                 sc = r.get("data",[{}])[0].get("sCode","")
-                log.info(f"  ✅ ORDER {side}/{ps} sz={sz} tdMode={td} sCode={sc}")
-                self._td_mode = td   # guarda o modo que funcionou
+                log.info(f"  ✅ ORDER {side} sz={sz} tdMode={td} sCode={sc}")
+                self._td_mode = td
                 return r
             d0 = r.get("data",[{}])[0] if r.get("data") else {}
-            sc = d0.get("sCode","")
-            log.warning(f"  ⚠️  tdMode={td} falhou sCode={sc} → tentando próximo...")
-        # Tentativa final: net mode (sem posSide)
-        body = {"instId":self.INST,"tdMode":"cross","side":side,"ordType":"market","sz":str(sz)}
-        r    = self._post("/api/v5/trade/order", body)
-        if r.get("code") == "0":
-            log.info(f"  ✅ ORDER {side} sz={sz} net mode OK")
-            return r
-        d0 = r.get("data",[{}])[0] if r.get("data") else {}
-        log.error(f"  ❌ ORDER {side}/{ps} sz={sz} TODAS AS TENTATIVAS FALHARAM")
-        log.error(f"     sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
+            log.warning(f"  ⚠️  tdMode={td} sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
+        log.error(f"  ❌ ORDER {side} sz={sz} falhou em cross e isolated")
         return r
 
     def _fill(self, r):
