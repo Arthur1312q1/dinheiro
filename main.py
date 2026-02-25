@@ -371,18 +371,24 @@ class LiveTrader:
                     self.okx.close_short(real['size'] * self.okx.ct_val())
                 log.info(f"  🟢 ENTER LONG {qty:.4f} ETH")
                 r, qty = self.okx.open_long(qty)
-                px = self.okx._fill(r) or self.okx.mark_price()
-                self.strategy.confirm_fill('BUY', px, qty, ts)
-                self._add_log("ENTER_LONG", px, qty)
+                if r.get("code") == "0":  # só confirma se a ordem foi aceita
+                    px = self.okx._fill(r) or self.okx.mark_price()
+                    self.strategy.confirm_fill('BUY', px, qty, ts)
+                    self._add_log("ENTER_LONG", px, qty)
+                else:
+                    log.error("  ❌ Ordem rejeitada — estratégia NÃO atualizada")
             elif side == 'SELL':
                 real = self.okx.position()
                 if real and real['side'] == 'long':
                     self.okx.close_long(real['size'] * self.okx.ct_val())
                 log.info(f"  🟢 ENTER SHORT {qty:.4f} ETH")
                 r, qty = self.okx.open_short(qty)
-                px = self.okx._fill(r) or self.okx.mark_price()
-                self.strategy.confirm_fill('SELL', px, qty, ts)
-                self._add_log("ENTER_SHORT", px, qty)
+                if r.get("code") == "0":  # só confirma se a ordem foi aceita
+                    px = self.okx._fill(r) or self.okx.mark_price()
+                    self.strategy.confirm_fill('SELL', px, qty, ts)
+                    self._add_log("ENTER_SHORT", px, qty)
+                else:
+                    log.error("  ❌ Ordem rejeitada — estratégia NÃO atualizada")
 
     def _wait(self, tf=30):
         now  = datetime.utcnow()
@@ -620,4 +626,3 @@ threading.Thread(target=_delayed_start, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)), debug=False)
-    
