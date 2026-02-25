@@ -10,8 +10,6 @@ from flask import Flask, jsonify
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 from data.collector import DataCollector
-from backtest.engine import BacktestEngine
-from backtest.reporter import BacktestReporter
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('azlema')
@@ -591,11 +589,16 @@ def ping(): return "pong"
 def health(): return jsonify({"ok":True,"creds":_creds_ok(),"trader":_trader is not None})
 
 # Auto-start quando gunicorn importa o módulo
-if _creds_ok():
-    log.info("🚀 Chaves OK — iniciando trader...")
-    threading.Thread(target=_thread, daemon=True).start()
-else:
-    log.warning("⚠️  Chaves OKX não encontradas — use o botão Iniciar.")
+# Delay de 5s: garante que o Flask sobe e responde ao health check do Render primeiro
+def _delayed_start():
+    time.sleep(5)
+    if _creds_ok():
+        log.info("🚀 Chaves OK — iniciando trader...")
+        threading.Thread(target=_thread, daemon=True).start()
+    else:
+        log.warning("⚠️  Chaves OKX não encontradas — use o botão Iniciar.")
+
+threading.Thread(target=_delayed_start, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)), debug=False)
