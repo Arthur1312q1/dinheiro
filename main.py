@@ -346,7 +346,9 @@ class LiveTrader:
                  f"el={self.strategy._el} es={self.strategy._es}")
 
         for act in actions:
-            kind = act.get('action',''); real = self.okx.position()
+            kind = act.get('action','')
+            real = self.okx.position()
+
             if kind == 'EXIT_LONG' and real and real['side'] == 'long':
                 log.info(f"  🔴 EXIT LONG ({act.get('exit_reason')})")
                 qty = real['size'] * self.okx.ct_val()
@@ -354,6 +356,7 @@ class LiveTrader:
                 px = self.okx._fill(r) or act['price']
                 self.strategy.confirm_exit('LONG', px, qty, ts, act.get('exit_reason',''))
                 self._add_log("EXIT_LONG", px, qty, act.get('exit_reason',''))
+
             elif kind == 'EXIT_SHORT' and real and real['side'] == 'short':
                 log.info(f"  🔴 EXIT SHORT ({act.get('exit_reason')})")
                 qty = real['size'] * self.okx.ct_val()
@@ -362,33 +365,35 @@ class LiveTrader:
                 self.strategy.confirm_exit('SHORT', px, qty, ts, act.get('exit_reason',''))
                 self._add_log("EXIT_SHORT", px, qty, act.get('exit_reason',''))
 
-        for order in self.strategy.get_pending_orders():
-            side = order['side']; qty = self._qty()
-            if qty <= 0: continue
-            if side == 'BUY':
-                real = self.okx.position()
+            elif kind == 'BUY':
+                qty = self._qty()
+                if qty <= 0:
+                    log.warning("  ⚠️  BUY ignorado: qty=0"); continue
                 if real and real['side'] == 'short':
                     self.okx.close_short(real['size'] * self.okx.ct_val())
                 log.info(f"  🟢 ENTER LONG {qty:.4f} ETH")
                 r, qty = self.okx.open_long(qty)
-                if r.get("code") == "0":  # só confirma se a ordem foi aceita
+                if r.get("code") == "0":
                     px = self.okx._fill(r) or self.okx.mark_price()
                     self.strategy.confirm_fill('BUY', px, qty, ts)
                     self._add_log("ENTER_LONG", px, qty)
                 else:
-                    log.error("  ❌ Ordem rejeitada — estratégia NÃO atualizada")
-            elif side == 'SELL':
-                real = self.okx.position()
+                    log.error("  ❌ Ordem LONG rejeitada — estratégia NÃO atualizada")
+
+            elif kind == 'SELL':
+                qty = self._qty()
+                if qty <= 0:
+                    log.warning("  ⚠️  SELL ignorado: qty=0"); continue
                 if real and real['side'] == 'long':
                     self.okx.close_long(real['size'] * self.okx.ct_val())
                 log.info(f"  🟢 ENTER SHORT {qty:.4f} ETH")
                 r, qty = self.okx.open_short(qty)
-                if r.get("code") == "0":  # só confirma se a ordem foi aceita
+                if r.get("code") == "0":
                     px = self.okx._fill(r) or self.okx.mark_price()
                     self.strategy.confirm_fill('SELL', px, qty, ts)
                     self._add_log("ENTER_SHORT", px, qty)
                 else:
-                    log.error("  ❌ Ordem rejeitada — estratégia NÃO atualizada")
+                    log.error("  ❌ Ordem SHORT rejeitada — estratégia NÃO atualizada")
 
     def _wait(self, tf=30):
         now  = datetime.utcnow()
