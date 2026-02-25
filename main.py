@@ -276,7 +276,25 @@ class LiveTrader:
         self._cache_ct:  float = 0.001
 
     def _qty(self):
-        self.okx.transfer_to_trading()   # garante saldo na conta Trading
+        self.okx.transfer_to_trading()
+        # Log RAW completo do saldo para diagnóstico
+        try:
+            raw = self.okx._get("/api/v5/account/balance", {"ccy":"USDT"})
+            d   = raw["data"][0]
+            for item in d.get("details",[]):
+                if item["ccy"] == "USDT":
+                    log.info(f"  📊 USDT availBal={item.get('availBal')} "
+                             f"availEq={item.get('availEq')} "
+                             f"cashBal={item.get('cashBal')} "
+                             f"frozenBal={item.get('frozenBal')} "
+                             f"disEq={item.get('disEq')} "
+                             f"uTime={item.get('uTime')}")
+            log.info(f"  📊 account totalEq={d.get('totalEq')} "
+                     f"adjEq={d.get('adjEq')} "
+                     f"notionalUsd={d.get('notionalUsd')} "
+                     f"acctId={d.get('uid')}")
+        except Exception as e:
+            log.warning(f"  ⚠️  diag balance: {e}")
         bal = self.okx.balance(); px = self.okx.mark_price()
         if bal <= 0 or px <= 0: return 0.0
         q = (bal * self.PCT) / px
@@ -602,3 +620,4 @@ threading.Thread(target=_delayed_start, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)), debug=False)
+    
