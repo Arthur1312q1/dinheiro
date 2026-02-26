@@ -15,10 +15,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefm
 log = logging.getLogger('azlema')
 
 # ── Config hardcoded ──────────────────────────────────────────────────────────
-SYMBOL    = "ETH-USDT"
+SYMBOL    = "ETH-USDT-SWAP"   # FIX 2: usar SWAP em warmup E live (preços consistentes)
 TIMEFRAME = "30m"
-# Live: 300 candles = 1 request OKX = startup em ~5s
-# IFM converge em ~50 bars, ZLEMA em ~20 bars → 300 é mais que suficiente
 TOTAL_CANDLES    = 300
 WARMUP_CANDLES   = 300
 STRATEGY_CONFIG  = {
@@ -64,7 +62,6 @@ class OKX:
     def transfer_to_trading(self):
         """Transfere todo saldo USDT da conta Funding para Trading antes de operar."""
         try:
-            # Buscar saldo na conta Funding (type=6)
             r = requests.get(self.BASE + "/api/v5/asset/balances",
                              headers=self._h("GET", "/api/v5/asset/balances"),
                              params={"ccy": "USDT"}, timeout=10).json()
@@ -93,17 +90,14 @@ class OKX:
                 for d in acct.get("details",[]):
                     if d["ccy"]=="USDT":
                         log.info(f"  📊 USDT: availBal={d.get('availBal')} availEq={d.get('availEq')} cashBal={d.get('cashBal')} frozenBal={d.get('frozenBal')} disEq={d.get('disEq')}")
-            # Tenta availBal direto; se zero, usa availEq (saldo ajustado cross)
             for d in acct.get("details", []):
                 if d["ccy"] == "USDT":
                     avail = float(d.get("availBal", 0) or 0)
                     if avail > 0:
                         return avail
-                    # availEq inclui PnL não realizado em cross margin
                     eq = float(d.get("availEq", 0) or 0)
                     if eq > 0:
                         return eq
-            # Fallback: equity total da conta em USDT
             total = float(acct.get("totalEq", 0) or 0)
             if total > 0:
                 log.info(f"  ℹ️  Usando totalEq={total:.4f} USDT (conta unificada)")
@@ -131,10 +125,7 @@ class OKX:
         return getattr(self, '_ct_val', 0.001)  # ETH-USDT-SWAP: 0.001 ETH/contrato
 
     def _fetch_ct_val(self):
-        """Usa 0.001 ETH/contrato (valor correto para ETH-USDT-SWAP OKX).
-        Loga o que a API retorna para referência, mas não usa — a API às vezes
-        retorna ctVal em unidade diferente (ex: 0.1 em vez de 0.001)."""
-        CT_FIXED = 0.001  # 1 contrato = 0.001 ETH (confirmado pelo usuário)
+        CT_FIXED = 0.001
         try:
             r   = self._get("/api/v5/public/instruments",
                             {"instType": "SWAP", "instId": self.INST})
@@ -154,9 +145,7 @@ class OKX:
         return max(1, cts)
 
     def _order(self, side, ps, sz):
-        # ps='net' = conta em one-way mode: NÃO incluir posSide no body
         net_mode = (ps == 'net')
-        # PERF: tenta o tdMode já conhecido primeiro (evita retry desnecessário ~200ms)
         td_primary   = getattr(self, '_td_mode', 'cross')
         td_secondary = 'isolated' if td_primary == 'cross' else 'cross'
         for td in [td_primary, td_secondary]:
@@ -183,13 +172,10 @@ class OKX:
         except: return None
 
     def _fill_async(self, r, callback, fallback_px: float):
-        """
-        Busca avgPx em background (não bloqueia o trade path).
-        Chama callback(px) quando tiver o preço real; usa fallback_px imediatamente.
-        """
+        """Busca avgPx em background (não bloqueia o trade path)."""
         def _worker():
             for attempt in range(5):
-                time.sleep(0.3 * (attempt + 1))   # 0.3s, 0.6s, 0.9s, 1.2s, 1.5s
+                time.sleep(0.3 * (attempt + 1))
                 try:
                     oid = r["data"][0]["ordId"]
                     px  = float(self._get("/api/v5/trade/order",
@@ -198,7 +184,7 @@ class OKX:
                         callback(px)
                         return
                 except: pass
-            callback(fallback_px)   # fallback se não conseguir
+            callback(fallback_px)
         threading.Thread(target=_worker, daemon=True).start()
 
     def _ps(self, side_long):
@@ -218,7 +204,6 @@ class OKX:
         return self._order("buy",  self._ps(False), self._cts(qty))
 
     def get_pos_mode(self):
-        """Retorna o modo de posição atual: 'long_short_mode' ou 'net_mode'."""
         try:
             r = self._get("/api/v5/account/config")
             return r["data"][0].get("posMode", "net_mode")
@@ -226,7 +211,6 @@ class OKX:
             return "net_mode"
 
     def setup(self):
-        # Detectar account level e modo atual
         try:
             cfg = self._get("/api/v5/account/config")
             d0  = cfg["data"][0]
@@ -237,11 +221,9 @@ class OKX:
             log.warning(f"  ⚠️  config: {e}")
             acct_lv = "2"; pos_mode = "net_mode"
 
-        # tdMode: UTA (acctLv=3,4) usa cross; regular usa isolated
         self._td_mode = "cross" if acct_lv in ("3","4") else "isolated"
         log.info(f"  ℹ️  tdMode={self._td_mode} (acctLv={acct_lv})")
 
-        # Tentar mudar para hedge mode
         r = self._post("/api/v5/account/set-position-mode", {"posMode":"long_short_mode"})
         if r.get("code") == "0":
             self._pos_mode = "long_short_mode"
@@ -250,8 +232,7 @@ class OKX:
             self._pos_mode = pos_mode
             log.warning(f"  ⚠️  posMode: {r.get('msg')} → usando {pos_mode}")
 
-        # Alavancagem 1x
-        mgn = self._td_mode  # cross ou isolated
+        mgn = self._td_mode
         if mgn == "isolated" and self._pos_mode == "long_short_mode":
             self._post("/api/v5/account/set-leverage",
                        {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"long"})
@@ -265,13 +246,11 @@ class OKX:
         else:
             log.warning(f"  ⚠️  set-leverage: {rl.get('msg')}")
 
-        # Tentar transferir Funding → Trading antes de checar saldo
         self.transfer_to_trading()
-        # Busca ct_val real da API (cacheia para uso posterior)
         ct  = self._fetch_ct_val()
-        bal = self.balance(verbose=True)  # loga campos completos 1x para diagnóstico
+        bal = self.balance(verbose=True)
         px  = self.mark_price()
-        min_usdt = ct * px  # margem mínima para 1 contrato em 1x
+        min_usdt = ct * px
         log.info(f"  ✅ OKX conectada | Saldo: {bal:.4f} USDT | "
                  f"Mín. 1 contrato: {min_usdt:.2f} USDT")
         qty_eth = (bal * LiveTrader.PCT) / px if px > 0 else 0
@@ -284,8 +263,6 @@ class OKX:
 # LIVE TRADER
 # ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
-    # Reduzido de 0.95 → 0.80 para deixar margem suficiente
-    # para fees + maintenance margin da OKX.
     PCT = 0.80
 
     def __init__(self):
@@ -295,17 +272,12 @@ class LiveTrader:
         self._warming = False
         self.log: List[Dict] = []
         self._pnl_baseline = 0.0
-        # Cache para /status e para o hot path de ordens
         self._cache_pos: Optional[Dict] = None
         self._cache_bal: float = 0.0
         self._cache_ct:  float = 0.001
-        self._cache_qty: float = 0.0   # ETH pré-calculado — usado direto na ordem
+        self._cache_qty: float = 0.0
 
     def _qty(self):
-        """
-        Retorna quantidade pré-calculada do cache.
-        ZERO chamadas HTTP no hot path — tudo já foi resolvido no _refresh_cache().
-        """
         qty = self._cache_qty
         if qty <= 0:
             log.warning("  ⚠️  _cache_qty=0 — recalculando na hora (fallback)")
@@ -339,15 +311,13 @@ class LiveTrader:
             self.strategy.next({'open':float(row['open']),'high':float(row['high']),
                 'low':float(row['low']),'close':float(row['close']),
                 'timestamp':row.get('timestamp',0),'index':int(row.get('index',0))})
-        # Salva baseline: PnL acumulado do histórico simulado
-        # O PnL real (live) será sempre relativo a este momento
         self._pnl_baseline = self.strategy.net_profit
         self._warming = False
         self._refresh_cache()
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} EC={self.strategy.EC:.2f} "
                  f"| baseline_pnl={self._pnl_baseline:.2f} (histórico simulado, ignorado)")
         self._sync()
-    
+
     @property
     def live_pnl(self):
         """PnL real acumulado APENAS das operações live (após o warmup)."""
@@ -355,16 +325,20 @@ class LiveTrader:
 
     def process(self, candle):
         ts       = candle.get('timestamp', datetime.utcnow())
-        close_px = float(candle['close'])   # preço de fechamento do candle — usado como fill price
+        close_px = float(candle['close'])
         log.info(f"\n── {ts} | O={candle['open']:.2f} H={candle['high']:.2f} L={candle['low']:.2f} C={close_px:.2f}")
+
+        # A estratégia processa o candle completo e retorna as ações
+        # next() já gerencia internamente: position_size, position_price,
+        # trailing stop, PnL — NÃO chamar confirm_fill/confirm_exit depois,
+        # pois sobrescreveria position_price com preço errado (FIX 1)
         actions = self.strategy.next(candle)
+
         log.info(f"  P={self.strategy.Period} EC={self.strategy.EC:.2f} EMA={self.strategy.EMA:.2f} "
                  f"pos={self.strategy.position_size:+.4f} trail={'ON' if self.strategy._trail_active else 'off'} "
                  f"el={self.strategy._el} es={self.strategy._es}")
 
-        # PERF: usa cache de posição — zero HTTP calls dentro do loop de ações.
-        # `real` é atualizado localmente após cada ordem para refletir o estado atual
-        # sem precisar buscar na exchange a cada iteração (~200ms economizados por ação).
+        # Cache de posição OKX (para evitar HTTP no loop de ações)
         real = self._cache_pos
 
         for act in actions:
@@ -376,12 +350,10 @@ class LiveTrader:
                 t0  = time.monotonic()
                 r   = self.okx.close_long(qty)
                 log.info(f"  ⚡ close_long latência={1000*(time.monotonic()-t0):.0f}ms")
-                # PERF: usa close_px do candle — elimina mark_price() HTTP (~200ms).
-                # _fill_async registra o avgPx real em background sem bloquear.
-                self.strategy.confirm_exit('LONG', close_px, qty, ts, act.get('exit_reason',''))
-                self._add_log("EXIT_LONG", close_px, qty, act.get('exit_reason',''))
+                # FIX 1: NÃO chamar confirm_exit — estratégia já fechou internamente
+                self._add_log("EXIT_LONG", act.get('price', close_px), qty, act.get('exit_reason',''))
                 self.okx._fill_async(r, lambda px: log.info(f"  📋 EXIT_LONG fill real={px:.2f}"), close_px)
-                real = None   # posição agora está flat — próximas ações veem isso
+                real = None
 
             elif kind == 'EXIT_SHORT' and real and real['side'] == 'short':
                 log.info(f"  🔴 EXIT SHORT ({act.get('exit_reason')})")
@@ -389,17 +361,16 @@ class LiveTrader:
                 t0  = time.monotonic()
                 r   = self.okx.close_short(qty)
                 log.info(f"  ⚡ close_short latência={1000*(time.monotonic()-t0):.0f}ms")
-                self.strategy.confirm_exit('SHORT', close_px, qty, ts, act.get('exit_reason',''))
-                self._add_log("EXIT_SHORT", close_px, qty, act.get('exit_reason',''))
+                # FIX 1: NÃO chamar confirm_exit — estratégia já fechou internamente
+                self._add_log("EXIT_SHORT", act.get('price', close_px), qty, act.get('exit_reason',''))
                 self.okx._fill_async(r, lambda px: log.info(f"  📋 EXIT_SHORT fill real={px:.2f}"), close_px)
-                real = None   # posição agora está flat
+                real = None
 
             elif kind == 'BUY':
                 qty = self._qty()
                 if qty <= 0:
                     log.warning("  ⚠️  BUY ignorado: qty=0"); continue
                 if real and real['side'] == 'short':
-                    # reversão: fecha short restante antes de abrir long
                     self.okx.close_short(real['size'] * self.okx.ct_val())
                     real = None
                 log.info(f"  🟢 ENTER LONG {qty:.4f} ETH")
@@ -408,11 +379,11 @@ class LiveTrader:
                 elapsed = 1000*(time.monotonic()-t0)
                 log.info(f"  ⚡ open_long latência={elapsed:.0f}ms")
                 if r.get("code") == "0":
-                    # PERF: confirma fill com close_px — sem mark_price() HTTP
-                    self.strategy.confirm_fill('BUY', close_px, qty, ts)
-                    self._add_log("ENTER_LONG", close_px, qty)
+                    # FIX 1: NÃO chamar confirm_fill — estratégia já abriu com
+                    # position_price = open_price correto dentro de next()
+                    self._add_log("ENTER_LONG", act.get('price', close_px), qty)
                     self.okx._fill_async(r, lambda px: log.info(f"  📋 LONG fill real={px:.2f}"), close_px)
-                    real = {'side': 'long', 'size': self.okx._cts(qty), 'avg_px': close_px}
+                    real = {'side': 'long', 'size': self.okx._cts(qty), 'avg_px': act.get('price', close_px)}
                 else:
                     log.error("  ❌ Ordem LONG rejeitada — estratégia NÃO atualizada")
 
@@ -421,7 +392,6 @@ class LiveTrader:
                 if qty <= 0:
                     log.warning("  ⚠️  SELL ignorado: qty=0"); continue
                 if real and real['side'] == 'long':
-                    # reversão: fecha long restante antes de abrir short
                     self.okx.close_long(real['size'] * self.okx.ct_val())
                     real = None
                 log.info(f"  🟢 ENTER SHORT {qty:.4f} ETH")
@@ -430,10 +400,10 @@ class LiveTrader:
                 elapsed = 1000*(time.monotonic()-t0)
                 log.info(f"  ⚡ open_short latência={elapsed:.0f}ms")
                 if r.get("code") == "0":
-                    self.strategy.confirm_fill('SELL', close_px, qty, ts)
-                    self._add_log("ENTER_SHORT", close_px, qty)
+                    # FIX 1: NÃO chamar confirm_fill — estratégia já abriu internamente
+                    self._add_log("ENTER_SHORT", act.get('price', close_px), qty)
                     self.okx._fill_async(r, lambda px: log.info(f"  📋 SHORT fill real={px:.2f}"), close_px)
-                    real = {'side': 'short', 'size': self.okx._cts(qty), 'avg_px': close_px}
+                    real = {'side': 'short', 'size': self.okx._cts(qty), 'avg_px': act.get('price', close_px)}
                 else:
                     log.error("  ❌ Ordem SHORT rejeitada — estratégia NÃO atualizada")
 
@@ -446,6 +416,7 @@ class LiveTrader:
     def _candle(self):
         TF = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H"}
         try:
+            # FIX 2: mesma instId usada no warmup (ETH-USDT-SWAP)
             r = requests.get("https://www.okx.com/api/v5/market/candles",
                 params={"instId":"ETH-USDT-SWAP","bar":TF.get(TIMEFRAME,"30m"),"limit":"2"},timeout=10).json()
             c = r["data"][1]
@@ -475,10 +446,6 @@ class LiveTrader:
         log.info("🔴 Trader encerrado")
 
     def _refresh_cache(self):
-        """
-        Atualiza cache em paralelo usando threads.
-        Roda ANTES de cada candle → hot path de ordens usa cache, zero HTTP calls.
-        """
         results = {}
 
         def _fetch_pos():
@@ -510,7 +477,7 @@ class LiveTrader:
             self._cache_qty = (bal * self.PCT) / px
             log.info(f"  🔄 cache: bal={bal:.2f} px={px:.2f} qty={self._cache_qty:.4f} ETH "
                      f"({self.okx._cts(self._cache_qty)} cts)")
-        self._cache_ct = 0.001  # fixo
+        self._cache_ct = 0.001
 
     def stop(self): self._running = False
 
@@ -639,6 +606,7 @@ def _thread():
     global _trader
     log.info("📥 Baixando 300 candles OKX...")
     try:
+        # FIX 2: usar ETH-USDT-SWAP para warmup (mesmo símbolo do candle live)
         df = DataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=TOTAL_CANDLES).fetch_ohlcv()
         log.info(f"  ✅ {len(df)} candles")
         if df.empty:
@@ -672,8 +640,6 @@ def status():
 
 @app.route('/start', methods=['POST'])
 def start():
-    # FIX 2: _lock protege tanto o /start quanto o _delayed_start,
-    # garantindo que apenas UM thread do trader roda por vez.
     with _lock:
         if _trader is not None:
             return jsonify({"message":"Já está rodando"})
@@ -693,10 +659,6 @@ def ping(): return "pong"
 @app.route('/health')
 def health(): return jsonify({"ok":True,"creds":_creds_ok(),"trader":_trader is not None})
 
-# Auto-start quando gunicorn importa o módulo.
-# FIX 2: _delayed_start agora usa o mesmo _lock do /start,
-# impedindo que dois traders rodem simultaneamente caso o usuário
-# clique em "Iniciar" enquanto o auto-start ainda está em andamento.
 def _delayed_start():
     time.sleep(5)
     if not _creds_ok():
