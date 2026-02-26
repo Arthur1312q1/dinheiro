@@ -2,31 +2,7 @@
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 # OKX COLLECTOR — Histórico completo via history-candles + candles
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# POR QUE DOIS ENDPOINTS OKX?
-# ──────────────────────────────────────────────────────────────────────────────
-# OKX tem dois endpoints de candles com comportamentos DIFERENTES:
-#
-#   /api/v5/market/candles
-#       → Dados RECENTES: retorna apenas os últimos ~1440 candles
-#       → Rápido, baixa latência, ideal para dados de hoje
-#       → Com paginação 'after', vai um pouco mais atrás (até ~3000 candles)
-#       → MAS NÃO vai até 4500+ candles necessários para o backtest!
-#
-#   /api/v5/market/history-candles
-#       → Dados HISTÓRICOS: vai anos atrás
-#       → 300 candles por request, paginação via 'after'
-#       → Cobertura completa do histórico OKX desde 2019
-#       → Usado por TradingView internamente para dados antigos
-#
-# ESTRATÉGIA:
-#   1. Buscar histórico antigo via /history-candles (paginando para trás)
-#   2. Complementar com /candles para os dados mais recentes
-#   3. Merge + deduplicação por timestamp
-#   4. Retornar exatamente `limit` candles mais recentes
-#
-# RESULTADO: Consegue 5500+ candles de 30min (> 4 meses de história) ✅
+# Suporta tanto spot (ETH-USDT) quanto futuros (ETH-USDT-SWAP)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import pandas as pd
@@ -42,7 +18,7 @@ class DataCollector:
     - /market/history-candles → dados históricos antigos
     - /market/candles         → dados recentes (últimas horas/dias)
 
-    Exporta também como OKXDataCollector para retrocompatibilidade.
+    Suporta qualquer instId OKX: spot (ETH-USDT), swap (ETH-USDT-SWAP), etc.
     """
 
     BASE = "https://www.okx.com"
@@ -56,38 +32,48 @@ class DataCollector:
 
     def __init__(
         self,
-        symbol:    str = "ETH-USDT",
+        symbol:    str = "ETH-USDT-SWAP",
         timeframe: str = "30m",
-        limit:     int = 5500,    # BACKTEST_CANDLES + WARMUP_CANDLES
-        exchange:  str = "okx",   # mantido por compatibilidade (só OKX aqui)
+        limit:     int = 5500,
+        exchange:  str = "okx",
     ):
-        # Normaliza símbolo para formato OKX: ETH-USDT
+        # Normaliza símbolo para formato OKX
+        # Aceita: ETH-USDT, ETH-USDT-SWAP, ETHUSDT, ETH/USDT etc.
         s = symbol.strip().upper().replace('/', '-').replace('_', '-')
+        # Só faz substituição simples se NÃO tiver sufixo como -SWAP, -FUTURES etc.
         if '-' not in s and s.endswith('USDT'):
             s = s[:-4] + '-USDT'
         self.symbol    = s
         self.timeframe = self._TF_MAP.get(timeframe.lower(), '30m')
         self.limit     = limit
 
-    # ───────────────────────────────────────────────────────────────────────────
+        # Detecta o tipo de instrumento para usar o endpoint correto
+        # SWAP e FUTURES têm endpoint diferente para history-candles
+        self._inst_type = self._detect_inst_type(s)
+
+    def _detect_inst_type(self, symbol: str) -> str:
+        """Detecta se é SPOT, SWAP ou FUTURES baseado no símbolo."""
+        if symbol.endswith('-SWAP'):
+            return 'SWAP'
+        elif 'FUTURES' in symbol or symbol.count('-') >= 2:
+            return 'FUTURES'
+        return 'SPOT'
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Busca HISTÓRICA — /api/v5/market/history-candles
-    # Paginação para trás via 'after'. Traz dados de anos atrás.
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     def _fetch_history(self, limit: int, before_ts_ms: Optional[int] = None) -> list:
         """
-        Busca candles históricos usando /history-candles.
-        Retorna lista de candles em ordem CRESCENTE (mais antigo primeiro).
+        Busca candles históricos. Retorna lista em ordem CRESCENTE.
         """
         collected = []
         after_ts  = str(before_ts_ms) if before_ts_ms else None
-        page_num  = 0
 
         while len(collected) < limit:
-            batch  = min(self.MAX_PER_REQ, limit - len(collected))
             params = {
                 'instId': self.symbol,
                 'bar':    self.timeframe,
-                'limit':  self.MAX_PER_REQ,  # OKX: pede max, trunca depois
+                'limit':  self.MAX_PER_REQ,
             }
             if after_ts:
                 params['after'] = after_ts
@@ -111,28 +97,22 @@ class DataCollector:
             if not page:
                 break
 
-            # OKX retorna em ordem DECRESCENTE (mais recente primeiro)
             collected.extend(page)
-            page_num += 1
-
-            oldest_ts = page[-1][0]   # timestamp do candle mais antigo desta página
-            after_ts  = oldest_ts     # próxima página: mais antigo que este
+            oldest_ts = page[-1][0]
+            after_ts  = oldest_ts
 
             if len(page) < self.MAX_PER_REQ:
                 break
 
-        # Inverte para ordem crescente (mais antigo primeiro)
         collected.reverse()
         return collected
 
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # Busca RECENTE — /api/v5/market/candles
-    # Traz os candles mais recentes (últimas horas/dias).
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     def _fetch_recent(self, limit: int = 300) -> list:
         """
-        Busca candles recentes usando /candles.
-        Retorna lista de candles em ordem CRESCENTE.
+        Busca candles recentes. Retorna lista em ordem CRESCENTE.
         """
         params = {
             'instId': self.symbol,
@@ -151,24 +131,24 @@ class DataCollector:
             return []
 
         if data.get('code') != '0':
+            print(f"  ⚠️ OKX candles: {data.get('msg')}")
             return []
 
         page = data.get('data', [])
-        page.reverse()   # crescente
+        page.reverse()
         return page
 
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # FETCH PRINCIPAL
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     def fetch_ohlcv(self) -> pd.DataFrame:
         """
         Busca candles da OKX.
         - Se limit <= 300: uma única requisição rápida (/candles)
         - Se limit > 300:  paginação via /history-candles + /candles
         """
-        print(f"🔍 OKX: {self.symbol} {self.timeframe} | {self.limit} candles...")
+        print(f"🔍 OKX: {self.symbol} ({self._inst_type}) {self.timeframe} | {self.limit} candles...")
 
-        # ── Caminho rápido: até 300 candles = 1 request ───────────────────
         if self.limit <= 300:
             recent = self._fetch_recent(limit=self.limit)
             if not recent:
@@ -177,7 +157,6 @@ class DataCollector:
             all_raw = recent
             print(f"  ✅ {len(all_raw)} candles (1 request)")
 
-        # ── Caminho histórico: > 300 candles ──────────────────────────────
         else:
             print(f"   [1/2] Candles recentes...")
             recent = self._fetch_recent(limit=300)
@@ -200,31 +179,27 @@ class DataCollector:
         for c in all_raw:
             try:
                 rows.append([
-                    int(c[0]),      # timestamp ms
-                    float(c[1]),    # open
-                    float(c[2]),    # high
-                    float(c[3]),    # low
-                    float(c[4]),    # close
-                    float(c[5]),    # volume
+                    int(c[0]),
+                    float(c[1]),
+                    float(c[2]),
+                    float(c[3]),
+                    float(c[4]),
+                    float(c[5]),
                 ])
             except (IndexError, ValueError):
                 continue
 
         df = pd.DataFrame(rows, columns=['timestamp','open','high','low','close','volume'])
         df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
-
-        # Deduplicação e ordenação
         df = (df.sort_values('timestamp')
                 .drop_duplicates('timestamp')
                 .reset_index(drop=True))
 
-        # Garante que temos exatamente `limit` candles (os mais recentes)
         if len(df) > self.limit:
             df = df.iloc[-self.limit:].reset_index(drop=True)
 
         df['index'] = df.index
 
-        # ── Diagnóstico ───────────────────────────────────────────────────
         first = df['timestamp'].iloc[0]
         last  = df['timestamp'].iloc[-1]
         days  = (last - first).total_seconds() / 86400
@@ -232,13 +207,12 @@ class DataCollector:
 
         if len(df) < self.limit * 0.8:
             print(f"  ⚠️ ATENÇÃO: recebeu apenas {len(df)}/{self.limit} candles esperados")
-            print(f"  💡 OKX pode não ter histórico suficiente para este período/timeframe")
 
         return df
 
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # Mock (fallback)
-    # ───────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     def _mock(self) -> pd.DataFrame:
         print(f"📊 Gerando {self.limit} candles mock (fallback)...")
         base = 2500.0
