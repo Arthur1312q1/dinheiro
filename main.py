@@ -146,22 +146,16 @@ class OKX:
 
     def _order(self, side, ps, sz):
         net_mode = (ps == 'net')
-        td_primary   = getattr(self, '_td_mode', 'cross')
-        td_secondary = 'isolated' if td_primary == 'cross' else 'cross'
-        for td in [td_primary, td_secondary]:
-            if net_mode:
-                body = {"instId":self.INST,"tdMode":td,"side":side,"ordType":"market","sz":str(sz)}
-            else:
-                body = {"instId":self.INST,"tdMode":td,"side":side,"posSide":ps,"ordType":"market","sz":str(sz)}
-            r  = self._post("/api/v5/trade/order", body)
-            if r.get("code") == "0":
-                sc = r.get("data",[{}])[0].get("sCode","")
-                log.info(f"  ✅ ORDER {side} sz={sz} tdMode={td} sCode={sc}")
-                self._td_mode = td
-                return r
-            d0 = r.get("data",[{}])[0] if r.get("data") else {}
-            log.warning(f"  ⚠️  tdMode={td} sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
-        log.error(f"  ❌ ORDER {side} sz={sz} falhou em {td_primary} e {td_secondary}")
+        body_base = {"instId":self.INST,"tdMode":"cross","side":side,"ordType":"market","sz":str(sz)}
+        if not net_mode:
+            body_base["posSide"] = ps
+        r = self._post("/api/v5/trade/order", body_base)
+        if r.get("code") == "0":
+            sc = r.get("data",[{}])[0].get("sCode","")
+            log.info(f"  ✅ ORDER {side} sz={sz} tdMode=cross sCode={sc}")
+            return r
+        d0 = r.get("data",[{}])[0] if r.get("data") else {}
+        log.error(f"  ❌ ORDER {side} sz={sz} sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
         return r
 
     def _fill(self, r):
@@ -221,8 +215,9 @@ class OKX:
             log.warning(f"  ⚠️  config: {e}")
             acct_lv = "2"; pos_mode = "net_mode"
 
-        self._td_mode = "cross" if acct_lv in ("3","4") else "isolated"
-        log.info(f"  ℹ️  tdMode={self._td_mode} (acctLv={acct_lv})")
+        # FIX: sempre cross — usa saldo total como colateral, sem alocação manual
+        self._td_mode = "cross"
+        log.info(f"  ℹ️  tdMode=cross forçado (acctLv={acct_lv})")
 
         r = self._post("/api/v5/account/set-position-mode", {"posMode":"long_short_mode"})
         if r.get("code") == "0":
@@ -232,17 +227,13 @@ class OKX:
             self._pos_mode = pos_mode
             log.warning(f"  ⚠️  posMode: {r.get('msg')} → usando {pos_mode}")
 
-        mgn = self._td_mode
-        if mgn == "isolated" and self._pos_mode == "long_short_mode":
-            self._post("/api/v5/account/set-leverage",
-                       {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"long"})
-            rl = self._post("/api/v5/account/set-leverage",
-                            {"instId":self.INST,"lever":"1","mgnMode":"isolated","posSide":"short"})
-        else:
-            rl = self._post("/api/v5/account/set-leverage",
-                            {"instId":self.INST,"lever":"1","mgnMode":mgn})
+        # FIX: sempre cross — 1x alavancagem, modo hedge (long_short)
+        rl = self._post("/api/v5/account/set-leverage",
+                        {"instId":self.INST,"lever":"1","mgnMode":"cross","posSide":"long"})
+        rl = self._post("/api/v5/account/set-leverage",
+                        {"instId":self.INST,"lever":"1","mgnMode":"cross","posSide":"short"})
         if rl.get("code") == "0":
-            log.info("  ✅ Alavancagem 1x configurada")
+            log.info("  ✅ Alavancagem 1x cross configurada")
         else:
             log.warning(f"  ⚠️  set-leverage: {rl.get('msg')}")
 
@@ -328,17 +319,12 @@ class LiveTrader:
         close_px = float(candle['close'])
         log.info(f"\n── {ts} | O={candle['open']:.2f} H={candle['high']:.2f} L={candle['low']:.2f} C={close_px:.2f}")
 
-        # A estratégia processa o candle completo e retorna as ações
-        # next() já gerencia internamente: position_size, position_price,
-        # trailing stop, PnL — NÃO chamar confirm_fill/confirm_exit depois,
-        # pois sobrescreveria position_price com preço errado (FIX 1)
         actions = self.strategy.next(candle)
 
         log.info(f"  P={self.strategy.Period} EC={self.strategy.EC:.2f} EMA={self.strategy.EMA:.2f} "
                  f"pos={self.strategy.position_size:+.4f} trail={'ON' if self.strategy._trail_active else 'off'} "
                  f"el={self.strategy._el} es={self.strategy._es}")
 
-        # Cache de posição OKX (para evitar HTTP no loop de ações)
         real = self._cache_pos
 
         for act in actions:
@@ -350,7 +336,6 @@ class LiveTrader:
                 t0  = time.monotonic()
                 r   = self.okx.close_long(qty)
                 log.info(f"  ⚡ close_long latência={1000*(time.monotonic()-t0):.0f}ms")
-                # FIX 1: NÃO chamar confirm_exit — estratégia já fechou internamente
                 self._add_log("EXIT_LONG", act.get('price', close_px), qty, act.get('exit_reason',''))
                 self.okx._fill_async(r, lambda px: log.info(f"  📋 EXIT_LONG fill real={px:.2f}"), close_px)
                 real = None
@@ -361,7 +346,6 @@ class LiveTrader:
                 t0  = time.monotonic()
                 r   = self.okx.close_short(qty)
                 log.info(f"  ⚡ close_short latência={1000*(time.monotonic()-t0):.0f}ms")
-                # FIX 1: NÃO chamar confirm_exit — estratégia já fechou internamente
                 self._add_log("EXIT_SHORT", act.get('price', close_px), qty, act.get('exit_reason',''))
                 self.okx._fill_async(r, lambda px: log.info(f"  📋 EXIT_SHORT fill real={px:.2f}"), close_px)
                 real = None
@@ -379,8 +363,6 @@ class LiveTrader:
                 elapsed = 1000*(time.monotonic()-t0)
                 log.info(f"  ⚡ open_long latência={elapsed:.0f}ms")
                 if r.get("code") == "0":
-                    # FIX 1: NÃO chamar confirm_fill — estratégia já abriu com
-                    # position_price = open_price correto dentro de next()
                     self._add_log("ENTER_LONG", act.get('price', close_px), qty)
                     self.okx._fill_async(r, lambda px: log.info(f"  📋 LONG fill real={px:.2f}"), close_px)
                     real = {'side': 'long', 'size': self.okx._cts(qty), 'avg_px': act.get('price', close_px)}
@@ -400,7 +382,6 @@ class LiveTrader:
                 elapsed = 1000*(time.monotonic()-t0)
                 log.info(f"  ⚡ open_short latência={elapsed:.0f}ms")
                 if r.get("code") == "0":
-                    # FIX 1: NÃO chamar confirm_fill — estratégia já abriu internamente
                     self._add_log("ENTER_SHORT", act.get('price', close_px), qty)
                     self.okx._fill_async(r, lambda px: log.info(f"  📋 SHORT fill real={px:.2f}"), close_px)
                     real = {'side': 'short', 'size': self.okx._cts(qty), 'avg_px': act.get('price', close_px)}
@@ -416,7 +397,6 @@ class LiveTrader:
     def _candle(self):
         TF = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H"}
         try:
-            # FIX 2: mesma instId usada no warmup (ETH-USDT-SWAP)
             r = requests.get("https://www.okx.com/api/v5/market/candles",
                 params={"instId":"ETH-USDT-SWAP","bar":TF.get(TIMEFRAME,"30m"),"limit":"2"},timeout=10).json()
             c = r["data"][1]
@@ -606,7 +586,6 @@ def _thread():
     global _trader
     log.info("📥 Baixando 300 candles OKX...")
     try:
-        # FIX 2: usar ETH-USDT-SWAP para warmup (mesmo símbolo do candle live)
         df = DataCollector(symbol=SYMBOL, timeframe=TIMEFRAME, limit=TOTAL_CANDLES).fetch_ohlcv()
         log.info(f"  ✅ {len(df)} candles")
         if df.empty:
