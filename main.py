@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefm
 log = logging.getLogger('azlema')
 
 # ── Config hardcoded ──────────────────────────────────────────────────────────
-SYMBOL    = "ETH-USDT-SWAP"   # FIX 2: usar SWAP em warmup E live (preços consistentes)
+SYMBOL    = "ETH-USDT-SWAP"
 TIMEFRAME = "30m"
 TOTAL_CANDLES    = 300
 WARMUP_CANDLES   = 300
@@ -26,7 +26,7 @@ STRATEGY_CONFIG  = {
     "max_lots": 100, "default_period": 20, "warmup_bars": WARMUP_CANDLES,
 }
 
-# ── Credenciais: lidas SEMPRE do ambiente, nunca em variável de módulo ────────
+# ── Credenciais ───────────────────────────────────────────────────────────────
 def _key():  return os.environ.get("OKX_API_KEY",    "").strip()
 def _sec():  return os.environ.get("OKX_SECRET_KEY", "").strip()
 def _pass(): return os.environ.get("OKX_PASSPHRASE", "").strip()
@@ -60,7 +60,6 @@ class OKX:
         return requests.post(self.BASE+path, headers=self._h("POST",path,b), data=b, timeout=10).json()
 
     def transfer_to_trading(self):
-        """Transfere todo saldo USDT da conta Funding para Trading antes de operar."""
         try:
             r = requests.get(self.BASE + "/api/v5/asset/balances",
                              headers=self._h("GET", "/api/v5/asset/balances"),
@@ -82,7 +81,6 @@ class OKX:
             log.warning(f"  ⚠️  transfer_to_trading: {e}")
 
     def balance(self, verbose=False):
-        """Retorna saldo USDT disponível para trading (conta unificada OKX)."""
         try:
             data = self._get("/api/v5/account/balance", {"ccy": "USDT"})
             acct = data["data"][0]
@@ -121,8 +119,7 @@ class OKX:
         except: return 0.0
 
     def ct_val(self):
-        """Retorna ct_val cacheado (busca na API apenas uma vez no setup)."""
-        return getattr(self, '_ct_val', 0.001)  # ETH-USDT-SWAP: 0.001 ETH/contrato
+        return getattr(self, '_ct_val', 0.001)
 
     def _fetch_ct_val(self):
         CT_FIXED = 0.001
@@ -139,7 +136,6 @@ class OKX:
         return CT_FIXED
 
     def _cts(self, eth):
-        """Converte ETH em número inteiro de contratos."""
         ct  = self.ct_val()
         cts = int(eth / ct)
         return max(1, cts)
@@ -158,15 +154,7 @@ class OKX:
         log.error(f"  ❌ ORDER {side} sz={sz} sCode={d0.get('sCode')} sMsg={d0.get('sMsg')}")
         return r
 
-    def _fill(self, r):
-        """Retorna avgPx sem bloquear — tenta 1x imediatamente, sem sleep."""
-        try:
-            oid = r["data"][0]["ordId"]
-            return float(self._get("/api/v5/trade/order",{"instId":self.INST,"ordId":oid})["data"][0]["avgPx"])
-        except: return None
-
     def _fill_async(self, r, callback, fallback_px: float):
-        """Busca avgPx em background (não bloqueia o trade path)."""
         def _worker():
             for attempt in range(5):
                 time.sleep(0.3 * (attempt + 1))
@@ -182,7 +170,6 @@ class OKX:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _ps(self, side_long):
-        """Retorna posSide correto conforme o modo de posição."""
         mode = getattr(self, '_pos_mode', 'long_short_mode')
         if mode == 'net_mode':
             return 'net'
@@ -197,25 +184,17 @@ class OKX:
     def close_short(self, qty):
         return self._order("buy",  self._ps(False), self._cts(qty))
 
-    def get_pos_mode(self):
-        try:
-            r = self._get("/api/v5/account/config")
-            return r["data"][0].get("posMode", "net_mode")
-        except:
-            return "net_mode"
-
     def setup(self):
         try:
             cfg = self._get("/api/v5/account/config")
             d0  = cfg["data"][0]
-            acct_lv = d0.get("acctLv", "2")
+            acct_lv  = d0.get("acctLv",  "2")
             pos_mode = d0.get("posMode", "net_mode")
             log.info(f"  ℹ️  acctLv={acct_lv} posMode={pos_mode}")
         except Exception as e:
             log.warning(f"  ⚠️  config: {e}")
             acct_lv = "2"; pos_mode = "net_mode"
 
-        # FIX: sempre cross — usa saldo total como colateral, sem alocação manual
         self._td_mode = "cross"
         log.info(f"  ℹ️  tdMode=cross forçado (acctLv={acct_lv})")
 
@@ -227,9 +206,8 @@ class OKX:
             self._pos_mode = pos_mode
             log.warning(f"  ⚠️  posMode: {r.get('msg')} → usando {pos_mode}")
 
-        # FIX: sempre cross — 1x alavancagem, modo hedge (long_short)
-        rl = self._post("/api/v5/account/set-leverage",
-                        {"instId":self.INST,"lever":"1","mgnMode":"cross","posSide":"long"})
+        self._post("/api/v5/account/set-leverage",
+                   {"instId":self.INST,"lever":"1","mgnMode":"cross","posSide":"long"})
         rl = self._post("/api/v5/account/set-leverage",
                         {"instId":self.INST,"lever":"1","mgnMode":"cross","posSide":"short"})
         if rl.get("code") == "0":
@@ -262,11 +240,17 @@ class LiveTrader:
         self._running = False
         self._warming = False
         self.log: List[Dict] = []
-        self._pnl_baseline = 0.0
+        self._pnl_baseline   = 0.0
         self._cache_pos: Optional[Dict] = None
         self._cache_bal: float = 0.0
         self._cache_ct:  float = 0.001
         self._cache_qty: float = 0.0
+        # ── FIX: timestamp do último candle processado ────────────────────
+        # Inicializado como "" e sobrescrito ao final do warmup com o timestamp
+        # do último candle histórico. O loop principal descarta silenciosamente
+        # qualquer candle com o mesmo timestamp, eliminando na raiz a ordem
+        # duplicada que causava sCode=51008 (margem insuficiente).
+        self._last_candle_ts: str = ""
 
     def _qty(self):
         qty = self._cache_qty
@@ -286,7 +270,7 @@ class LiveTrader:
             log.warning("  ⚠️  Estratégia tem posição mas OKX flat → resetando")
             self.strategy._reset_pos()
         elif real is not None and sp == 0:
-            qty = real["size"] * self.okx.ct_val()
+            qty  = real["size"] * self.okx.ct_val()
             side = 'BUY' if real["side"] == "long" else 'SELL'
             log.warning(f"  ⚠️  OKX tem {side} {qty:.4f} ETH → sincronizando")
             self.strategy.confirm_fill(side, real["avg_px"], qty, datetime.utcnow())
@@ -305,13 +289,16 @@ class LiveTrader:
         self._pnl_baseline = self.strategy.net_profit
         self._warming = False
         self._refresh_cache()
+        # FIX: grava o timestamp do último candle do warmup.
+        # O loop live vai ignorar candles com este mesmo ts (são o mesmo candle
+        # que a API retorna logo após o warmup terminar).
+        self._last_candle_ts = str(df['timestamp'].iloc[-1])
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} EC={self.strategy.EC:.2f} "
-                 f"| baseline_pnl={self._pnl_baseline:.2f} (histórico simulado, ignorado)")
+                 f"| último ts={self._last_candle_ts}")
         self._sync()
 
     @property
     def live_pnl(self):
-        """PnL real acumulado APENAS das operações live (após o warmup)."""
         return self.strategy.net_profit - self._pnl_baseline
 
     def process(self, candle):
@@ -403,7 +390,8 @@ class LiveTrader:
             return {'open':float(c[1]),'high':float(c[2]),'low':float(c[3]),'close':float(c[4]),
                     'timestamp':datetime.fromtimestamp(int(c[0])/1000,tz=timezone.utc),
                     'index':self.strategy._bar+1}
-        except Exception as e: log.error(f"Erro candle: {e}"); return None
+        except Exception as e:
+            log.error(f"Erro candle: {e}"); return None
 
     def run(self, df):
         log.info("╔════════════════════════════════════╗")
@@ -418,9 +406,20 @@ class LiveTrader:
             try:
                 self._wait(tf)
                 c = self._candle()
-                if c:
-                    self._refresh_cache()
-                    self.process(c)
+                if not c:
+                    continue
+                # FIX DEFINITIVO: converte timestamp para string e compara com o
+                # último processado. Se igual, é o mesmo candle — descarta sem
+                # log, sem sleep extra, sem nenhum efeito colateral.
+                # O warmup já gravou o ts do último candle histórico em
+                # self._last_candle_ts, então a primeira iteração após o warmup
+                # nunca processa o candle duplicado.
+                ts = str(c['timestamp'])
+                if ts == self._last_candle_ts:
+                    continue
+                self._last_candle_ts = ts
+                self._refresh_cache()
+                self.process(c)
             except Exception as e:
                 log.error(f"❌ {e}"); time.sleep(60)
         log.info("🔴 Trader encerrado")
