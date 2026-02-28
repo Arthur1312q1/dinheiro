@@ -159,13 +159,24 @@ class OKX:
                  f"1 contrato ≈ {ct * px:.4f} USDT")
         return ct
 
-    def _cts(self, eth_qty: float) -> int:
-        """Converte quantidade em ETH para número de contratos (mínimo 1)."""
+    def _cts(self, eth_qty: float, bal_usdt: float = 0.0, px: float = 0.0) -> int:
+        """
+        Converte ETH para numero de contratos.
+        Se bal_usdt e px fornecidos, limita ao que o saldo cobre (sem exceder margem).
+        """
         ct  = self.ct_val()
-        cts = int(eth_qty / ct)
-        return max(1, cts)
+        cts = max(1, int(eth_qty / ct))
+        if bal_usdt > 0 and px > 0:
+            custo_por_ct = ct * px
+            # 90% do saldo como limite (10% de buffer para taxas/margem OKX)
+            max_cts = max(1, int((bal_usdt * 0.90) / custo_por_ct))
+            if cts > max_cts:
+                log.info(f"  sz reduzido {cts}->>{max_cts} "
+                         f"(saldo={bal_usdt:.2f} USDT, 1ct={custo_por_ct:.4f} USDT)")
+            cts = min(cts, max_cts)
+        return cts
 
-    # ── Ordens ────────────────────────────────────────────────────────────────
+    # Ordens
     def _order(self, side, ps, sz):
         net_mode  = (ps == 'net')
         body = {
@@ -209,12 +220,14 @@ class OKX:
             return 'net'
         return 'long' if side_long else 'short'
 
-    def open_long(self, qty):
-        r = self._order("buy",  self._ps(True),  self._cts(qty))
+    def open_long(self, qty, bal_usdt=0.0, px=0.0):
+        sz = self._cts(qty, bal_usdt, px)
+        r  = self._order("buy",  self._ps(True),  sz)
         return r, qty
 
-    def open_short(self, qty):
-        r = self._order("sell", self._ps(False), self._cts(qty))
+    def open_short(self, qty, bal_usdt=0.0, px=0.0):
+        sz = self._cts(qty, bal_usdt, px)
+        r  = self._order("sell", self._ps(False), sz)
         return r, qty
 
     def close_long(self, qty):
@@ -285,23 +298,30 @@ class LiveTrader:
         self._pnl_baseline   = 0.0
         self._cache_pos: Optional[Dict] = None
         self._cache_bal: float = 0.0
-        self._cache_ct:  float = 0.001   # 0.001 ETH/contrato (fixo)
+        self._cache_px:  float = 0.0      # preco cache (para calcular contratos)
+        self._cache_ct:  float = 0.001    # 0.001 ETH/contrato (fixo)
         self._cache_qty: float = 0.0
-        # Deduplicação de candle (evita processar o mesmo candle duas vezes)
-        self._last_candle_ts: str = ""
+        # Deduplicação: impede processar o mesmo candle 2x
+        self._last_candle_ts:   str = ""
+        # Lock de ordem: impede enviar 2 ordens para o mesmo candle
+        self._last_order_candle: str = ""
 
     # ── Quantidade ────────────────────────────────────────────────────────────
     def _qty(self) -> float:
-        qty = self._cache_qty
-        if qty <= 0:
-            log.warning("  ⚠️  _cache_qty=0 — recalculando")
+        bal = self._cache_bal
+        px  = self._cache_px
+        ct  = self.okx.ct_val()
+        if bal <= 0 or px <= 0:
+            log.warning("  ⚠️  cache bal/px zerado — recalculando")
             bal = self.okx.balance()
             px  = self.okx.mark_price()
             if bal <= 0 or px <= 0:
                 return 0.0
-            qty = (bal * self.PCT) / px
-        log.info(f"  💰 qty={qty:.6f} ETH | bal={self._cache_bal:.2f} USDT | "
-                 f"cts={self.okx._cts(qty)}")
+        # Quantos contratos cabem em PCT do saldo (com buffer de 90% p/ taxas OKX)
+        usdt_disp = bal * self.PCT * 0.90
+        cts = max(1, int(usdt_disp / (ct * px)))
+        qty = cts * ct
+        log.info(f"  💰 qty={qty:.6f} ETH ({cts} cts) | bal={bal:.2f} USDT | px={px:.2f}")
         return qty
 
     # ── Sincroniza estado da estratégia com a exchange ────────────────────────
@@ -410,6 +430,10 @@ class LiveTrader:
 
             # ── ENTER LONG ────────────────────────────────────────────────────
             elif kind == 'BUY':
+                # Bloqueia segunda ordem no mesmo candle
+                if self._last_order_candle == str(ts):
+                    log.warning("  ⚠️  BUY bloqueado: ordem já enviada neste candle")
+                    continue
                 qty = self._qty()
                 if qty <= 0:
                     log.warning("  ⚠️  BUY ignorado: qty=0")
@@ -417,13 +441,16 @@ class LiveTrader:
                 if real and real['side'] == 'short':
                     self.okx.close_short(real['size'] * self.okx.ct_val())
                     real = None
-                log.info(f"  🟢 ENTER LONG {qty:.6f} ETH "
-                         f"({self.okx._cts(qty)} cts)")
+                bal = self._cache_bal
+                px  = self._cache_px if self._cache_px > 0 else close_px
+                cts = self.okx._cts(qty, bal, px)
+                log.info(f"  🟢 ENTER LONG {qty:.6f} ETH ({cts} cts)")
                 t0      = time.monotonic()
-                r, qty  = self.okx.open_long(qty)
+                r, qty  = self.okx.open_long(qty, bal, px)
                 elapsed = 1000 * (time.monotonic() - t0)
                 log.info(f"  ⚡ open_long {elapsed:.0f}ms")
                 if r.get("code") == "0":
+                    self._last_order_candle = str(ts)
                     self._add_log("ENTER_LONG", act.get('price', close_px), qty)
                     self.okx._fill_async(r,
                         lambda px: log.info(f"  📋 LONG fill={px:.2f}"), close_px)
@@ -436,6 +463,10 @@ class LiveTrader:
 
             # ── ENTER SHORT ───────────────────────────────────────────────────
             elif kind == 'SELL':
+                # Bloqueia segunda ordem no mesmo candle
+                if self._last_order_candle == str(ts):
+                    log.warning("  ⚠️  SELL bloqueado: ordem já enviada neste candle")
+                    continue
                 qty = self._qty()
                 if qty <= 0:
                     log.warning("  ⚠️  SELL ignorado: qty=0")
@@ -443,13 +474,16 @@ class LiveTrader:
                 if real and real['side'] == 'long':
                     self.okx.close_long(real['size'] * self.okx.ct_val())
                     real = None
-                log.info(f"  🟢 ENTER SHORT {qty:.6f} ETH "
-                         f"({self.okx._cts(qty)} cts)")
+                bal = self._cache_bal
+                px  = self._cache_px if self._cache_px > 0 else close_px
+                cts = self.okx._cts(qty, bal, px)
+                log.info(f"  🟢 ENTER SHORT {qty:.6f} ETH ({cts} cts)")
                 t0      = time.monotonic()
-                r, qty  = self.okx.open_short(qty)
+                r, qty  = self.okx.open_short(qty, bal, px)
                 elapsed = 1000 * (time.monotonic() - t0)
                 log.info(f"  ⚡ open_short {elapsed:.0f}ms")
                 if r.get("code") == "0":
+                    self._last_order_candle = str(ts)
                     self._add_log("ENTER_SHORT", act.get('price', close_px), qty)
                     self.okx._fill_async(r,
                         lambda px: log.info(f"  📋 SHORT fill={px:.2f}"), close_px)
@@ -506,12 +540,16 @@ class LiveTrader:
         while self._running:
             try:
                 self._wait(tf)
+                # Aguarda 2s extras para garantir que o candle fechado
+                # ja esta disponivel na API (evita buscar o candle em formacao)
+                time.sleep(2)
                 c = self._candle()
                 if not c:
                     continue
-                # Deduplicação de timestamp
+                # Deduplicacao de timestamp — impede processar mesmo candle 2x
                 ts = str(c['timestamp'])
                 if ts == self._last_candle_ts:
+                    log.info(f"  ⏭️  Candle duplicado ignorado: {ts}")
                     continue
                 self._last_candle_ts = ts
                 self._refresh_cache()
@@ -546,12 +584,16 @@ class LiveTrader:
         bal = results.get('bal', self._cache_bal)
         px  = results.get('px',  0.0)
         if bal > 0: self._cache_bal = bal
+        if px  > 0: self._cache_px  = px
+        ct = self.okx.ct_val()
         if px > 0 and bal > 0:
-            self._cache_qty = (bal * self.PCT) / px
+            # Contratos acessiveis com 90% do saldo
+            cts = max(1, int((bal * self.PCT * 0.90) / (ct * px)))
+            self._cache_qty = cts * ct
             log.info(f"  🔄 cache: bal={bal:.2f} px={px:.2f} "
-                     f"qty={self._cache_qty:.6f} ETH "
-                     f"({self.okx._cts(self._cache_qty)} cts)")
-        self._cache_ct = self.okx.ct_val()
+                     f"qty={self._cache_qty:.6f} ETH ({cts} cts) "
+                     f"[{cts} * {ct} ETH]")
+        self._cache_ct = ct
 
     def stop(self):
         self._running = False
