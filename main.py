@@ -145,12 +145,9 @@ class OKX:
         except:
             return 0.0
 
-    # ── FIX-A: ctVal vem da API, não hardcoded ────────────────────────────────
-    # Versão anterior ignorava o valor real (0.1 ETH/contrato) e usava 0.001,
-    # fazendo o bot enviar sz=2 quando a OKX interpretava como 0.2 ETH = ~$384,
-    # causando sCode=51008 com apenas $7 de saldo.
+    # ── ctVal: valor do contrato (ETH/contrato) ───────────────────────────────
     def ct_val(self):
-        return getattr(self, '_ct_val', 0.01)   # fallback seguro
+        return getattr(self, '_ct_val', 0.001)   # fallback: 0.001 ETH/contrato
 
     def _fetch_ct_val(self):
         try:
@@ -163,9 +160,9 @@ class OKX:
                      f"1 contrato ≈ {ct * px:.4f} USDT")
             return ct
         except Exception as e:
-            log.warning(f"  ⚠️  _fetch_ct_val falhou: {e} → usando fallback 0.01")
-            self._ct_val = 0.01
-            return 0.01
+            log.warning(f"  ⚠️  _fetch_ct_val falhou: {e} → usando fallback 0.001")
+            self._ct_val = 0.001
+            return 0.001
 
     def _cts(self, eth_qty: float) -> int:
         """Converte quantidade em ETH para número de contratos (mínimo 1)."""
@@ -265,7 +262,7 @@ class OKX:
             log.warning(f"  ⚠️  set-leverage: {rl.get('msg')}")
 
         self.transfer_to_trading()
-        ct  = self._fetch_ct_val()       # FIX-A: usa valor real da API
+        ct  = self._fetch_ct_val()       # usa valor real da API
         bal = self.balance(verbose=True)
         px  = self.mark_price()
         min_usdt = ct * px
@@ -293,7 +290,7 @@ class LiveTrader:
         self._pnl_baseline   = 0.0
         self._cache_pos: Optional[Dict] = None
         self._cache_bal: float = 0.0
-        self._cache_ct:  float = 0.01
+        self._cache_ct:  float = 0.001   # ← 0.001 ETH/contrato
         self._cache_qty: float = 0.0
         # Deduplicação de candle (evita processar o mesmo candle duas vezes)
         self._last_candle_ts: str = ""
@@ -325,8 +322,7 @@ class LiveTrader:
             log.warning(f"  ⚠️  OKX tem {side} {qty:.6f} ETH → sincronizando")
             self.strategy.confirm_fill(side, real["avg_px"], qty, datetime.utcnow())
 
-    # ── FIX-C: reset completo do estado pendente após ordem rejeitada ─────────
-    # Sem isso, es/el residual gera uma segunda ordem contraditória 30min depois.
+    # ── Reset completo do estado pendente após ordem rejeitada ────────────────
     def _reset_strategy_pending(self, reason: str = ""):
         self.strategy._reset_pos()
         self.strategy._el    = False
@@ -440,8 +436,6 @@ class LiveTrader:
                             'size': self.okx._cts(qty),
                             'avg_px': act.get('price', close_px)}
                 else:
-                    # FIX-C: ordem rejeitada → zera pendências para não gerar
-                    # ordem oposta contraditória no próximo candle
                     self._reset_strategy_pending(
                         "BUY rejeitado — pendências zeradas para evitar SHORT sequencial")
 
@@ -468,13 +462,10 @@ class LiveTrader:
                             'size': self.okx._cts(qty),
                             'avg_px': act.get('price', close_px)}
                 else:
-                    # FIX-C: mesma lógica para SELL rejeitado
                     self._reset_strategy_pending(
                         "SELL rejeitado — pendências zeradas para evitar LONG sequencial")
 
-    # ── FIX-B: timing sem delay excessivo ─────────────────────────────────────
-    # Versão anterior: +3 e max(3) → ordem 4s depois da abertura do candle.
-    # Nova versão: +0 e max(1) → ordem ~1s após abertura (candle já estável na API).
+    # ── Timing ────────────────────────────────────────────────────────────────
     def _wait(self, tf: int = 30):
         now  = datetime.utcnow()
         secs = (tf - now.minute % tf) * 60 - now.second
@@ -493,7 +484,7 @@ class LiveTrader:
                         "limit":  "2"},
                 timeout=10,
             ).json()
-            c = r["data"][1]   # índice 1 = último candle FECHADO (índice 0 = em formação)
+            c = r["data"][1]   # índice 1 = último candle FECHADO
             return {
                 'open':      float(c[1]),
                 'high':      float(c[2]),
@@ -519,11 +510,11 @@ class LiveTrader:
              (60 if 'h' in TIMEFRAME else 1)
         while self._running:
             try:
-                self._wait(tf)          # FIX-B: espera sem +3s desnecessário
+                self._wait(tf)
                 c = self._candle()
                 if not c:
                     continue
-                # Deduplicação de timestamp (evita reprocessar candle do warmup)
+                # Deduplicação de timestamp
                 ts = str(c['timestamp'])
                 if ts == self._last_candle_ts:
                     continue
@@ -660,7 +651,7 @@ async function poll(){
     else if(warm) se.innerHTML='<span class="dot dy"></span><span class="y">Inicializando...</span>';
     else se.innerHTML='<span class="dot dr"></span><span style="color:#445">Parado</span>';
     const p=d.pos;const pe=document.getElementById('pos');
-    if(p) pe.innerHTML=`<span class="${p.side==='long'?'g':'r'}">${p.side.toUpperCase()} ${(p.size*(d.ct||0.01)).toFixed(4)}</span>`;
+    if(p) pe.innerHTML=`<span class="${p.side==='long'?'g':'r'}">${p.side.toUpperCase()} ${(p.size*(d.ct||0.001)).toFixed(4)}</span>`;
     else pe.innerHTML='<span style="color:#334">Flat</span>';
     if(d.bal!=null) document.getElementById('bal').textContent=d.bal.toFixed(2)+' USDT';
     const pe2=document.getElementById('pnl');
