@@ -3,8 +3,8 @@ AZLEMA Live Trading — OKX ETH-USDT-SWAP Futures 1x
 Render: configurar APENAS OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
 
 CORREÇÕES vs versão anterior:
-  FIX-A: ctVal usa valor real da API (não hardcoded 0.001).
-          API retorna 0.1 → sz calculado corretamente → sem sCode=51008.
+  FIX-A: ctVal fixado em 0.001 ETH/contrato (API ignorada intencionalmente).
+          sz calculado com base em 0.001 ETH por contrato.
   FIX-B: _wait() remove +3 e max(3). Usa +0 e max(1).
           Trade chega à exchange em ~1s da abertura do candle, não 4s.
   FIX-C: Após ordem rejeitada, reset completo do estado pendente da estratégia.
@@ -146,23 +146,18 @@ class OKX:
             return 0.0
 
     # ── ctVal: valor do contrato (ETH/contrato) ───────────────────────────────
+    CT_VAL_FIXED = 0.001   # fixo em 0.001 ETH/contrato (ignora valor da API)
+
     def ct_val(self):
-        return getattr(self, '_ct_val', 0.001)   # fallback: 0.001 ETH/contrato
+        return self.CT_VAL_FIXED
 
     def _fetch_ct_val(self):
-        try:
-            r  = self._get("/api/v5/public/instruments",
-                           {"instType": "SWAP", "instId": self.INST})
-            ct = float(r["data"][0]["ctVal"])
-            self._ct_val = ct
-            px = self.mark_price()
-            log.info(f"  ✅ ctVal API={ct} ETH/contrato | "
-                     f"1 contrato ≈ {ct * px:.4f} USDT")
-            return ct
-        except Exception as e:
-            log.warning(f"  ⚠️  _fetch_ct_val falhou: {e} → usando fallback 0.001")
-            self._ct_val = 0.001
-            return 0.001
+        # Valor fixado em 0.001 ETH/contrato — API ignorada intencionalmente
+        ct = self.CT_VAL_FIXED
+        px = self.mark_price()
+        log.info(f"  ✅ ctVal FIXO={ct} ETH/contrato | "
+                 f"1 contrato ≈ {ct * px:.4f} USDT")
+        return ct
 
     def _cts(self, eth_qty: float) -> int:
         """Converte quantidade em ETH para número de contratos (mínimo 1)."""
@@ -290,7 +285,7 @@ class LiveTrader:
         self._pnl_baseline   = 0.0
         self._cache_pos: Optional[Dict] = None
         self._cache_bal: float = 0.0
-        self._cache_ct:  float = 0.001   # ← 0.001 ETH/contrato
+        self._cache_ct:  float = 0.001   # 0.001 ETH/contrato (fixo)
         self._cache_qty: float = 0.0
         # Deduplicação de candle (evita processar o mesmo candle duas vezes)
         self._last_candle_ts: str = ""
