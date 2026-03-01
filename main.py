@@ -1021,6 +1021,31 @@ tr:hover td { background:rgba(255,255,255,.02); }
 ::-webkit-scrollbar { width:5px; height:5px; }
 ::-webkit-scrollbar-track { background:var(--bg); }
 ::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* API quick-access bar */
+.apibar { background:#06090f; border-bottom:1px solid var(--border);
+          padding:8px 28px; display:flex; align-items:center; gap:18px;
+          flex-wrap:wrap; position:sticky; top:53px; z-index:99; }
+.apibar-label { font-size:.58rem; font-weight:700; letter-spacing:2px;
+                color:var(--muted); text-transform:uppercase; white-space:nowrap; }
+.apibar-group { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+.apibar-section { font-size:.58rem; color:var(--muted); letter-spacing:1px;
+                  text-transform:uppercase; margin-right:2px; white-space:nowrap; }
+.apibtn { display:inline-flex; align-items:center; padding:4px 10px;
+          border-radius:4px; font-size:.68rem; font-weight:600; cursor:pointer;
+          letter-spacing:.3px; border:none; text-decoration:none;
+          font-family:'IBM Plex Mono',monospace; transition:.15s; white-space:nowrap; }
+.apibtn:hover { filter:brightness(1.25); transform:translateY(-1px); }
+.apibtn:active { transform:translateY(0); }
+.apibtn-blue   { background:rgba(0,212,255,.12); color:#00d4ff; border:1px solid rgba(0,212,255,.25); }
+.apibtn-green  { background:rgba(0,229,122,.12); color:#00e57a; border:1px solid rgba(0,229,122,.25); }
+.apibtn-red    { background:rgba(255,77,109,.12); color:#ff4d6d; border:1px solid rgba(255,77,109,.25); }
+.apibtn-yellow { background:rgba(255,217,74,.1);  color:#ffd94a; border:1px solid rgba(255,217,74,.25); }
+.apibtn-purple { background:rgba(155,107,255,.12);color:#9b6bff; border:1px solid rgba(155,107,255,.25); }
+#apibar-msg { font-size:.7rem; font-family:'IBM Plex Mono',monospace;
+              padding:3px 10px; border-radius:4px; display:none; }
+.abm-ok { background:rgba(0,229,122,.12); color:var(--green); border:1px solid rgba(0,229,122,.3); }
+.abm-er { background:rgba(255,77,109,.12); color:var(--red);   border:1px solid rgba(255,77,109,.3); }
 </style>
 </head>
 <body>
@@ -1034,6 +1059,35 @@ tr:hover td { background:rgba(255,255,255,.02); }
       <button class="tab" onclick="switchTab('history')">Histórico</button>
       <button class="tab" onclick="switchTab('backtest')">Backtest</button>
     </div>
+  </div>
+
+  <!-- ── Quick-access API bar ── -->
+  <div class="apibar">
+    <span class="apibar-label">API RÁPIDA</span>
+    <div class="apibar-group">
+      <span class="apibar-section">STATUS</span>
+      <a class="apibtn apibtn-blue"  href="/status"  target="_blank">/status</a>
+      <a class="apibtn apibtn-blue"  href="/health"  target="_blank">/health</a>
+      <a class="apibtn apibtn-blue"  href="/ping"    target="_blank">/ping</a>
+    </div>
+    <div class="apibar-group">
+      <span class="apibar-section">TRADER</span>
+      <button class="apibtn apibtn-green" onclick="apiPost('/start','Trader iniciado!')">POST /start</button>
+      <button class="apibtn apibtn-red"   onclick="apiPost('/stop','Trader parado!')">POST /stop</button>
+    </div>
+    <div class="apibar-group">
+      <span class="apibar-section">HISTÓRICO</span>
+      <a class="apibtn apibtn-purple" href="/history" target="_blank">GET /history</a>
+      <button class="apibtn apibtn-purple" onclick="exportJson('/history','trades_history')">⬇ Exportar JSON</button>
+      <button class="apibtn apibtn-red"    onclick="if(confirm('Limpar histórico de trades?'))apiPost('/history/clear','Histórico limpo!')">DELETE /history</button>
+    </div>
+    <div class="apibar-group">
+      <span class="apibar-section">BACKTEST</span>
+      <a class="apibtn apibtn-yellow" href="/backtest/history" target="_blank">GET /bt/history</a>
+      <button class="apibtn apibtn-yellow" onclick="exportJson('/backtest/history','backtest_history')">⬇ Exportar JSON</button>
+      <button class="apibtn apibtn-green"  onclick="quickBacktest()">POST /bt/run</button>
+    </div>
+    <div id="apibar-msg"></div>
   </div>
 
   <div class="main">
@@ -1429,6 +1483,75 @@ async function loadBtHistory(){
 }
 
 loadBtHistory();
+
+// ── API bar helpers ───────────────────────────────────────────────────────────
+async function apiPost(route, successMsg) {
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block';
+  m.className = 'abm-ok';
+  m.textContent = '...';
+  try {
+    const d = await (await fetch(route, { method: 'POST' })).json();
+    m.className = d.error ? 'abm-er' : 'abm-ok';
+    m.textContent = d.error || successMsg || d.message || 'OK';
+  } catch (e) {
+    m.className = 'abm-er';
+    m.textContent = 'Erro: ' + e;
+  }
+  setTimeout(() => m.style.display = 'none', 3500);
+  setTimeout(poll, 1200);
+}
+
+async function exportJson(route, filename) {
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok';
+  m.textContent = 'Exportando...';
+  try {
+    const d = await (await fetch(route)).json();
+    const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename + '_' + new Date().toISOString().slice(0,10) + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    m.textContent = '✓ Download iniciado';
+  } catch (e) {
+    m.className = 'abm-er';
+    m.textContent = 'Erro: ' + e;
+  }
+  setTimeout(() => m.style.display = 'none', 3000);
+}
+
+async function quickBacktest() {
+  const sym = prompt('Símbolo (ex: ETH-USDT-SWAP)', 'ETH-USDT-SWAP');
+  if (!sym) return;
+  const tf  = prompt('Timeframe (1m/5m/15m/30m/1h/4h/1d)', '30m');
+  if (!tf)  return;
+  const lim = prompt('Quantidade de candles', '500');
+  if (!lim) return;
+  const cap = prompt('Capital inicial (USDT)', '1000');
+  if (!cap) return;
+
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok';
+  m.textContent = '⏳ Rodando backtest...';
+
+  try {
+    const d = await (await fetch(
+      `/backtest/run?symbol=${encodeURIComponent(sym)}&tf=${tf}&limit=${lim}&capital=${cap}`,
+      { method: 'POST' }
+    )).json();
+    if (d.error) { m.className='abm-er'; m.textContent='Erro: '+d.error; }
+    else {
+      m.textContent = `✓ BT OK | PnL: ${d.total_pnl>=0?'+':''}${(d.total_pnl||0).toFixed(2)} | WR: ${(d.win_rate||0).toFixed(1)}%`;
+      switchTab('backtest');
+      renderBacktestResult(d);
+      loadBtHistory();
+    }
+  } catch(e) { m.className='abm-er'; m.textContent='Erro: '+e; }
+  setTimeout(() => m.style.display = 'none', 6000);
+}
 </script>
 </body>
 </html>"""
