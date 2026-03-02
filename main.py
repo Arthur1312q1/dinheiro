@@ -1370,7 +1370,7 @@ async function clearHistory() {
 }
 
 async function newPaperSession() {
-  if (!confirm('Iniciar nova sessão?\n\nIsso vai limpar os trades Paper/Live atuais.\nOs resultados de Backtest NÃO serão afetados.')) return;
+  if (!confirm('Iniciar nova sessão? Isso vai limpar os trades Paper/Live atuais. Os resultados de Backtest NAO serao afetados.')) return;
   const m = document.getElementById('apibar-msg');
   m.style.display = 'inline-block'; m.className = 'abm-ok';
   m.textContent = '🆕 Nova sessão iniciada';
