@@ -1031,9 +1031,32 @@ tr:hover td{background:rgba(255,255,255,.02)}
 
     <!-- ═══ HISTORY PANEL ═══ -->
     <div class="panel" id="panel-history">
-      <div class="controls">
-        <button class="btn btn-sec" onclick="loadHistory()">↺ Atualizar</button>
-        <button class="btn btn-sec" onclick="if(confirm('Limpar histórico?'))clearHistory()">🗑 Limpar</button>
+      <!-- Banner: sessão atual -->
+      <div id="hist-session-banner" style="
+        display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
+        background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+        padding:14px 18px;margin-bottom:20px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Sessão atual</span>
+          <span id="hist-session-mode" class="mode-indicator mi-paper">📄 PAPER</span>
+          <span id="hist-session-count" style="font-size:.72rem;font-family:'IBM Plex Mono',monospace;color:var(--muted)">0 trades</span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem" onclick="loadHistory()">↺ Atualizar</button>
+          <button class="btn" style="padding:7px 16px;font-size:.74rem;background:rgba(0,212,255,.1);color:var(--accent);border:1px solid rgba(0,212,255,.3)"
+            onclick="newPaperSession()"
+            title="Limpa os trades desta sessão para começar uma nova — não afeta o histórico de Backtest">
+            🆕 Nova Sessão
+          </button>
+          <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem;color:var(--red);border-color:rgba(255,77,109,.3)"
+            onclick="if(confirm('Limpar TODO o histórico de Paper/Live?'))clearHistory()">🗑 Limpar tudo</button>
+        </div>
+      </div>
+      <!-- Nota de separação -->
+      <div style="font-size:.7rem;color:var(--muted);margin-bottom:16px;font-family:'IBM Plex Mono',monospace;
+        background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);border-radius:6px;padding:10px 14px">
+        ℹ️ Esta aba mostra apenas trades <strong style="color:var(--text)">Paper / Live</strong>.
+        Os trades de <strong style="color:var(--yellow)">Backtest</strong> ficam separados na aba → <strong style="color:var(--yellow)">Backtest</strong>.
       </div>
       <div class="kpi-grid">
         <div class="kpi"><div class="kpi-lbl">Total Trades</div><div class="kpi-val" id="h-total">—</div></div>
@@ -1050,8 +1073,8 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="tbl-wrap">
           <table>
             <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>Motivo</th><th>Modo</th></tr></thead>
-            <tbody id="hist-tbl"><tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr></tbody>
+                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr></thead>
+            <tbody id="hist-tbl"><tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -1080,7 +1103,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <div class="tbl-wrap">
             <table>
               <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                         <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>Motivo</th></tr></thead>
+                         <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr></thead>
               <tbody id="bt-tbl"></tbody>
             </table>
           </div>
@@ -1278,6 +1301,18 @@ async function loadHistory() {
   try {
     const d = await (await fetch('/history')).json();
     const s = d.stats || {};
+
+    // Atualiza banner de sessão
+    const isPaper    = _currentMode === 'paper';
+    const modeEl     = document.getElementById('hist-session-mode');
+    const countEl    = document.getElementById('hist-session-count');
+    const closedCount = (d.trades||[]).filter(t => t.status === 'closed').length;
+    if (modeEl) {
+      modeEl.textContent = isPaper ? '📄 PAPER' : '💰 LIVE';
+      modeEl.className   = 'mode-indicator ' + (isPaper ? 'mi-paper' : 'mi-live');
+    }
+    if (countEl) countEl.textContent = closedCount + ' trade' + (closedCount !== 1 ? 's' : '') + ' fechado' + (closedCount !== 1 ? 's' : '');
+
     const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
     document.getElementById('h-total').textContent  = s.total || 0;
     const wrEl = document.getElementById('h-wr');
@@ -1301,23 +1336,27 @@ async function loadHistory() {
       return;
     }
     tb.innerHTML = trades.map((t, i) => {
-      const pnl = t.pnl_usdt || 0;
-      const dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
-      const dc  = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
-      const pc  = pnl >= 0 ? 'g' : 'r';
-      const ep  = t.exit_price ? t.exit_price.toFixed(2) : '—';
-      const mode = t.mode === 'paper'
+      const pnl    = t.pnl_usdt || 0;
+      const pct    = t.pnl_pct  || 0;
+      const dir    = t.action === 'BUY' ? 'LONG' : 'SHORT';
+      const dc     = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
+      const pc     = pnl >= 0 ? 'g' : 'r';
+      const ep     = t.exit_price ? t.exit_price.toFixed(2) : '—';
+      const mode   = t.mode === 'paper'
         ? '<span class="p">PAPER</span>'
         : '<span class="g">LIVE</span>';
+      const entryFmt = (t.entry_time||'—').replace('T',' ').slice(0,19);
+      const exitFmt  = (t.exit_time ||'—').replace('T',' ').slice(0,19);
       return `<tr>
         <td>${i+1}</td>
-        <td>${(t.entry_time||'—').replace('T',' ').slice(0,16)}</td>
-        <td>${(t.exit_time ||'—').replace('T',' ').slice(0,16)}</td>
+        <td class="mono" style="font-size:.7rem">${entryFmt}</td>
+        <td class="mono" style="font-size:.7rem">${exitFmt}</td>
         <td><span class="${dc}">${dir}</span></td>
         <td>${(t.qty||0).toFixed(4)}</td>
         <td>${(t.entry_price||0).toFixed(2)}</td>
         <td>${ep}</td>
         <td class="${pc}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
+        <td class="${pc}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
         <td style="color:var(--muted)">${t.exit_reason||'—'}</td>
         <td>${mode}</td>
       </tr>`;
@@ -1328,6 +1367,16 @@ async function loadHistory() {
 async function clearHistory() {
   await fetch('/history/clear', { method: 'POST' });
   loadHistory();
+}
+
+async function newPaperSession() {
+  if (!confirm('Iniciar nova sessão?\n\nIsso vai limpar os trades Paper/Live atuais.\nOs resultados de Backtest NÃO serão afetados.')) return;
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok';
+  m.textContent = '🆕 Nova sessão iniciada';
+  await fetch('/history/clear', { method: 'POST' });
+  loadHistory();
+  setTimeout(() => m.style.display = 'none', 3000);
 }
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
@@ -1369,23 +1418,26 @@ function renderBacktestResult(d) {
 
   const trades = (d.trades || []).slice().reverse();
   document.getElementById('bt-tbl').innerHTML = trades.length ? trades.map((t,i) => {
-    const pnl = t.pnl_usdt || 0;
-    const pct = t.pnl_percent || 0;
-    const dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
-    const dc  = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
-    const pc  = pnl >= 0 ? 'g' : 'r';
+    const pnl  = t.pnl_usdt    || 0;
+    const pct  = t.pnl_percent || 0;
+    const dir  = t.action === 'BUY' ? 'LONG' : 'SHORT';
+    const dc   = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
+    const pc   = pnl >= 0 ? 'g' : 'r';
+    const entryFmt = (t.entry_time||'—').replace('T',' ').slice(0,19);
+    const exitFmt  = (t.exit_time ||'—').replace('T',' ').slice(0,19);
     return `<tr>
       <td>${i+1}</td>
-      <td>${(t.entry_time||'—').replace('T',' ').slice(0,16)}</td>
-      <td>${(t.exit_time ||'—').replace('T',' ').slice(0,16)}</td>
+      <td class="mono" style="font-size:.7rem">${entryFmt}</td>
+      <td class="mono" style="font-size:.7rem">${exitFmt}</td>
       <td><span class="${dc}">${dir}</span></td>
       <td>${(t.qty||0).toFixed(4)}</td>
       <td>${(t.entry_price||0).toFixed(2)}</td>
       <td>${t.exit_price ? t.exit_price.toFixed(2) : '—'}</td>
       <td class="${pc}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
+      <td class="${pc}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
       <td style="color:var(--muted)">${t.exit_comment||'—'}</td>
     </tr>`;
-  }).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
 
   document.getElementById('bt-result').style.display = 'block';
 }
