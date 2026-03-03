@@ -735,8 +735,10 @@ class LiveTrader:
 # ═══════════════════════════════════════════════════════════════════════════════
 # BACKTEST
 # ═══════════════════════════════════════════════════════════════════════════════
-def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=1000.0) -> Dict:
-    log.info(f"🔬 Backtest: {symbol} {timeframe} {limit} candles...")
+def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=1000.0,
+                 open_fee_pct=0.0, close_fee_pct=0.0) -> Dict:
+    log.info(f"🔬 Backtest: {symbol} {timeframe} {limit} candles | "
+             f"taxas: abertura={open_fee_pct}% fechamento={close_fee_pct}%")
     try:
         dc_sym = symbol if '-' in symbol else symbol
         df = DataCollector(symbol=dc_sym, timeframe=timeframe, limit=limit).fetch_ohlcv()
@@ -748,27 +750,35 @@ def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=
         cfg["initial_capital"] = initial_capital
         cfg["warmup_bars"]     = min(50, limit // 5)
         strategy = AdaptiveZeroLagEMA(**cfg)
-        engine   = BacktestEngine(strategy, df)
+        engine   = BacktestEngine(strategy, df,
+                                  open_fee_pct=open_fee_pct,
+                                  close_fee_pct=close_fee_pct)
         results  = engine.run()
 
-        closed = results.get("closed_trades", [])
-        gw = sum(t["pnl_usdt"] for t in closed if t.get("pnl_usdt", 0) > 0)
-        gl = abs(sum(t["pnl_usdt"] for t in closed if t.get("pnl_usdt", 0) < 0))
+        closed     = results.get("closed_trades", [])
+        fees_on    = results.get("fees_enabled", False)
+        pnl_key    = "pnl_net" if fees_on else "pnl_usdt"
+        gw = sum(t[pnl_key] for t in closed if t.get(pnl_key, 0) > 0)
+        gl = abs(sum(t[pnl_key] for t in closed if t.get(pnl_key, 0) < 0))
 
         record = {
-            "id":           brazil_iso(),
-            "symbol":       symbol,
-            "timeframe":    timeframe,
-            "candles":      limit,
-            "capital":      initial_capital,
-            "total_pnl":    round(results.get("total_pnl_usdt", 0), 4),
-            "final_bal":    round(results.get("final_balance", 0), 4),
-            "win_rate":     round(results.get("win_rate", 0), 2),
-            "total_trades": results.get("total_trades", 0),
-            "max_drawdown": round(results.get("max_drawdown", 0), 4),
-            "sharpe":       round(results.get("sharpe", 0), 4),
-            "profit_factor": round(gw / gl, 3) if gl > 0 else float("inf"),
-            "trades":       closed,
+            "id":             brazil_iso(),
+            "symbol":         symbol,
+            "timeframe":      timeframe,
+            "candles":        limit,
+            "capital":        initial_capital,
+            "open_fee_pct":   open_fee_pct,
+            "close_fee_pct":  close_fee_pct,
+            "total_fees_paid": round(results.get("total_fees_paid", 0), 4),
+            "total_pnl":      round(results.get("total_pnl_usdt", 0), 4),
+            "final_bal":      round(results.get("final_balance", 0), 4),
+            "win_rate":       round(results.get("win_rate", 0), 2),
+            "total_trades":   results.get("total_trades", 0),
+            "max_drawdown":   round(results.get("max_drawdown", 0), 4),
+            "sharpe":         round(results.get("sharpe", 0), 4),
+            "profit_factor":  round(gw / gl, 3) if gl > 0 else float("inf"),
+            "fees_enabled":   fees_on,
+            "trades":         closed,
         }
 
         data = backtest_mgr._load()
@@ -1111,7 +1121,27 @@ tr:hover td{background:rgba(255,255,255,.02)}
         </div>
         <div class="form-group"><label>Candles</label><input id="bt-lim" type="number" value="500" min="100" max="5000"></div>
         <div class="form-group"><label>Capital Inicial</label><input id="bt-cap" type="number" value="1000" min="100"></div>
-        <button class="btn btn-accent" id="btnBT" onclick="runBacktest()">▶ Executar</button>
+        <div class="form-group" title="Taxa cobrada ao abrir posição (% do valor nocional). Bitget taker: 0.06%">
+          <label>Taxa Abertura %</label>
+          <input id="bt-ofee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px">
+        </div>
+        <div class="form-group" title="Taxa cobrada ao fechar posição (% do valor nocional). Bitget taker: 0.06%">
+          <label>Taxa Fechamento %</label>
+          <input id="bt-cfee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px">
+        </div>
+        <div style="display:flex;flex-direction:column;gap:5px;justify-content:flex-end">
+          <button class="btn btn-accent" id="btnBT" onclick="runBacktest()">▶ Executar</button>
+          <button class="btn btn-sec" style="font-size:.72rem;padding:6px 12px"
+            onclick="document.getElementById('bt-ofee').value='0';document.getElementById('bt-cfee').value='0'"
+            title="Remover taxas para ver resultado sem custos">Sem taxas</button>
+        </div>
+      </div>
+      <div style="font-size:.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;
+        background:rgba(255,217,74,.04);border:1px solid rgba(255,217,74,.12);border-radius:5px;
+        padding:8px 14px;margin-bottom:18px">
+        💡 <strong style="color:var(--yellow)">Bitget Futures (taker):</strong> 0.06% abertura + 0.06% fechamento &nbsp;|&nbsp;
+        <strong style="color:var(--yellow)">Maker:</strong> 0.02% + 0.02% &nbsp;|&nbsp;
+        <strong style="color:var(--muted)">0% = sem simulação de taxas</strong>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="bt-prog" style="width:0%"></div></div>
       <div id="bt-result" style="display:none">
@@ -1405,12 +1435,15 @@ async function runBacktest() {
   prog.style.width = '20%';
   document.getElementById('bt-result').style.display = 'none';
   try {
-    const sym = document.getElementById('bt-sym').value;
-    const tf  = document.getElementById('bt-tf').value;
-    const lim = document.getElementById('bt-lim').value;
-    const cap = document.getElementById('bt-cap').value;
+    const sym  = document.getElementById('bt-sym').value;
+    const tf   = document.getElementById('bt-tf').value;
+    const lim  = document.getElementById('bt-lim').value;
+    const cap  = document.getElementById('bt-cap').value;
+    const ofee = document.getElementById('bt-ofee').value;
+    const cfee = document.getElementById('bt-cfee').value;
     prog.style.width = '60%';
-    const d = await (await fetch(`/backtest/run?symbol=${sym}&tf=${tf}&limit=${lim}&capital=${cap}`, {method:'POST'})).json();
+    const url = `/backtest/run?symbol=${sym}&tf=${tf}&limit=${lim}&capital=${cap}&open_fee=${ofee}&close_fee=${cfee}`;
+    const d = await (await fetch(url, {method:'POST'})).json();
     prog.style.width = '100%';
     if (d.error) { alert('Erro: ' + d.error); return; }
     renderBacktestResult(d);
@@ -1420,9 +1453,12 @@ async function runBacktest() {
 }
 
 function renderBacktestResult(d) {
-  const pf = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
+  const pf      = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
+  const hasFees = d.fees_enabled && (d.open_fee_pct > 0 || d.close_fee_pct > 0);
+  const pnlLabel = hasFees ? 'PnL Líquido' : 'PnL Total';
+
   const kpis = [
-    ['PnL Total',    (d.total_pnl >= 0 ? '+' : '') + d.total_pnl.toFixed(2) + ' USDT', d.total_pnl >= 0 ? 'g' : 'r'],
+    [pnlLabel,       (d.total_pnl >= 0 ? '+' : '') + d.total_pnl.toFixed(2) + ' USDT', d.total_pnl >= 0 ? 'g' : 'r'],
     ['Saldo Final',  d.final_bal.toFixed(2) + ' USDT', ''],
     ['Win Rate',     d.win_rate.toFixed(1) + '%',  d.win_rate >= 50 ? 'g' : 'r'],
     ['Total Trades', d.total_trades, ''],
@@ -1430,19 +1466,61 @@ function renderBacktestResult(d) {
     ['Max Drawdown', d.max_drawdown.toFixed(2) + '%', 'r'],
     ['Sharpe Ratio', d.sharpe.toFixed(3),  d.sharpe >= 1 ? 'g' : d.sharpe >= 0 ? 'y' : 'r'],
   ];
+  if (hasFees) {
+    kpis.push(['Taxas Pagas', '-' + (d.total_fees_paid||0).toFixed(4) + ' USDT', 'r']);
+  }
+
   document.getElementById('bt-kpis').innerHTML = kpis.map(([lbl,val,cls]) =>
     `<div class="kpi ${cls}"><div class="kpi-lbl">${lbl}</div><div class="kpi-val ${cls}">${val}</div></div>`
   ).join('');
 
+  // Banner de taxas
+  const btResult = document.getElementById('bt-result');
+  let feesBanner = document.getElementById('bt-fees-banner');
+  if (!feesBanner) {
+    feesBanner = document.createElement('div');
+    feesBanner.id = 'bt-fees-banner';
+    feesBanner.style.cssText = 'font-size:.7rem;font-family:"IBM Plex Mono",monospace;padding:8px 14px;border-radius:5px;margin-bottom:16px;';
+    btResult.insertBefore(feesBanner, btResult.firstChild);
+  }
+  if (hasFees) {
+    feesBanner.style.background = 'rgba(255,77,109,.06)';
+    feesBanner.style.border = '1px solid rgba(255,77,109,.2)';
+    feesBanner.style.color = '#ff4d6d';
+    feesBanner.innerHTML = `💸 Taxas simuladas: <strong>${d.open_fee_pct}%</strong> abertura + <strong>${d.close_fee_pct}%</strong> fechamento &nbsp;|&nbsp; Total pago: <strong>-${(d.total_fees_paid||0).toFixed(4)} USDT</strong> &nbsp;|&nbsp; PnL já descontado`;
+  } else {
+    feesBanner.style.background = 'rgba(255,217,74,.05)';
+    feesBanner.style.border = '1px solid rgba(255,217,74,.15)';
+    feesBanner.style.color = '#ffd94a';
+    feesBanner.innerHTML = '⚠️ Sem taxas simuladas — resultado sem custo de corretagem (0% abertura e fechamento)';
+  }
+
+  // Cabeçalho da tabela: adiciona coluna PnL Líq se houver taxas
+  const tblHead = document.querySelector('#bt-tbl')?.closest('table')?.querySelector('thead tr');
+  if (tblHead) {
+    tblHead.innerHTML = `<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+      <th>P. Entrada</th><th>P. Saída</th>
+      <th>PnL Bruto</th>${hasFees ? '<th>Taxas</th><th>PnL Líq.</th>' : ''}
+      <th>PnL %</th><th>Motivo</th>`;
+  }
+  const colSpan = hasFees ? 13 : 10;
+
   const trades = (d.trades || []).slice().reverse();
   document.getElementById('bt-tbl').innerHTML = trades.length ? trades.map((t,i) => {
-    const pnl  = t.pnl_usdt    || 0;
-    const pct  = t.pnl_percent || 0;
-    const dir  = t.action === 'BUY' ? 'LONG' : 'SHORT';
-    const dc   = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
-    const pc   = pnl >= 0 ? 'g' : 'r';
+    const pnlB  = t.pnl_usdt  || 0;
+    const pnlN  = t.pnl_net   != null ? t.pnl_net : pnlB;
+    const pct   = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
+    const fees  = t.fees_total || 0;
+    const dir   = t.action === 'BUY' ? 'LONG' : 'SHORT';
+    const dc    = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
+    const pcB   = pnlB >= 0 ? 'g' : 'r';
+    const pcN   = pnlN >= 0 ? 'g' : 'r';
     const entryFmt = (t.entry_time||'—').replace('T',' ').slice(0,19);
     const exitFmt  = (t.exit_time ||'—').replace('T',' ').slice(0,19);
+    const feeCols  = hasFees
+      ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td>
+         <td class="${pcN}">${pnlN >= 0 ? '+' : ''}${pnlN.toFixed(4)}</td>`
+      : '';
     return `<tr>
       <td>${i+1}</td>
       <td class="mono" style="font-size:.7rem">${entryFmt}</td>
@@ -1451,11 +1529,12 @@ function renderBacktestResult(d) {
       <td>${(t.qty||0).toFixed(4)}</td>
       <td>${(t.entry_price||0).toFixed(2)}</td>
       <td>${t.exit_price ? t.exit_price.toFixed(2) : '—'}</td>
-      <td class="${pc}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
-      <td class="${pc}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
+      <td class="${pcB}">${pnlB >= 0 ? '+' : ''}${pnlB.toFixed(4)}</td>
+      ${feeCols}
+      <td class="${pcN}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
       <td style="color:var(--muted)">${t.exit_comment||'—'}</td>
     </tr>`;
-  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
+  }).join('') : `<tr><td colspan="${colSpan}" style="text-align:center;color:var(--muted)">Sem trades</td></tr>`;
 
   document.getElementById('bt-result').style.display = 'block';
 }
@@ -1466,12 +1545,26 @@ async function loadBtHistory() {
     const sessions = (d.sessions || []).slice().reverse();
     const tb = document.getElementById('bt-hist-tbl');
     if (!sessions.length) {
-      tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>';
+      tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>';
       return;
     }
+    // Atualiza cabeçalho para incluir colunas de taxa
+    const thead = tb.closest('table')?.querySelector('thead tr');
+    if (thead) {
+      thead.innerHTML = `<th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th>
+        <th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th>
+        <th>Drawdown</th><th>Sharpe</th><th>Tax.Aber.</th><th>Tax.Fech.</th>`;
+    }
     tb.innerHTML = sessions.map(s => {
-      const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
-      const pc = s.total_pnl >= 0 ? 'g' : 'r';
+      const pf      = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
+      const pc      = s.total_pnl >= 0 ? 'g' : 'r';
+      const hasFees = s.fees_enabled || s.open_fee_pct > 0 || s.close_fee_pct > 0;
+      const feeTag  = hasFees
+        ? `<span style="color:#ff4d6d;font-size:.65rem">${(s.open_fee_pct||0).toFixed(2)}%</span>`
+        : `<span style="color:var(--muted);font-size:.65rem">0%</span>`;
+      const cFeeTag = hasFees
+        ? `<span style="color:#ff4d6d;font-size:.65rem">${(s.close_fee_pct||0).toFixed(2)}%</span>`
+        : `<span style="color:var(--muted);font-size:.65rem">0%</span>`;
       return `<tr>
         <td>${(s.id||'—').replace('T',' ').slice(0,19)}</td>
         <td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td>
@@ -1481,6 +1574,7 @@ async function loadBtHistory() {
         <td class="${s.profit_factor > 1 ? 'g' : 'r'}">${pf}</td>
         <td class="r">${(s.max_drawdown||0).toFixed(2)}%</td>
         <td class="${(s.sharpe||0) >= 1 ? 'g' : (s.sharpe||0) >= 0 ? 'y' : 'r'}">${(s.sharpe||0).toFixed(3)}</td>
+        <td>${feeTag}</td><td>${cFeeTag}</td>
       </tr>`;
     }).join('');
   } catch(e) { console.error(e); }
@@ -1658,11 +1752,13 @@ def clear_history():
 
 @app.route('/backtest/run', methods=['POST'])
 def api_backtest():
-    sym     = flask_request.args.get('symbol',  "ETH-USDT-SWAP")
-    tf      = flask_request.args.get('tf',      TIMEFRAME)
-    limit   = int(flask_request.args.get('limit',   500))
-    capital = float(flask_request.args.get('capital', 1000.0))
-    result  = run_backtest(sym, tf, limit, capital)
+    sym           = flask_request.args.get('symbol',        "ETH-USDT-SWAP")
+    tf            = flask_request.args.get('tf',            TIMEFRAME)
+    limit         = int(flask_request.args.get('limit',     500))
+    capital       = float(flask_request.args.get('capital', 1000.0))
+    open_fee_pct  = float(flask_request.args.get('open_fee',  0.0))
+    close_fee_pct = float(flask_request.args.get('close_fee', 0.0))
+    result = run_backtest(sym, tf, limit, capital, open_fee_pct, close_fee_pct)
     return jsonify(result)
 
 @app.route('/backtest/history')
