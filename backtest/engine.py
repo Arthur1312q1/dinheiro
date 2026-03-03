@@ -1,14 +1,40 @@
 # backtest/engine.py
 import pandas as pd
 import numpy as np
+from datetime import timezone, timedelta
 from typing import List, Dict, Any
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
+
+# Fuso horário Brasil (Brasília, UTC-3, sem horário de verão)
+BRT = timezone(timedelta(hours=-3))
+
+
+def _to_brt_str(ts) -> str:
+    """
+    Converte timestamp (pandas.Timestamp UTC ou qualquer datetime) para
+    string no horário de Brasília: 'YYYY-MM-DDTHH:MM:SS'
+    """
+    try:
+        if isinstance(ts, pd.Timestamp):
+            # Pandas Timestamp — pode ser naive (assume UTC) ou tz-aware
+            if ts.tzinfo is None:
+                ts = ts.tz_localize('UTC')
+            return ts.tz_convert(BRT).strftime('%Y-%m-%dT%H:%M:%S')
+        elif hasattr(ts, 'tzinfo'):
+            # datetime nativo
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(BRT).strftime('%Y-%m-%dT%H:%M:%S')
+    except Exception:
+        pass
+    return str(ts)[:19]
 
 
 class BacktestEngine:
     """
     Motor de backtest que processa candles e registra trades.
     Compatível com a estratégia AdaptiveZeroLagEMA.
+    Todos os timestamps são armazenados em horário de Brasília (BRT, UTC-3).
     """
 
     def __init__(self, strategy: AdaptiveZeroLagEMA, data: pd.DataFrame):
@@ -33,17 +59,18 @@ class BacktestEngine:
 
             for action in actions:
                 act = action['action']
+                # Converte timestamp para string BRT
+                ts_str = _to_brt_str(action['timestamp'])
 
                 if act in ('BUY', 'SELL'):
-                    # Novo trade aberto
                     self.trades.append({
-                        'entry_time':   action['timestamp'],
+                        'entry_time':   ts_str,
                         'entry_price':  action['price'],
                         'action':       act,
                         'qty':          action['qty'],
                         'comment':      action.get('comment', ''),
                         'balance':      action['balance'],
-                        # Campos de saída serão preenchidos depois
+                        # Campos de saída preenchidos depois
                         'exit_time':    None,
                         'exit_price':   None,
                         'pnl_usdt':     None,
@@ -52,7 +79,6 @@ class BacktestEngine:
                     })
 
                 elif act in ('EXIT_LONG', 'EXIT_SHORT'):
-                    # Encontra o último trade aberto (pyramiding=1 → apenas 1 aberto)
                     open_trade = self._find_open_trade(act)
                     if open_trade is not None:
                         entry_price = open_trade['entry_price']
@@ -60,14 +86,13 @@ class BacktestEngine:
                         qty         = open_trade['qty']
                         pnl_usdt    = action.get('pnl', 0.0)
 
-                        # PnL % relativo à entrada
                         if open_trade['action'] == 'BUY':
                             pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                         else:
                             pnl_pct = ((entry_price - exit_price) / entry_price) * 100
 
                         open_trade.update({
-                            'exit_time':    action['timestamp'],
+                            'exit_time':    ts_str,
                             'exit_price':   exit_price,
                             'pnl_usdt':     pnl_usdt,
                             'pnl_percent':  pnl_pct,
@@ -75,7 +100,7 @@ class BacktestEngine:
                         })
 
             self.equity_curve.append(self.strategy.balance)
-            self.timestamp_list.append(candle['timestamp'])
+            self.timestamp_list.append(_to_brt_str(candle['timestamp']))
 
         return self._generate_report()
 
@@ -91,7 +116,6 @@ class BacktestEngine:
         return None
 
     def _generate_report(self) -> Dict[str, Any]:
-        # Filtra apenas trades com entrada E saída
         closed = [t for t in self.trades if t.get('exit_time') is not None]
         df_closed = pd.DataFrame(closed) if closed else pd.DataFrame()
 
@@ -113,7 +137,6 @@ class BacktestEngine:
         }
 
     def _calculate_max_drawdown(self) -> float:
-        """Max drawdown em % da curva de equity."""
         if len(self.equity_curve) < 2:
             return 0.0
         peak = self.equity_curve[0]
@@ -129,11 +152,9 @@ class BacktestEngine:
 
     def _calculate_sharpe(self, risk_free_rate: float = 0.0,
                           periods_per_year: int = 252) -> float:
-        """Sharpe Ratio anualizado."""
         if len(self.equity_curve) < 2:
             return 0.0
         eq = np.array(self.equity_curve, dtype=float)
-        # Evita divisão por zero
         safe = np.where(eq[:-1] != 0, eq[:-1], np.nan)
         returns = np.diff(eq) / safe
         returns = returns[~np.isnan(returns)]
