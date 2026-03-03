@@ -494,11 +494,15 @@ class LiveTrader:
             self._cache_px = close_px
 
         log.info(f"\n── {ts} | C={close_px:.2f} | bal={self._cache_bal:.2f} | "
-                 f"pos={self.strategy.position_size:+.4f} | "
+                 f"strat_pos={self.strategy.position_size:+.4f} | "
+                 f"pos={self._cache_pos} | "
                  f"paper={'SIM' if self._is_paper() else 'NAO'}")
 
-        actions  = self.strategy.next(candle)
+        actions  = self.strategy.next(candle) or []
         real     = self._cache_pos
+
+        log.info(f"  📊 Estratégia: {len(actions)} sinal(is): "
+                 f"{[a.get('action','?') for a in actions]}")
 
         for act in actions:
             kind = act.get('action', '')
@@ -590,6 +594,9 @@ class LiveTrader:
                         self._last_order_candle = str(ts)
                         self._add_log("ENTER_SHORT", px, qty)
                         real = {'side': 'short', 'size': qty, 'avg_px': px}
+
+        # Persiste cache de posição para próximo processo
+        self._cache_pos = real
 
     def _wait(self, tf: int = 30):
         now  = datetime.utcnow()
