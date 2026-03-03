@@ -500,8 +500,10 @@ class LiveTrader:
         ts       = candle.get('timestamp', brazil_now())
         close_px = float(candle['close'])
 
-        # Garante que _cache_px sempre tem o preço atual do candle como mínimo
-        if close_px > 0:
+        # NÃO sobrescreve _cache_px com preço histórico do candle fechado.
+        # _cache_px foi atualizado por _refresh_cache() com o mark price atual.
+        # Usa close_px apenas como fallback se o cache ainda está vazio.
+        if self._cache_px <= 0 and close_px > 0:
             self._cache_px = close_px
 
         log.info(f"\n── {ts} | C={close_px:.2f} | bal={self._cache_bal:.2f} | "
@@ -523,13 +525,15 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
-                        self.paper.close_long(pos['size'], close_px, reason)
-                        self._add_log("EXIT_LONG", close_px, pos['size'], reason)
+                        _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.paper.close_long(pos['size'], _exit_px, reason)
+                        self._add_log("EXIT_LONG", _exit_px, pos['size'], reason)
                         real = None
                 elif real and real['side'] == 'long':
                     qty = real['size'] * self.bitget.ct_val()
-                    self.bitget.close_long(qty, close_px, reason)
-                    self._add_log("EXIT_LONG", close_px, qty, reason)
+                    _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                    self.bitget.close_long(qty, _exit_px, reason)
+                    self._add_log("EXIT_LONG", _exit_px, qty, reason)
                     real = None
 
             elif kind == 'EXIT_SHORT':
@@ -537,13 +541,15 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
-                        self.paper.close_short(pos['size'], close_px, reason)
-                        self._add_log("EXIT_SHORT", close_px, pos['size'], reason)
+                        _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.paper.close_short(pos['size'], _exit_px, reason)
+                        self._add_log("EXIT_SHORT", _exit_px, pos['size'], reason)
                         real = None
                 elif real and real['side'] == 'short':
                     qty = real['size'] * self.bitget.ct_val()
-                    self.bitget.close_short(qty, close_px, reason)
-                    self._add_log("EXIT_SHORT", close_px, qty, reason)
+                    _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                    self.bitget.close_short(qty, _exit_px, reason)
+                    self._add_log("EXIT_SHORT", _exit_px, qty, reason)
                     real = None
 
             elif kind == 'BUY':
@@ -555,7 +561,8 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
-                        self.paper.close_short(pos['size'], close_px, "REVERSAL")
+                        _rev_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.paper.close_short(pos['size'], _rev_px, "REVERSAL")
                     px = self._cache_px if self._cache_px > 0 else close_px
                     log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty = self.paper.open_long(qty, self._cache_bal, px)
@@ -565,7 +572,8 @@ class LiveTrader:
                         real = {'side': 'long', 'size': qty, 'avg_px': px}
                 else:
                     if real and real['side'] == 'short':
-                        self.bitget.close_short(real['size'] * self.bitget.ct_val(), close_px, "REVERSAL")
+                        _rev_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.bitget.close_short(real['size'] * self.bitget.ct_val(), _rev_px, "REVERSAL")
                         real = None
                     bal = self._cache_bal
                     px  = self._cache_px if self._cache_px > 0 else close_px
@@ -585,7 +593,8 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
-                        self.paper.close_long(pos['size'], close_px, "REVERSAL")
+                        _rev_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.paper.close_long(pos['size'], _rev_px, "REVERSAL")
                     px = self._cache_px if self._cache_px > 0 else close_px
                     log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty = self.paper.open_short(qty, self._cache_bal, px)
@@ -595,7 +604,8 @@ class LiveTrader:
                         real = {'side': 'short', 'size': qty, 'avg_px': px}
                 else:
                     if real and real['side'] == 'long':
-                        self.bitget.close_long(real['size'] * self.bitget.ct_val(), close_px, "REVERSAL")
+                        _rev_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.bitget.close_long(real['size'] * self.bitget.ct_val(), _rev_px, "REVERSAL")
                         real = None
                     bal = self._cache_bal
                     px  = self._cache_px if self._cache_px > 0 else close_px
@@ -610,12 +620,16 @@ class LiveTrader:
         self._cache_pos = real
 
     def _wait(self, tf: int = 30):
-        now  = brazil_now()
-        secs = (tf - now.minute % tf) * 60 - now.second
-        if secs <= 0:
-            secs += tf * 60
-        log.info(f"⏰ Aguardando {secs:.0f}s até próximo close...")
-        time.sleep(max(1, secs))
+        """Aguarda até o fechamento exato do próximo candle (precisão de ms)."""
+        now     = brazil_now()
+        tf_secs = tf * 60
+        elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
+        secs    = tf_secs - elapsed
+        # < 1s do fechamento → espera o próximo ciclo completo
+        if secs < 1:
+            secs += tf_secs
+        log.info(f"⏰ Aguardando {secs:.1f}s até próximo close ({tf}m)...")
+        time.sleep(secs)
 
     def _candle(self) -> Optional[Dict]:
         # Bitget v2 granularity values
@@ -679,16 +693,31 @@ class LiveTrader:
         while self._running:
             try:
                 self._wait(tf)
-                time.sleep(2)
-                c = self._candle()
-                if not c:
-                    log.warning("  ⚠️ _candle() retornou None — aguardando próximo ciclo")
+
+                # Retry rápido sem sleep fixo — candle disponível quase imediato
+                # quando o servidor está na mesma região que a Bitget API
+                c = None
+                for _attempt in range(10):
+                    raw = self._candle()
+                    if raw is None:
+                        time.sleep(0.2)
+                        continue
+                    if str(raw['timestamp']) == self._last_candle_ts:
+                        # Candle ainda não fechou na API — tenta de novo em 200ms
+                        if _attempt < 9:
+                            log.info(f"  ⏳ Aguardando novo candle na API (tentativa {_attempt+1}/10)...")
+                            time.sleep(0.2)
+                            continue
+                        log.warning("  ⚠️ Candle não atualizou após 10 tentativas — próximo ciclo")
+                        break
+                    c = raw
+                    break
+
+                if c is None:
                     continue
+
                 ts = str(c['timestamp'])
-                if ts == self._last_candle_ts:
-                    log.info(f"  ⏭️ Candle duplicado ignorado: {ts}")
-                    continue
-                log.info(f"  ✅ Novo candle: {ts}")
+                log.info(f"  ✅ Novo candle: {ts} (latência: {_attempt} retry(s))")
                 self._last_candle_ts = ts
                 self._refresh_cache()
                 self.process(c)
