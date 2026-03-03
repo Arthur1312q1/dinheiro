@@ -8,10 +8,21 @@ Modo de operação selecionável via dashboard:
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
 from pathlib import Path
 from flask import Flask, jsonify, request as flask_request
+
+# ── Fuso horário Brasil (Brasília, UTC-3, sem horário de verão) ───────────────
+BRT = timezone(timedelta(hours=-3))
+
+def brazil_now() -> datetime:
+    """Retorna datetime atual no horário de Brasília."""
+    return datetime.now(BRT)
+
+def brazil_iso() -> str:
+    """Retorna ISO string no horário de Brasília (sem microsegundos)."""
+    return brazil_now().strftime('%Y-%m-%dT%H:%M:%S')
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 from data.collector import DataCollector
@@ -173,7 +184,7 @@ class PaperTrader:
 
     def open_long(self, qty, bal_usdt=0, px=0):
         trade_id = self._new_id()
-        ts = datetime.utcnow().isoformat()
+        ts = brazil_iso()
         history_mgr.add_trade({
             "id": trade_id, "action": "BUY", "status": "open",
             "entry_time": ts, "entry_price": px,
@@ -185,7 +196,7 @@ class PaperTrader:
 
     def open_short(self, qty, bal_usdt=0, px=0):
         trade_id = self._new_id()
-        ts = datetime.utcnow().isoformat()
+        ts = brazil_iso()
         history_mgr.add_trade({
             "id": trade_id, "action": "SELL", "status": "open",
             "entry_time": ts, "entry_price": px,
@@ -201,7 +212,7 @@ class PaperTrader:
         entry_px = self.position["avg_px"]
         pnl      = (exit_px - entry_px) * qty
         self.balance += pnl
-        ts = datetime.utcnow().isoformat()
+        ts = brazil_iso()
         history_mgr.close_trade(self.position["id"], exit_px, ts, reason, pnl)
         log.info(f"  📄 PAPER LONG fechado | px={exit_px:.2f} pnl={pnl:+.4f} USDT")
         self.position = None
@@ -213,7 +224,7 @@ class PaperTrader:
         entry_px = self.position["avg_px"]
         pnl      = (entry_px - exit_px) * qty
         self.balance += pnl
-        ts = datetime.utcnow().isoformat()
+        ts = brazil_iso()
         history_mgr.close_trade(self.position["id"], exit_px, ts, reason, pnl)
         log.info(f"  📄 PAPER SHORT fechado | px={exit_px:.2f} pnl={pnl:+.4f} USDT")
         self.position = None
@@ -333,7 +344,7 @@ class Bitget:
         if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
             history_mgr.add_trade({"id": str(oid), "action": "BUY", "status": "open",
-                "entry_time": datetime.utcnow().isoformat(), "entry_price": px,
+                "entry_time": brazil_iso(), "entry_price": px,
                 "qty": qty, "balance": bal, "mode": "live"})
         return r, qty
 
@@ -343,7 +354,7 @@ class Bitget:
         if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
             history_mgr.add_trade({"id": str(oid), "action": "SELL", "status": "open",
-                "entry_time": datetime.utcnow().isoformat(), "entry_price": px,
+                "entry_time": brazil_iso(), "entry_price": px,
                 "qty": qty, "balance": bal, "mode": "live"})
         return r, qty
 
@@ -351,7 +362,7 @@ class Bitget:
         sz = self._cts(qty)
         r  = self._order("sell", "close", sz)
         if r.get("code") == "00000":
-            ts = datetime.utcnow().isoformat()
+            ts = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
                 if t.get("action") == "BUY" and t.get("status") == "open":
                     pnl = (exit_px - t.get("entry_price", exit_px)) * qty
@@ -363,7 +374,7 @@ class Bitget:
         sz = self._cts(qty)
         r  = self._order("buy", "close", sz)
         if r.get("code") == "00000":
-            ts = datetime.utcnow().isoformat()
+            ts = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
                 if t.get("action") == "SELL" and t.get("status") == "open":
                     pnl = (t.get("entry_price", exit_px) - exit_px) * qty
@@ -449,7 +460,7 @@ class LiveTrader:
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
-            "time":   datetime.utcnow().isoformat(),
+            "time":   brazil_iso(),
             "action": action,
             "price":  price,
             "qty":    qty,
@@ -486,7 +497,7 @@ class LiveTrader:
         return self.strategy.net_profit - self._pnl_baseline
 
     def process(self, candle: Dict):
-        ts       = candle.get('timestamp', datetime.utcnow())
+        ts       = candle.get('timestamp', brazil_now())
         close_px = float(candle['close'])
 
         # Garante que _cache_px sempre tem o preço atual do candle como mínimo
@@ -599,7 +610,7 @@ class LiveTrader:
         self._cache_pos = real
 
     def _wait(self, tf: int = 30):
-        now  = datetime.utcnow()
+        now  = brazil_now()
         secs = (tf - now.minute % tf) * 60 - now.second
         if secs <= 0:
             secs += tf * 60
@@ -745,7 +756,7 @@ def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=
         gl = abs(sum(t["pnl_usdt"] for t in closed if t.get("pnl_usdt", 0) < 0))
 
         record = {
-            "id":           datetime.utcnow().isoformat(),
+            "id":           brazil_iso(),
             "symbol":       symbol,
             "timeframe":    timeframe,
             "candles":      limit,
@@ -787,8 +798,14 @@ class _LogCap(logging.Handler):
         _logs.append(self.format(r))
         if len(_logs) > 300: _logs.pop(0)
 
+class _BRTFormatter(logging.Formatter):
+    """Formatter que exibe hora no fuso de Brasília (UTC-3)."""
+    def formatTime(self, record, datefmt=None):
+        ct = datetime.fromtimestamp(record.created, tz=BRT)
+        return ct.strftime(datefmt or '%H:%M:%S')
+
 _lh = _LogCap()
-_lh.setFormatter(logging.Formatter('%(asctime)s %(message)s', '%H:%M:%S'))
+_lh.setFormatter(_BRTFormatter('%(asctime)s %(message)s', '%H:%M:%S'))
 log.addHandler(_lh)
 
 DASH = """<!DOCTYPE html>
@@ -1456,7 +1473,7 @@ async function loadBtHistory() {
       const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
       const pc = s.total_pnl >= 0 ? 'g' : 'r';
       return `<tr>
-        <td>${(s.id||'—').replace('T',' ').slice(0,16)}</td>
+        <td>${(s.id||'—').replace('T',' ').slice(0,19)}</td>
         <td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td>
         <td class="${pc}">${s.total_pnl >= 0 ? '+' : ''}${(s.total_pnl||0).toFixed(2)}</td>
         <td class="${s.win_rate >= 50 ? 'g' : 'r'}">${(s.win_rate||0).toFixed(1)}%</td>
