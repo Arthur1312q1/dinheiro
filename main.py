@@ -475,16 +475,21 @@ class LiveTrader:
         bal = self._cache_bal
         px  = self._cache_px
         ct  = 0.001
-        if bal <= 0 or px <= 0:
-            bal = PAPER_BALANCE if self._is_paper() else 0
-            px  = self._mark_price()
-            if bal <= 0 or px <= 0:
+        if bal <= 0:
+            log.warning(f"  ⚠️ _qty: saldo inválido bal={bal}")
+            return 0.0
+        if px <= 0:
+            px = self._mark_price()
+            if px <= 0:
+                log.warning(f"  ⚠️ _qty: preço inválido px={px} — sem trade")
                 return 0.0
-        pct = 1.0 if self._is_paper() else LIVE_PCT   # paper=100%, live=95%
+            self._cache_px = px
+        pct       = 1.0 if self._is_paper() else LIVE_PCT
         usdt_disp = bal * pct * 0.90
-        cts = max(1, int(usdt_disp / (ct * px)))
-        qty = cts * ct
-        log.info(f"  💰 qty={qty:.6f} ETH ({cts} cts) | bal={bal:.2f} USDT | px={px:.2f} | {'PAPER' if self._is_paper() else 'LIVE 95%'}")
+        cts       = max(1, int(usdt_disp / (ct * px)))
+        qty       = cts * ct
+        log.info(f"  💰 qty={qty:.6f} ETH ({cts} cts) | bal={bal:.2f} | px={px:.2f} | "
+                 f"{'PAPER' if self._is_paper() else 'LIVE 95%'}")
         return qty
 
     def _add_log(self, action, price, qty, reason=""):
@@ -508,11 +513,18 @@ class LiveTrader:
                 'timestamp': row.get('timestamp', 0),
                 'index':     int(row.get('index', 0)),
             })
-        self._pnl_baseline   = self.strategy.net_profit
-        self._warming        = False
+        self._pnl_baseline = self.strategy.net_profit
+        self._warming      = False
+        # Inicializa _cache_px com o último close do warmup como fallback seguro
+        last_close = float(df['close'].iloc[-1])
+        if last_close > 0:
+            self._cache_px = last_close
         self._refresh_cache()
-        self._last_candle_ts = str(df['timestamp'].iloc[-1])
-        log.info(f"  ✅ Warmup OK | Period={self.strategy.Period}")
+        # NÃO seta _last_candle_ts aqui — o timestamp OKX difere do Bitget
+        # e causaria o primeiro candle real ser descartado como duplicado
+        self._last_candle_ts = ""
+        log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} | "
+                 f"EC={self.strategy.EC:.2f} | px_cache={self._cache_px:.2f}")
 
     @property
     def live_pnl(self):
@@ -521,7 +533,14 @@ class LiveTrader:
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', datetime.utcnow())
         close_px = float(candle['close'])
-        log.info(f"\n── {ts} | C={close_px:.2f}")
+
+        # Garante que _cache_px sempre tem o preço atual do candle como mínimo
+        if close_px > 0:
+            self._cache_px = close_px
+
+        log.info(f"\n── {ts} | C={close_px:.2f} | bal={self._cache_bal:.2f} | "
+                 f"pos={self.strategy.position_size:+.4f} | "
+                 f"paper={'SIM' if self._is_paper() else 'NAO'}")
 
         actions  = self.strategy.next(candle)
         real     = self._cache_pos
@@ -626,21 +645,26 @@ class LiveTrader:
         time.sleep(max(1, secs))
 
     def _candle(self) -> Optional[Dict]:
-        TF = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H"}
-        tf = TF.get(TIMEFRAME, "30m")
+        # Bitget Mix v1 granularity: "1min","5min","15min","30min","60min","4H","1D"
+        TF = {"1m":"1min","3m":"3min","5m":"5min","15m":"15min","30m":"30min",
+              "1h":"60min","2h":"120min","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
+        tf = TF.get(TIMEFRAME, "30min")
         try:
             r = requests.get(
                 "https://api.bitget.com/api/mix/v1/market/candles",
-                params={"symbol": "ETHUSDT_UMCBL", "granularity": tf, "limit": "2"},
+                params={"symbol": "ETHUSDT_UMCBL", "granularity": tf, "limit": "3"},
                 timeout=10,
             ).json()
-            # Bitget retorna em ordem decrescente: data[0] = barra mais recente (ainda aberta)
-            # data[1] = barra anterior já fechada
             data = r.get("data", [])
-            if len(data) < 2:
+            if r.get("code") != "00000":
+                log.error(f"  ❌ Bitget candles API: code={r.get('code')} msg={r.get('msg')}")
                 return None
-            c = data[1]  # barra fechada
-            return {
+            if len(data) < 2:
+                log.warning(f"  ⚠️ Bitget retornou menos de 2 candles (len={len(data)})")
+                return None
+            # data[0] = barra atual (aberta), data[1] = última barra fechada
+            c = data[1]
+            candle = {
                 'open':      float(c[1]),
                 'high':      float(c[2]),
                 'low':       float(c[3]),
@@ -648,8 +672,11 @@ class LiveTrader:
                 'timestamp': datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc),
                 'index':     self.strategy._bar + 1,
             }
+            log.info(f"  🕯️ Candle: O={candle['open']:.2f} H={candle['high']:.2f} "
+                     f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
+            return candle
         except Exception as e:
-            log.error(f"Erro _candle: {e}")
+            log.error(f"  ❌ _candle erro: {e}")
             return None
 
     def run(self, df: pd.DataFrame):
@@ -666,6 +693,7 @@ class LiveTrader:
                 log.error("❌ Falha ao conectar na Bitget"); return
 
         self.warmup(df)
+        log.info(f"  ✅ Pronto para receber candles ao vivo da Bitget")
         self._running = True
         tf = int(TIMEFRAME.replace('m','').replace('h','')) * \
              (60 if 'h' in TIMEFRAME else 1)
@@ -676,24 +704,30 @@ class LiveTrader:
                 time.sleep(2)
                 c = self._candle()
                 if not c:
+                    log.warning("  ⚠️ _candle() retornou None — aguardando próximo ciclo")
                     continue
                 ts = str(c['timestamp'])
                 if ts == self._last_candle_ts:
-                    log.info(f"  ⏭️ Candle duplicado: {ts}")
+                    log.info(f"  ⏭️ Candle duplicado ignorado: {ts}")
                     continue
+                log.info(f"  ✅ Novo candle: {ts}")
                 self._last_candle_ts = ts
                 self._refresh_cache()
                 self.process(c)
             except Exception as e:
-                log.error(f"❌ {e}")
+                log.error(f"❌ Erro no loop principal: {e}\n{traceback.format_exc()}")
                 time.sleep(60)
         log.info("🔴 Trader encerrado")
 
     def _refresh_cache(self):
         if self._is_paper():
             self._cache_bal = self.paper.get_balance()
-            self._cache_px  = self._mark_price()
+            px = self._mark_price()
+            if px > 0:
+                self._cache_px = px          # só atualiza se API retornou preço válido
             self._cache_pos = self.paper.get_position()
+            log.info(f"  🔄 cache | bal={self._cache_bal:.2f} px={self._cache_px:.2f} "
+                     f"pos={self._cache_pos}")
         else:
             results = {}
             def _fp():
