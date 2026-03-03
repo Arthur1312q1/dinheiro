@@ -21,7 +21,7 @@ log = logging.getLogger('azlema')
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SYMBOL    = "ETH-USDT"          # Bitget symbol
-SYMBOL_ID = "ETHUSDT_UMCBL"     # Bitget contract ID
+SYMBOL_ID = "ETHUSDT"              # Bitget v2 symbol (usdt-futures)
 TIMEFRAME = "30m"
 TOTAL_CANDLES  = 300
 WARMUP_CANDLES = 300
@@ -227,20 +227,22 @@ class PaperTrader:
 # BITGET CLIENT (real trading — 95% do saldo)
 # ═══════════════════════════════════════════════════════════════════════════════
 class Bitget:
-    BASE      = "https://api.bitget.com"
-    INST      = "ETHUSDT_UMCBL"   # ETH/USDT contrato perpétuo
-    MARGIN    = "USDT"
-    PRODUCT   = "umcbl"
-    CT_VAL    = 0.001             # 1 contrato = 0.001 ETH
+    """
+    Cliente Bitget API v2 (Mix USDT Futures perpetuo).
+    """
+    BASE         = "https://api.bitget.com"
+    SYMBOL       = "ETHUSDT"
+    PRODUCT_TYPE = "usdt-futures"
+    MARGIN       = "USDT"
+    CT_VAL       = 0.001
 
-    # ── Assinatura HMAC-SHA256 ──────────────────────────────────────────────
-    def _sign(self, ts: str, method: str, path: str, body: str = "") -> str:
+    def _sign(self, ts, method, path, body=""):
         msg = ts + method.upper() + path + body
         return base64.b64encode(
             hmac.new(_sec().encode(), msg.encode(), hashlib.sha256).digest()
         ).decode()
 
-    def _headers(self, method: str, path: str, body: str = "") -> Dict:
+    def _headers(self, method, path, body=""):
         ts = str(int(time.time() * 1000))
         return {
             "ACCESS-KEY":        _key(),
@@ -251,136 +253,103 @@ class Bitget:
             "locale":            "en-US",
         }
 
-    def _get(self, path: str, params: Dict = None) -> Dict:
-        qs = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
-        r  = requests.get(self.BASE + path + qs,
-                          headers=self._headers("GET", path + qs), timeout=10)
+    def _get(self, path, params=None):
+        qs = ("?" + "&".join(f"{k}={v}" for k,v in params.items())) if params else ""
+        r  = requests.get(self.BASE+path+qs, headers=self._headers("GET",path+qs), timeout=10)
         return r.json()
 
-    def _post(self, path: str, body: Dict) -> Dict:
+    def _post(self, path, body):
         b = json.dumps(body)
-        r = requests.post(self.BASE + path,
-                          headers=self._headers("POST", path, b), data=b, timeout=10)
+        r = requests.post(self.BASE+path, headers=self._headers("POST",path,b), data=b, timeout=10)
         return r.json()
 
-    # ── Preço mark ─────────────────────────────────────────────────────────
-    def mark_price(self) -> float:
+    def mark_price(self):
         try:
-            r = self._get("/api/mix/v1/market/mark-price",
-                          {"symbol": self.INST})
-            return float(r["data"]["markPrice"])
+            r = self._get("/api/v2/mix/market/symbol-price",
+                          {"symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE})
+            return float(r["data"][0]["markPrice"])
         except:
             pass
         try:
-            r = self._get("/api/mix/v1/market/ticker",
-                          {"symbol": self.INST})
-            return float(r["data"]["last"])
+            r = self._get("/api/v2/mix/market/ticker",
+                          {"symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE})
+            return float(r["data"][0]["lastPr"])
         except:
             return 0.0
 
-    # ── Saldo disponível em USDT ────────────────────────────────────────────
-    def balance(self) -> float:
+    def balance(self):
         try:
-            r = self._get("/api/mix/v1/account/account",
-                          {"symbol": self.INST, "marginCoin": self.MARGIN})
+            r = self._get("/api/v2/mix/account/account",
+                          {"symbol": self.SYMBOL,
+                           "productType": self.PRODUCT_TYPE,
+                           "marginCoin": self.MARGIN})
             return float(r["data"].get("available", 0) or 0)
         except Exception as e:
-            log.error(f"  ❌ balance: {e}")
+            log.error(f"  Bitget balance erro: {e}")
         return 0.0
 
-    # ── Posição atual ───────────────────────────────────────────────────────
-    def position(self) -> Optional[Dict]:
+    def position(self):
         try:
-            r = self._get("/api/mix/v1/position/allPosition",
-                          {"productType": self.PRODUCT, "marginCoin": self.MARGIN})
+            r = self._get("/api/v2/mix/position/all-position",
+                          {"productType": self.PRODUCT_TYPE, "marginCoin": self.MARGIN})
             for p in r.get("data", []):
-                if p.get("symbol") == self.INST:
+                if p.get("symbol") == self.SYMBOL:
                     sz = float(p.get("total", 0))
                     if sz > 0:
-                        side = p.get("holdSide", "long")
-                        return {"side": side, "size": sz,
-                                "avg_px": float(p.get("averageOpenPrice", 0))}
+                        return {"side": p.get("holdSide","long"), "size": sz,
+                                "avg_px": float(p.get("openPriceAvg", 0))}
         except:
             pass
         return None
 
-    # ── Número de contratos para 95% do saldo ──────────────────────────────
-    def _cts(self, qty_eth: float, bal: float = 0, px: float = 0) -> int:
+    def _cts(self, qty_eth, bal=0, px=0):
         cts = max(1, int(qty_eth / self.CT_VAL))
         if bal > 0 and px > 0:
-            custo = self.CT_VAL * px
-            max_cts = max(1, int((bal * LIVE_PCT) / custo))   # 95% do saldo
-            cts = min(cts, max_cts)
+            cts = min(cts, max(1, int((bal * LIVE_PCT) / (self.CT_VAL * px))))
         return cts
 
-    # ── Enviar order ─────────────────────────────────────────────────────────
-    def _order(self, side: str, hold_side: str, sz: int) -> Dict:
+    def _order(self, side, trade_side, sz):
         body = {
-            "symbol":     self.INST,
-            "marginCoin": self.MARGIN,
-            "size":       str(sz),
-            "side":       side,
-            "orderType":  "market",
-            "tradeSide":  "open" if side in ("buy", "sell") else "close",
+            "symbol":      self.SYMBOL,
+            "productType": self.PRODUCT_TYPE,
+            "marginMode":  "crossed",
+            "marginCoin":  self.MARGIN,
+            "size":        str(sz),
+            "side":        side,
+            "tradeSide":   trade_side,
+            "orderType":   "market",
         }
-        r  = self._post("/api/mix/v1/order/placeOrder", body)
-        d0 = r.get("data", {}) or {}
+        r  = self._post("/api/v2/mix/order/place-order", body)
+        d0 = r.get("data") or {}
         if r.get("code") == "00000":
-            log.info(f"  ✅ ORDER {side} sz={sz} ordId={d0.get('orderId','?')}")
+            log.info(f"  ✅ ORDER {side}/{trade_side} sz={sz} ordId={d0.get('orderId','?')}")
         else:
-            log.error(f"  ❌ ORDER {side} sz={sz} msg={r.get('msg','')} code={r.get('code','')}")
+            log.error(f"  ❌ ORDER {side}/{trade_side} sz={sz} code={r.get('code','')} msg={r.get('msg','')}")
         return r
 
-    def _close_order(self, side: str, sz: int) -> Dict:
-        """Fecha posição existente."""
-        close_side = "sell" if side == "long" else "buy"
-        body = {
-            "symbol":     self.INST,
-            "marginCoin": self.MARGIN,
-            "size":       str(sz),
-            "side":       close_side,
-            "orderType":  "market",
-            "tradeSide":  "close",
-        }
-        r = self._post("/api/mix/v1/order/placeOrder", body)
-        d0 = r.get("data", {}) or {}
+    def open_long(self, qty, bal=0, px=0):
+        sz = self._cts(qty, bal, px)
+        r  = self._order("buy", "open", sz)
         if r.get("code") == "00000":
-            log.info(f"  ✅ CLOSE {side} sz={sz}")
-        else:
-            log.error(f"  ❌ CLOSE {side} msg={r.get('msg','')} code={r.get('code','')}")
-        return r
-
-    def open_long(self, qty: float, bal: float = 0, px: float = 0):
-        sz = self._cts(qty, bal, px)
-        r  = self._order("buy", "long", sz)
-        ok = r.get("code") == "00000"
-        if ok:
-            ts = datetime.utcnow().isoformat()
             oid = (r.get("data") or {}).get("orderId", "?")
-            history_mgr.add_trade({
-                "id": str(oid), "action": "BUY", "status": "open",
-                "entry_time": ts, "entry_price": px,
-                "qty": qty, "balance": bal, "mode": "live",
-            })
+            history_mgr.add_trade({"id": str(oid), "action": "BUY", "status": "open",
+                "entry_time": datetime.utcnow().isoformat(), "entry_price": px,
+                "qty": qty, "balance": bal, "mode": "live"})
         return r, qty
 
-    def open_short(self, qty: float, bal: float = 0, px: float = 0):
+    def open_short(self, qty, bal=0, px=0):
         sz = self._cts(qty, bal, px)
-        r  = self._order("sell", "short", sz)
-        ok = r.get("code") == "00000"
-        if ok:
-            ts = datetime.utcnow().isoformat()
+        r  = self._order("sell", "open", sz)
+        if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
-            history_mgr.add_trade({
-                "id": str(oid), "action": "SELL", "status": "open",
-                "entry_time": ts, "entry_price": px,
-                "qty": qty, "balance": bal, "mode": "live",
-            })
+            history_mgr.add_trade({"id": str(oid), "action": "SELL", "status": "open",
+                "entry_time": datetime.utcnow().isoformat(), "entry_price": px,
+                "qty": qty, "balance": bal, "mode": "live"})
         return r, qty
 
-    def close_long(self, qty: float, exit_px: float = 0, reason: str = "EXIT"):
+    def close_long(self, qty, exit_px=0, reason="EXIT"):
         sz = self._cts(qty)
-        r  = self._close_order("long", sz)
+        r  = self._order("sell", "close", sz)
         if r.get("code") == "00000":
             ts = datetime.utcnow().isoformat()
             for t in reversed(history_mgr.get_all_trades()):
@@ -390,9 +359,9 @@ class Bitget:
                     break
         return r
 
-    def close_short(self, qty: float, exit_px: float = 0, reason: str = "EXIT"):
+    def close_short(self, qty, exit_px=0, reason="EXIT"):
         sz = self._cts(qty)
-        r  = self._close_order("short", sz)
+        r  = self._order("buy", "close", sz)
         if r.get("code") == "00000":
             ts = datetime.utcnow().isoformat()
             for t in reversed(history_mgr.get_all_trades()):
@@ -402,41 +371,26 @@ class Bitget:
                     break
         return r
 
-    def ct_val(self) -> float:
+    def ct_val(self):
         return self.CT_VAL
 
-    # ── Setup inicial ───────────────────────────────────────────────────────
-    def setup(self) -> bool:
-        try:
-            # Define alavancagem 1x
-            r = self._post("/api/mix/v1/account/setLeverage", {
-                "symbol":     self.INST,
-                "marginCoin": self.MARGIN,
-                "leverage":   "1",
-                "holdSide":   "long",
-            })
-            r2 = self._post("/api/mix/v1/account/setLeverage", {
-                "symbol":     self.INST,
-                "marginCoin": self.MARGIN,
-                "leverage":   "1",
-                "holdSide":   "short",
-            })
-            if r.get("code") == "00000":
-                log.info("  ✅ Alavancagem 1x configurada")
-            else:
-                log.warning(f"  ⚠️ setLeverage: {r.get('msg')}")
-        except Exception as e:
-            log.warning(f"  ⚠️ setup leverage: {e}")
-
+    def setup(self):
+        for hold in ("long", "short"):
+            try:
+                r = self._post("/api/v2/mix/account/set-leverage", {
+                    "symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE,
+                    "marginCoin": self.MARGIN, "leverage": "1", "holdSide": hold})
+                if r.get("code") == "00000":
+                    log.info(f"  Alavancagem 1x ({hold})")
+                else:
+                    log.warning(f"  setLeverage {hold}: {r.get('msg','')}")
+            except Exception as e:
+                log.warning(f"  setup leverage {hold}: {e}")
         bal = self.balance()
         px  = self.mark_price()
-        log.info(f"  ✅ Bitget conectada | Saldo: {bal:.4f} USDT | Preço: {px:.2f}")
+        log.info(f"  Bitget v2 | Saldo: {bal:.4f} USDT | Preco: {px:.2f}")
         return bal > 0 or px > 0
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LIVE TRADER
-# ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
     def __init__(self):
         self._paper_mode = get_paper_mode()
@@ -464,10 +418,11 @@ class LiveTrader:
     def _mark_price(self) -> float:
         try:
             r = requests.get(
-                "https://api.bitget.com/api/mix/v1/market/mark-price",
-                params={"symbol": "ETHUSDT_UMCBL"}, timeout=10
+                "https://api.bitget.com/api/v2/mix/market/symbol-price",
+                params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
+                timeout=10
             ).json()
-            return float(r["data"]["markPrice"])
+            return float(r["data"][0]["markPrice"])
         except:
             return self._cache_px
 
@@ -645,20 +600,25 @@ class LiveTrader:
         time.sleep(max(1, secs))
 
     def _candle(self) -> Optional[Dict]:
-        # Bitget Mix v1 granularity: "1min","5min","15min","30min","60min","4H","1D"
-        TF = {"1m":"1min","3m":"3min","5m":"5min","15m":"15min","30m":"30min",
-              "1h":"60min","2h":"120min","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
-        tf = TF.get(TIMEFRAME, "30min")
+        # Bitget v2 granularity values
+        TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+              "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
+        tf = TF.get(TIMEFRAME, "30m")
         try:
             r = requests.get(
-                "https://api.bitget.com/api/mix/v1/market/candles",
-                params={"symbol": "ETHUSDT_UMCBL", "granularity": tf, "limit": "3"},
+                "https://api.bitget.com/api/v2/mix/market/candles",
+                params={
+                    "symbol":      "ETHUSDT",
+                    "productType": "usdt-futures",
+                    "granularity": tf,
+                    "limit":       "3",
+                },
                 timeout=10,
             ).json()
-            data = r.get("data", [])
             if r.get("code") != "00000":
                 log.error(f"  ❌ Bitget candles API: code={r.get('code')} msg={r.get('msg')}")
                 return None
+            data = r.get("data", [])
             if len(data) < 2:
                 log.warning(f"  ⚠️ Bitget retornou menos de 2 candles (len={len(data)})")
                 return None
