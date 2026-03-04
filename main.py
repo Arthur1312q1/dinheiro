@@ -501,7 +501,7 @@ class LiveTrader:
         close_px = float(candle['close'])
 
         # NÃO sobrescreve _cache_px com preço histórico do candle fechado.
-        # _cache_px foi atualizado por _refresh_cache() com o mark price atual.
+        # _cache_px é atualizado por _refresh_cache() com o mark price atual.
         # Usa close_px apenas como fallback se o cache ainda está vazio.
         if self._cache_px <= 0 and close_px > 0:
             self._cache_px = close_px
@@ -511,8 +511,11 @@ class LiveTrader:
                  f"pos={self._cache_pos} | "
                  f"paper={'SIM' if self._is_paper() else 'NAO'}")
 
-        actions  = self.strategy.next(candle) or []
-        real     = self._cache_pos
+        actions = self.strategy.next(candle) or []
+        # 'real' rastreia a posição atual ao longo do loop.
+        # Para paper: autoritativa é self.paper.get_position() (sempre fresco).
+        # Para live:  autoritativa é real (atualizado via API e localmente).
+        real = self._cache_pos
 
         log.info(f"  📊 Estratégia: {len(actions)} sinal(is): "
                  f"{[a.get('action','?') for a in actions]}")
@@ -520,103 +523,163 @@ class LiveTrader:
         for act in actions:
             kind = act.get('action', '')
 
+            # ── EXIT LONG ────────────────────────────────────────────────────
             if kind == 'EXIT_LONG':
                 reason = act.get('exit_reason', 'EXIT')
+
                 if self._is_paper():
-                    pos = self.paper.get_position()
+                    pos = self.paper.get_position()          # sempre fresco
                     if pos and pos['side'] == 'long':
-                        _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                        # Usa preço exato do stop/trail da estratégia (simulação realista)
+                        _exit_px = act.get('price') or (self._cache_px if self._cache_px > 0 else close_px)
                         self.paper.close_long(pos['size'], _exit_px, reason)
                         self._add_log("EXIT_LONG", _exit_px, pos['size'], reason)
                         real = None
-                elif real and real['side'] == 'long':
-                    qty = real['size'] * self.bitget.ct_val()
-                    _exit_px = self._cache_px if self._cache_px > 0 else close_px
-                    self.bitget.close_long(qty, _exit_px, reason)
-                    self._add_log("EXIT_LONG", _exit_px, qty, reason)
-                    real = None
+                        self._cache_pos = None
+                    else:
+                        log.warning(f"  ⚠️ EXIT_LONG ignorado — paper pos={pos}")
 
+                else:  # LIVE
+                    # Se cache estiver desatualizado, re-consulta Bitget antes de desistir
+                    if not (real and real['side'] == 'long'):
+                        log.info("  🔄 EXIT_LONG: real stale/None — re-query Bitget...")
+                        real = self.bitget.position()
+                        self._cache_pos = real
+
+                    if real and real['side'] == 'long':
+                        # real['size'] vem da API = contratos
+                        qty = real['size'] * self.bitget.ct_val()
+                        _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.bitget.close_long(qty, _exit_px, reason)
+                        self._add_log("EXIT_LONG", _exit_px, qty, reason)
+                        real = None
+                        self._cache_pos = None
+                    else:
+                        log.warning(f"  ⚠️ EXIT_LONG ignorado — live pos={real}")
+
+            # ── EXIT SHORT ───────────────────────────────────────────────────
             elif kind == 'EXIT_SHORT':
                 reason = act.get('exit_reason', 'EXIT')
+
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
-                        _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                        _exit_px = act.get('price') or (self._cache_px if self._cache_px > 0 else close_px)
                         self.paper.close_short(pos['size'], _exit_px, reason)
                         self._add_log("EXIT_SHORT", _exit_px, pos['size'], reason)
                         real = None
-                elif real and real['side'] == 'short':
-                    qty = real['size'] * self.bitget.ct_val()
-                    _exit_px = self._cache_px if self._cache_px > 0 else close_px
-                    self.bitget.close_short(qty, _exit_px, reason)
-                    self._add_log("EXIT_SHORT", _exit_px, qty, reason)
-                    real = None
+                        self._cache_pos = None
+                    else:
+                        log.warning(f"  ⚠️ EXIT_SHORT ignorado — paper pos={pos}")
 
+                else:  # LIVE
+                    if not (real and real['side'] == 'short'):
+                        log.info("  🔄 EXIT_SHORT: real stale/None — re-query Bitget...")
+                        real = self.bitget.position()
+                        self._cache_pos = real
+
+                    if real and real['side'] == 'short':
+                        qty = real['size'] * self.bitget.ct_val()
+                        _exit_px = self._cache_px if self._cache_px > 0 else close_px
+                        self.bitget.close_short(qty, _exit_px, reason)
+                        self._add_log("EXIT_SHORT", _exit_px, qty, reason)
+                        real = None
+                        self._cache_pos = None
+                    else:
+                        log.warning(f"  ⚠️ EXIT_SHORT ignorado — live pos={real}")
+
+            # ── ENTER LONG (BUY) ─────────────────────────────────────────────
             elif kind == 'BUY':
                 if self._last_order_candle == str(ts):
+                    log.info("  ⏭️ BUY ignorado — já operou neste candle")
                     continue
                 qty = self._qty()
                 if qty <= 0:
+                    log.warning("  ⚠️ BUY ignorado — qty=0 (saldo ou preço inválido)")
                     continue
+
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
-                        _rev_px = self._cache_px if self._cache_px > 0 else close_px
+                        # Fecha short antes de abrir long (reversão)
+                        _rev_px = act.get('price') or (self._cache_px if self._cache_px > 0 else close_px)
                         self.paper.close_short(pos['size'], _rev_px, "REVERSAL")
+                        real = None
+                        self._cache_pos = None
                     px = self._cache_px if self._cache_px > 0 else close_px
                     log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
-                    r, qty = self.paper.open_long(qty, self._cache_bal, px)
+                    r, qty_filled = self.paper.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "0":
                         self._last_order_candle = str(ts)
-                        self._add_log("ENTER_LONG", px, qty)
-                        real = {'side': 'long', 'size': qty, 'avg_px': px}
-                else:
+                        self._add_log("ENTER_LONG", px, qty_filled)
+                        real = {'side': 'long', 'size': qty_filled, 'avg_px': px}
+                        self._cache_pos = real
+
+                else:  # LIVE
                     if real and real['side'] == 'short':
+                        # Fecha short via reversão
                         _rev_px = self._cache_px if self._cache_px > 0 else close_px
                         self.bitget.close_short(real['size'] * self.bitget.ct_val(), _rev_px, "REVERSAL")
                         real = None
+                        self._cache_pos = None
                     bal = self._cache_bal
                     px  = self._cache_px if self._cache_px > 0 else close_px
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f} (95% saldo)")
-                    r, qty = self.bitget.open_long(qty, bal, px)
+                    r, qty_filled = self.bitget.open_long(qty, bal, px)
                     if r.get("code") == "00000":
                         self._last_order_candle = str(ts)
-                        self._add_log("ENTER_LONG", px, qty)
-                        real = {'side': 'long', 'size': qty, 'avg_px': px}
+                        self._add_log("ENTER_LONG", px, qty_filled)
+                        # Converte ETH → contratos para manter consistência com API Bitget
+                        cts = max(1, int(qty_filled / self.bitget.ct_val()))
+                        real = {'side': 'long', 'size': cts, 'avg_px': px}
+                        self._cache_pos = real
 
+            # ── ENTER SHORT (SELL) ───────────────────────────────────────────
             elif kind == 'SELL':
                 if self._last_order_candle == str(ts):
+                    log.info("  ⏭️ SELL ignorado — já operou neste candle")
                     continue
                 qty = self._qty()
                 if qty <= 0:
+                    log.warning("  ⚠️ SELL ignorado — qty=0 (saldo ou preço inválido)")
                     continue
+
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
-                        _rev_px = self._cache_px if self._cache_px > 0 else close_px
+                        # Fecha long antes de abrir short (reversão)
+                        _rev_px = act.get('price') or (self._cache_px if self._cache_px > 0 else close_px)
                         self.paper.close_long(pos['size'], _rev_px, "REVERSAL")
+                        real = None
+                        self._cache_pos = None
                     px = self._cache_px if self._cache_px > 0 else close_px
                     log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
-                    r, qty = self.paper.open_short(qty, self._cache_bal, px)
+                    r, qty_filled = self.paper.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "0":
                         self._last_order_candle = str(ts)
-                        self._add_log("ENTER_SHORT", px, qty)
-                        real = {'side': 'short', 'size': qty, 'avg_px': px}
-                else:
+                        self._add_log("ENTER_SHORT", px, qty_filled)
+                        real = {'side': 'short', 'size': qty_filled, 'avg_px': px}
+                        self._cache_pos = real
+
+                else:  # LIVE
                     if real and real['side'] == 'long':
+                        # Fecha long via reversão
                         _rev_px = self._cache_px if self._cache_px > 0 else close_px
                         self.bitget.close_long(real['size'] * self.bitget.ct_val(), _rev_px, "REVERSAL")
                         real = None
+                        self._cache_pos = None
                     bal = self._cache_bal
                     px  = self._cache_px if self._cache_px > 0 else close_px
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f} (95% saldo)")
-                    r, qty = self.bitget.open_short(qty, bal, px)
+                    r, qty_filled = self.bitget.open_short(qty, bal, px)
                     if r.get("code") == "00000":
                         self._last_order_candle = str(ts)
-                        self._add_log("ENTER_SHORT", px, qty)
-                        real = {'side': 'short', 'size': qty, 'avg_px': px}
+                        self._add_log("ENTER_SHORT", px, qty_filled)
+                        cts = max(1, int(qty_filled / self.bitget.ct_val()))
+                        real = {'side': 'short', 'size': cts, 'avg_px': px}
+                        self._cache_pos = real
 
-        # Persiste cache de posição para próximo processo
+        # Persiste cache de posição final para o próximo candle
         self._cache_pos = real
 
     def _wait(self, tf: int = 30):
