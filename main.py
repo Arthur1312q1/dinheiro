@@ -44,7 +44,6 @@ STRATEGY_CONFIG = {
 }
 
 # ── Modo de operação (mutável via dashboard) ──────────────────────────────────
-# True = Paper Trading (saldo falso) | False = Live Trading (Bitget real, 95% saldo)
 _PAPER_TRADING   = os.environ.get("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 PAPER_BALANCE    = float(os.environ.get("PAPER_BALANCE", "1000.0"))
 LIVE_PCT         = 0.95         # Usa 95% do saldo real em live
@@ -212,8 +211,7 @@ class PaperTrader:
         entry_px = self.position["avg_px"]
         trade_id = self.position["id"]
         pnl      = (exit_px - entry_px) * qty
-        self.balance += pnl
-        self.position = None          # limpa PRIMEIRO — evita deadlock se I/O falhar
+        self.position = None
         ts = brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
@@ -228,8 +226,7 @@ class PaperTrader:
         entry_px = self.position["avg_px"]
         trade_id = self.position["id"]
         pnl      = (entry_px - exit_px) * qty
-        self.balance += pnl
-        self.position = None          # limpa PRIMEIRO
+        self.position = None
         ts = brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
@@ -429,7 +426,6 @@ class LiveTrader:
         self._cache_bal: float = PAPER_BALANCE if self._paper_mode else 0.0
         self._cache_px:  float = 0.0
         self._last_candle_ts:    str = ""
-        # _last_order_candle removido: verificação por side evita duplicatas
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -444,27 +440,6 @@ class LiveTrader:
             return float(r["data"][0]["markPrice"])
         except:
             return self._cache_px
-
-    def _qty(self) -> float:
-        bal = self._cache_bal
-        px  = self._cache_px
-        ct  = 0.001
-        if bal <= 0:
-            log.warning(f"  ⚠️ _qty: saldo inválido bal={bal}")
-            return 0.0
-        if px <= 0:
-            px = self._mark_price()
-            if px <= 0:
-                log.warning(f"  ⚠️ _qty: preço inválido px={px} — sem trade")
-                return 0.0
-            self._cache_px = px
-        pct       = 1.0 if self._is_paper() else LIVE_PCT
-        usdt_disp = bal * pct * 0.90
-        cts       = max(1, int(usdt_disp / (ct * px)))
-        qty       = cts * ct
-        log.info(f"  💰 qty={qty:.6f} ETH ({cts} cts) | bal={bal:.2f} | px={px:.2f} | "
-                 f"{'PAPER' if self._is_paper() else 'LIVE 95%'}")
-        return qty
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
@@ -489,13 +464,10 @@ class LiveTrader:
             })
         self._pnl_baseline = self.strategy.net_profit
         self._warming      = False
-        # Inicializa _cache_px com o último close do warmup como fallback seguro
         last_close = float(df['close'].iloc[-1])
         if last_close > 0:
             self._cache_px = last_close
         self._refresh_cache()
-        # NÃO seta _last_candle_ts aqui — o timestamp OKX difere do Bitget
-        # e causaria o primeiro candle real ser descartado como duplicado
         self._last_candle_ts = ""
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} | "
                  f"EC={self.strategy.EC:.2f} | px_cache={self._cache_px:.2f}")
@@ -508,11 +480,9 @@ class LiveTrader:
         ts       = candle.get('timestamp', brazil_now())
         close_px = float(candle['close'])
 
-        # Atualiza _cache_px apenas como fallback (evita sobrescrever mark price)
         if self._cache_px <= 0 and close_px > 0:
             self._cache_px = close_px
 
-        # Posição atual antes de processar a barra
         cur_paper = self.paper.get_position() if self._is_paper() else None
 
         log.info(
@@ -528,14 +498,21 @@ class LiveTrader:
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
         for act in actions:
-            kind   = act.get('action', '')
-            act_px = float(act.get('price') or 0)
+            kind = act.get('action', '')
+
+            # ── PREÇO E QTY VÊM SEMPRE DA ESTRATÉGIA ─────────────────────
+            # Garante paridade EXATA com o backtest.
+            # A estratégia já calculou:
+            #   - price: open da barra (entradas) ou stop_price (saídas)
+            #   - qty:   via _lots() — mesma fórmula do backtest
+            act_px  = float(act.get('price') or 0)
+            act_qty = float(act.get('qty')   or 0)
 
             # ── EXIT LONG ─────────────────────────────────────────────────
             if kind == 'EXIT_LONG':
                 reason = act.get('exit_reason', 'EXIT')
-                # Para paper: usa preço exato da estratégia (stop/trail realista)
-                px = act_px if act_px > 0 else (self._cache_px if self._cache_px > 0 else close_px)
+                # Preço exato da estratégia (stop/trail — igual ao backtest)
+                px = act_px if act_px > 0 else close_px
 
                 if self._is_paper():
                     pos = self.paper.get_position()
@@ -545,10 +522,8 @@ class LiveTrader:
                         self._cache_pos = None
                         log.info(f"  🔴 [PAPER] EXIT LONG @ {px:.2f} | {reason}")
                     else:
-                        # Estratégia já está flat — não é erro, só log
                         log.info(f"  ℹ️ EXIT_LONG: paper pos={pos} (strategy já flat, OK)")
                 else:
-                    # LIVE: tenta com cache; re-query se stale
                     pos = self._cache_pos
                     if not (pos and pos['side'] == 'long'):
                         log.info("  🔄 EXIT_LONG: cache stale — re-query Bitget...")
@@ -556,18 +531,17 @@ class LiveTrader:
                         self._cache_pos = pos
                     if pos and pos['side'] == 'long':
                         qty_close = pos['size'] * self.bitget.ct_val()
-                        px_live   = self._cache_px if self._cache_px > 0 else close_px
-                        self.bitget.close_long(qty_close, px_live, reason)
-                        self._add_log("EXIT_LONG", px_live, qty_close, reason)
+                        self.bitget.close_long(qty_close, px, reason)
+                        self._add_log("EXIT_LONG", px, qty_close, reason)
                         self._cache_pos = None
-                        log.info(f"  🔴 LIVE EXIT LONG @ {px_live:.2f} | {reason}")
+                        log.info(f"  🔴 LIVE EXIT LONG @ {px:.2f} | {reason}")
                     else:
                         log.info(f"  ℹ️ EXIT_LONG: Bitget pos={pos} (strategy já flat, OK)")
 
             # ── EXIT SHORT ────────────────────────────────────────────────
             elif kind == 'EXIT_SHORT':
                 reason = act.get('exit_reason', 'EXIT')
-                px = act_px if act_px > 0 else (self._cache_px if self._cache_px > 0 else close_px)
+                px = act_px if act_px > 0 else close_px
 
                 if self._is_paper():
                     pos = self.paper.get_position()
@@ -586,56 +560,49 @@ class LiveTrader:
                         self._cache_pos = pos
                     if pos and pos['side'] == 'short':
                         qty_close = pos['size'] * self.bitget.ct_val()
-                        px_live   = self._cache_px if self._cache_px > 0 else close_px
-                        self.bitget.close_short(qty_close, px_live, reason)
-                        self._add_log("EXIT_SHORT", px_live, qty_close, reason)
+                        self.bitget.close_short(qty_close, px, reason)
+                        self._add_log("EXIT_SHORT", px, qty_close, reason)
                         self._cache_pos = None
-                        log.info(f"  🟢 LIVE EXIT SHORT @ {px_live:.2f} | {reason}")
+                        log.info(f"  🟢 LIVE EXIT SHORT @ {px:.2f} | {reason}")
                     else:
                         log.info(f"  ℹ️ EXIT_SHORT: Bitget pos={pos} (strategy já flat, OK)")
 
             # ── ENTER LONG (BUY) ──────────────────────────────────────────
             elif kind == 'BUY':
-                # Checa posição atual para evitar duplicata
                 cur = self.paper.get_position() if self._is_paper() else self._cache_pos
                 if cur and cur['side'] == 'long':
                     log.info("  ⏭️ BUY ignorado — já tem long aberto")
                     continue
 
-                qty = self._qty()
+                # Preço e qty EXATOS da estratégia — mesmos valores do backtest
+                px  = act_px  if act_px  > 0 else close_px
+                qty = act_qty if act_qty > 0 else 0.0
+
                 if qty <= 0:
-                    log.warning("  ⚠️ BUY ignorado — qty=0 (saldo/preço inválido)")
-                    # Estratégia abriu internamente mas não conseguimos executar
-                    # → reseta estado interno para evitar deadlock
-                    self.strategy._reset_pos()
+                    log.warning("  ⚠️ BUY ignorado — qty=0 vindo da estratégia")
                     continue
 
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
-                        # Fecha short existente antes de abrir long (reversão)
-                        px_rev = act_px if act_px > 0 else (self._cache_px if self._cache_px > 0 else close_px)
-                        self.paper.close_short(pos['size'], px_rev, "REVERSAL")
+                        # Reversão: fecha short com o mesmo preço que a estratégia usou
+                        self.paper.close_short(pos['size'], px, "REVERSAL")
                         self._cache_pos = None
-                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px_rev:.2f}")
-                    px = self._cache_px if self._cache_px > 0 else close_px
+                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
                     log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.paper.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "0":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                     else:
-                        log.error(f"  ❌ paper.open_long falhou — resetando strategy")
-                        self.strategy._reset_pos()
+                        log.error(f"  ❌ paper.open_long falhou")
 
                 else:  # LIVE
                     pos = self._cache_pos
                     if pos and pos['side'] == 'short':
-                        px_rev = self._cache_px if self._cache_px > 0 else close_px
-                        self.bitget.close_short(pos['size'] * self.bitget.ct_val(), px_rev, "REVERSAL")
+                        self.bitget.close_short(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
                         self._cache_pos = None
-                        log.info(f"  ↩️ LIVE REVERSAL: fechou SHORT @ {px_rev:.2f}")
-                    px = self._cache_px if self._cache_px > 0 else close_px
+                        log.info(f"  ↩️ LIVE REVERSAL: fechou SHORT @ {px:.2f}")
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
@@ -643,8 +610,7 @@ class LiveTrader:
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': cts, 'avg_px': px}
                     else:
-                        log.error(f"  ❌ bitget.open_long falhou — resetando strategy")
-                        self.strategy._reset_pos()
+                        log.error(f"  ❌ bitget.open_long falhou")
 
             # ── ENTER SHORT (SELL) ────────────────────────────────────────
             elif kind == 'SELL':
@@ -653,37 +619,34 @@ class LiveTrader:
                     log.info("  ⏭️ SELL ignorado — já tem short aberto")
                     continue
 
-                qty = self._qty()
+                # Preço e qty EXATOS da estratégia — mesmos valores do backtest
+                px  = act_px  if act_px  > 0 else close_px
+                qty = act_qty if act_qty > 0 else 0.0
+
                 if qty <= 0:
-                    log.warning("  ⚠️ SELL ignorado — qty=0 (saldo/preço inválido)")
-                    self.strategy._reset_pos()
+                    log.warning("  ⚠️ SELL ignorado — qty=0 vindo da estratégia")
                     continue
 
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
-                        px_rev = act_px if act_px > 0 else (self._cache_px if self._cache_px > 0 else close_px)
-                        self.paper.close_long(pos['size'], px_rev, "REVERSAL")
+                        self.paper.close_long(pos['size'], px, "REVERSAL")
                         self._cache_pos = None
-                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px_rev:.2f}")
-                    px = self._cache_px if self._cache_px > 0 else close_px
+                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
                     log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.paper.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "0":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                     else:
-                        log.error(f"  ❌ paper.open_short falhou — resetando strategy")
-                        self.strategy._reset_pos()
+                        log.error(f"  ❌ paper.open_short falhou")
 
                 else:  # LIVE
                     pos = self._cache_pos
                     if pos and pos['side'] == 'long':
-                        px_rev = self._cache_px if self._cache_px > 0 else close_px
-                        self.bitget.close_long(pos['size'] * self.bitget.ct_val(), px_rev, "REVERSAL")
+                        self.bitget.close_long(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
                         self._cache_pos = None
-                        log.info(f"  ↩️ LIVE REVERSAL: fechou LONG @ {px_rev:.2f}")
-                    px = self._cache_px if self._cache_px > 0 else close_px
+                        log.info(f"  ↩️ LIVE REVERSAL: fechou LONG @ {px:.2f}")
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
@@ -691,12 +654,14 @@ class LiveTrader:
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': cts, 'avg_px': px}
                     else:
-                        log.error(f"  ❌ bitget.open_short falhou — resetando strategy")
-                        self.strategy._reset_pos()
+                        log.error(f"  ❌ bitget.open_short falhou")
 
-        # Sincroniza _cache_pos com o estado real do paper ao fim de cada barra
+        # Sincroniza saldo e posição com o estado EXATO da estratégia
+        # (mesma fonte de verdade que o backtest usa)
         if self._is_paper():
-            self._cache_pos = self.paper.get_position()
+            self.paper.balance = self.strategy.balance
+            self._cache_bal    = self.strategy.balance
+            self._cache_pos    = self.paper.get_position()
 
     def _wait(self, tf: int = 30):
         """Aguarda até o fechamento exato do próximo candle (precisão de ms)."""
@@ -704,14 +669,12 @@ class LiveTrader:
         tf_secs = tf * 60
         elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
         secs    = tf_secs - elapsed
-        # < 1s do fechamento → espera o próximo ciclo completo
         if secs < 1:
             secs += tf_secs
         log.info(f"⏰ Aguardando {secs:.1f}s até próximo close ({tf}m)...")
         time.sleep(secs)
 
     def _candle(self) -> Optional[Dict]:
-        # Bitget v2 granularity values
         TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
               "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
         tf = TF.get(TIMEFRAME, "30m")
@@ -733,7 +696,6 @@ class LiveTrader:
             if len(data) < 2:
                 log.warning(f"  ⚠️ Bitget retornou menos de 2 candles (len={len(data)})")
                 return None
-            # data[0] = barra atual (aberta), data[1] = última barra fechada
             c = data[1]
             candle = {
                 'open':      float(c[1]),
@@ -773,8 +735,6 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # Retry rápido sem sleep fixo — candle disponível quase imediato
-                # quando o servidor está na mesma região que a Bitget API
                 c = None
                 for _attempt in range(10):
                     raw = self._candle()
@@ -782,7 +742,6 @@ class LiveTrader:
                         time.sleep(0.2)
                         continue
                     if str(raw['timestamp']) == self._last_candle_ts:
-                        # Candle ainda não fechou na API — tenta de novo em 200ms
                         if _attempt < 9:
                             log.info(f"  ⏳ Aguardando novo candle na API (tentativa {_attempt+1}/10)...")
                             time.sleep(0.2)
@@ -807,10 +766,11 @@ class LiveTrader:
 
     def _refresh_cache(self):
         if self._is_paper():
-            self._cache_bal = self.paper.get_balance()
+            # Para paper: saldo vem da estratégia (fonte de verdade), preço do mercado
             px = self._mark_price()
             if px > 0:
-                self._cache_px = px          # só atualiza se API retornou preço válido
+                self._cache_px = px
+            self._cache_bal = self.strategy.balance
             self._cache_pos = self.paper.get_position()
             log.info(f"  🔄 cache | bal={self._cache_bal:.2f} px={self._cache_px:.2f} "
                      f"pos={self._cache_pos}")
@@ -953,7 +913,7 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
      color:var(--muted);border:none;background:transparent;transition:.2s}
 .tab.active{background:var(--bg2);color:var(--text);border:1px solid var(--border)}
 
-/* MODE TOGGLE — componente principal */
+/* MODE TOGGLE */
 .mode-toggle-wrap{display:flex;align-items:center;gap:0;border-radius:8px;overflow:hidden;
   border:1px solid var(--border);background:var(--bg3);padding:3px;gap:3px}
 .mode-btn{padding:8px 20px;border:none;border-radius:6px;font-size:.78rem;font-weight:700;
@@ -1080,7 +1040,6 @@ tr:hover td{background:rgba(255,255,255,.02)}
     <span class="logo">⚡ AZLEMA</span>
     <span class="mono" style="font-size:.7rem;color:var(--muted)">ETH-USDT · 30m · Bitget</span>
 
-    <!-- TOGGLE PAPER / LIVE -->
     <div class="mode-toggle-wrap" title="Selecionar modo de operação">
       <button class="mode-btn paper-btn" id="btnPaper" onclick="setMode('paper')">
         📄 PAPER
@@ -1167,7 +1126,6 @@ tr:hover td{background:rgba(255,255,255,.02)}
 
     <!-- ═══ HISTORY PANEL ═══ -->
     <div class="panel" id="panel-history">
-      <!-- Banner: sessão atual -->
       <div id="hist-session-banner" style="
         display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
         background:var(--bg2);border:1px solid var(--border);border-radius:8px;
@@ -1180,15 +1138,13 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem" onclick="loadHistory()">↺ Atualizar</button>
           <button class="btn" style="padding:7px 16px;font-size:.74rem;background:rgba(0,212,255,.1);color:var(--accent);border:1px solid rgba(0,212,255,.3)"
-            onclick="newPaperSession()"
-            title="Limpa os trades desta sessão para começar uma nova — não afeta o histórico de Backtest">
+            onclick="newPaperSession()">
             🆕 Nova Sessão
           </button>
           <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem;color:var(--red);border-color:rgba(255,77,109,.3)"
             onclick="if(confirm('Limpar TODO o histórico de Paper/Live?'))clearHistory()">🗑 Limpar tudo</button>
         </div>
       </div>
-      <!-- Nota de separação -->
       <div style="font-size:.7rem;color:var(--muted);margin-bottom:16px;font-family:'IBM Plex Mono',monospace;
         background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);border-radius:6px;padding:10px 14px">
         ℹ️ Esta aba mostra apenas trades <strong style="color:var(--text)">Paper / Live</strong>.
@@ -1229,27 +1185,25 @@ tr:hover td{background:rgba(255,255,255,.02)}
         </div>
         <div class="form-group"><label>Candles</label><input id="bt-lim" type="number" value="500" min="100" max="5000"></div>
         <div class="form-group"><label>Capital Inicial</label><input id="bt-cap" type="number" value="1000" min="100"></div>
-        <div class="form-group" title="Taxa cobrada ao abrir posição (% do valor nocional). Bitget taker: 0.06%">
+        <div class="form-group">
           <label>Taxa Abertura %</label>
           <input id="bt-ofee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px">
         </div>
-        <div class="form-group" title="Taxa cobrada ao fechar posição (% do valor nocional). Bitget taker: 0.06%">
+        <div class="form-group">
           <label>Taxa Fechamento %</label>
           <input id="bt-cfee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px">
         </div>
         <div style="display:flex;flex-direction:column;gap:5px;justify-content:flex-end">
           <button class="btn btn-accent" id="btnBT" onclick="runBacktest()">▶ Executar</button>
           <button class="btn btn-sec" style="font-size:.72rem;padding:6px 12px"
-            onclick="document.getElementById('bt-ofee').value='0';document.getElementById('bt-cfee').value='0'"
-            title="Remover taxas para ver resultado sem custos">Sem taxas</button>
+            onclick="document.getElementById('bt-ofee').value='0';document.getElementById('bt-cfee').value='0'">Sem taxas</button>
         </div>
       </div>
       <div style="font-size:.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;
         background:rgba(255,217,74,.04);border:1px solid rgba(255,217,74,.12);border-radius:5px;
         padding:8px 14px;margin-bottom:18px">
         💡 <strong style="color:var(--yellow)">Bitget Futures (taker):</strong> 0.06% abertura + 0.06% fechamento &nbsp;|&nbsp;
-        <strong style="color:var(--yellow)">Maker:</strong> 0.02% + 0.02% &nbsp;|&nbsp;
-        <strong style="color:var(--muted)">0% = sem simulação de taxas</strong>
+        <strong style="color:var(--yellow)">Maker:</strong> 0.02% + 0.02%
       </div>
       <div class="progress-bar"><div class="progress-fill" id="bt-prog" style="width:0%"></div></div>
       <div id="bt-result" style="display:none">
@@ -1284,151 +1238,91 @@ tr:hover td{background:rgba(255,255,255,.02)}
 <div class="mode-toast" id="modeToast"></div>
 
 <script>
-// ── Modo atual ────────────────────────────────────────────────────────────────
-let _currentMode = 'paper';   // 'paper' | 'live'
+let _currentMode = 'paper';
 
 function updateModeUI(mode) {
   _currentMode = mode;
   const isPaper = mode === 'paper';
-
   document.getElementById('btnPaper').classList.toggle('active', isPaper);
   document.getElementById('btnLive').classList.toggle('active', !isPaper);
-
   const ind = document.getElementById('modeIndicator');
-  if (isPaper) {
-    ind.textContent = '📄 Saldo Simulado';
-    ind.className = 'mode-indicator mi-paper';
-  } else {
-    ind.textContent = '💰 95% Saldo Real';
-    ind.className = 'mode-indicator mi-live';
-  }
-
+  if (isPaper) { ind.textContent = '📄 Saldo Simulado'; ind.className = 'mode-indicator mi-paper'; }
+  else { ind.textContent = '💰 95% Saldo Real'; ind.className = 'mode-indicator mi-live'; }
   const lv = document.getElementById('lv-mode');
-  if (lv) {
-    lv.textContent = isPaper ? 'PAPER' : 'LIVE · 95%';
-    lv.className   = 'kpi-val ' + (isPaper ? 'p' : 'live-c');
-  }
-
+  if (lv) { lv.textContent = isPaper ? 'PAPER' : 'LIVE · 95%'; lv.className = 'kpi-val ' + (isPaper ? 'p' : 'live-c'); }
   const kpiMode = document.getElementById('kpi-mode');
   if (kpiMode) kpiMode.className = 'kpi ' + (isPaper ? 'p' : 'live-kpi');
 }
 
 async function setMode(mode) {
-  // Se trader está rodando, avisa antes de trocar
   const running = document.getElementById('btnStop').disabled === false;
   if (running) {
-    if (!confirm(`O trader está rodando. Parar e trocar para ${mode === 'paper' ? 'PAPER' : 'LIVE 95%'}?`))
-      return;
+    if (!confirm(`O trader está rodando. Parar e trocar para ${mode === 'paper' ? 'PAPER' : 'LIVE 95%'}?`)) return;
     await fetch('/stop', { method: 'POST' });
     await new Promise(r => setTimeout(r, 1000));
   }
-
   const m = document.getElementById('apibar-msg');
-  m.style.display = 'inline-block'; m.className = 'abm-ok';
-  m.textContent = 'Alterando modo...';
-
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = 'Alterando modo...';
   try {
-    const d = await (await fetch('/mode', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode })
-    })).json();
-
-    if (d.error) {
-      m.className = 'abm-er'; m.textContent = d.error;
-    } else {
-      updateModeUI(mode);
-      showToast(mode);
-      m.textContent = d.message || 'OK';
-    }
-  } catch (e) {
-    m.className = 'abm-er'; m.textContent = 'Erro: ' + e;
-  }
+    const d = await (await fetch('/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })).json();
+    if (d.error) { m.className = 'abm-er'; m.textContent = d.error; }
+    else { updateModeUI(mode); showToast(mode); m.textContent = d.message || 'OK'; }
+  } catch (e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
   setTimeout(() => m.style.display = 'none', 4000);
 }
 
 function showToast(mode) {
   const t = document.getElementById('modeToast');
   t.className = 'mode-toast ' + (mode === 'paper' ? 'toast-paper' : 'toast-live');
-  t.textContent = mode === 'paper'
-    ? '📄 Modo PAPER ativado — trades simulados'
-    : '💰 Modo LIVE ativado — usando 95% do saldo real na Bitget';
+  t.textContent = mode === 'paper' ? '📄 Modo PAPER ativado — trades simulados' : '💰 Modo LIVE ativado — usando 95% do saldo real na Bitget';
   t.style.display = 'block';
   setTimeout(() => t.style.display = 'none', 4000);
 }
 
-// ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(t) {
-  document.querySelectorAll('.tab').forEach((el,i) => {
-    el.classList.toggle('active', ['live','history','backtest'][i] === t);
-  });
+  document.querySelectorAll('.tab').forEach((el,i) => { el.classList.toggle('active', ['live','history','backtest'][i] === t); });
   document.querySelectorAll('.panel').forEach(el => el.classList.remove('active'));
   document.getElementById('panel-' + t).classList.add('active');
   if (t === 'history') loadHistory();
   if (t === 'backtest') loadBtHistory();
 }
 
-// ── Live poll ─────────────────────────────────────────────────────────────────
 async function poll() {
   try {
     const d = await (await fetch('/status')).json();
-    const run  = d.status === 'running';
-    const warm = d.status === 'warming';
-
-    // Atualiza modo vindo do server
+    const run = d.status === 'running', warm = d.status === 'warming';
     updateModeUI(d.paper ? 'paper' : 'live');
-
     document.getElementById('btnStart').disabled = run || warm;
     document.getElementById('btnStop').disabled  = !(run || warm);
-
     const se = document.getElementById('lv-status');
-    if (run)        se.innerHTML = '<span class="status-dot dot-run"></span><span class="g">Rodando</span>';
-    else if (warm)  se.innerHTML = '<span class="status-dot dot-warm"></span><span class="y">Warmup...</span>';
-    else            se.innerHTML = '<span class="status-dot dot-stop"></span><span style="color:var(--muted)">Parado</span>';
-
-    if (d.bal  != null) document.getElementById('lv-bal').textContent  = d.bal.toFixed(2)  + ' USDT';
+    if (run) se.innerHTML = '<span class="status-dot dot-run"></span><span class="g">Rodando</span>';
+    else if (warm) se.innerHTML = '<span class="status-dot dot-warm"></span><span class="y">Warmup...</span>';
+    else se.innerHTML = '<span class="status-dot dot-stop"></span><span style="color:var(--muted)">Parado</span>';
+    if (d.bal  != null) document.getElementById('lv-bal').textContent  = d.bal.toFixed(2) + ' USDT';
     const pe = document.getElementById('lv-pnl');
-    if (d.pnl  != null) {
-      pe.textContent  = (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(4) + ' USDT';
-      pe.className = 'kpi-val ' + (d.pnl >= 0 ? 'g' : 'r');
-    }
+    if (d.pnl  != null) { pe.textContent = (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(4) + ' USDT'; pe.className = 'kpi-val ' + (d.pnl >= 0 ? 'g' : 'r'); }
     const pp = document.getElementById('lv-pos');
-    if (d.pos) {
-      const s = d.pos.side;
-      pp.innerHTML = `<span class="${s === 'long' ? 'g' : 'r'}">${s.toUpperCase()}</span>`;
-    } else { pp.innerHTML = '<span style="color:var(--muted)">FLAT</span>'; }
-    if (d.period != null) document.getElementById('lv-per').textContent  = d.period;
-    if (d.ec     != null) document.getElementById('lv-ec').textContent   = d.ec.toFixed(2);
-    if (d.ema    != null) document.getElementById('lv-ema').textContent  = d.ema.toFixed(2);
-
-    // Trades recentes
+    if (d.pos) { const s = d.pos.side; pp.innerHTML = `<span class="${s === 'long' ? 'g' : 'r'}">${s.toUpperCase()}</span>`; }
+    else { pp.innerHTML = '<span style="color:var(--muted)">FLAT</span>'; }
+    if (d.period != null) document.getElementById('lv-per').textContent = d.period;
+    if (d.ec     != null) document.getElementById('lv-ec').textContent  = d.ec.toFixed(2);
+    if (d.ema    != null) document.getElementById('lv-ema').textContent = d.ema.toFixed(2);
     const tb = document.getElementById('lv-trades');
     const tr = [...(d.trades || [])].reverse();
     if (tr.length) {
       tb.innerHTML = tr.map(t => {
-        const ac = t.action || '';
-        let cl = 'dir', lb = ac;
+        const ac = t.action || ''; let cl = 'dir', lb = ac;
         if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
         if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
-        return `<tr>
-          <td>${(t.time || '').split('T')[1]?.slice(0,8) || '—'}</td>
-          <td><span class="${cl}">${lb}</span></td>
-          <td>${t.price?.toFixed(2) || '—'}</td>
-          <td>${t.qty?.toFixed(6)   || '—'}</td>
-          <td style="color:var(--muted)">${t.reason || '—'}</td>
-        </tr>`;
+        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
       }).join('');
     }
-
-    // Log
     const lb = document.getElementById('lv-log');
     if (d.log && d.log.length) {
       lb.innerHTML = d.log.slice(-80).map(l => {
         let cls = '';
-        if (/✅|LONG|BUY/.test(l))    cls = 'lg';
-        else if (/❌|EXIT|SHORT/.test(l)) cls = 'lr';
-        else if (/⚠️|WARN/.test(l))   cls = 'ly';
-        else if (/AZLEMA|╔|╚/.test(l))  cls = 'la';
+        if (/✅|LONG|BUY/.test(l)) cls = 'lg'; else if (/❌|EXIT|SHORT/.test(l)) cls = 'lr';
+        else if (/⚠️|WARN/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
         return `<div class="${cls}">${l}</div>`;
       }).join('');
       lb.scrollTop = lb.scrollHeight;
@@ -1437,213 +1331,100 @@ async function poll() {
 }
 poll(); setInterval(poll, 4000);
 
-// ── Controls ──────────────────────────────────────────────────────────────────
 async function ctrl(a) {
   const m = document.getElementById('sysmsg');
-  m.style.display = 'inline-block';
-  m.className = a === 'start' ? 'msg-ok' : 'msg-er';
+  m.style.display = 'inline-block'; m.className = a === 'start' ? 'msg-ok' : 'msg-er';
   m.textContent = a === 'start' ? 'Iniciando...' : 'Parando...';
   try {
     const d = await (await fetch('/' + a, { method: 'POST' })).json();
-    m.className = d.error ? 'msg-er' : 'msg-ok';
-    m.textContent = d.message || d.error || 'OK';
+    m.className = d.error ? 'msg-er' : 'msg-ok'; m.textContent = d.message || d.error || 'OK';
   } catch { m.className = 'msg-er'; m.textContent = 'Erro de rede'; }
-  setTimeout(() => m.style.display = 'none', 5000);
-  setTimeout(poll, 1500);
+  setTimeout(() => m.style.display = 'none', 5000); setTimeout(poll, 1500);
 }
 
-// ── History ───────────────────────────────────────────────────────────────────
 async function loadHistory() {
   try {
     const d = await (await fetch('/history')).json();
     const s = d.stats || {};
-
-    // Atualiza banner de sessão
-    const isPaper    = _currentMode === 'paper';
-    const modeEl     = document.getElementById('hist-session-mode');
-    const countEl    = document.getElementById('hist-session-count');
+    const isPaper = _currentMode === 'paper';
+    const modeEl = document.getElementById('hist-session-mode');
+    const countEl = document.getElementById('hist-session-count');
     const closedCount = (d.trades||[]).filter(t => t.status === 'closed').length;
-    if (modeEl) {
-      modeEl.textContent = isPaper ? '📄 PAPER' : '💰 LIVE';
-      modeEl.className   = 'mode-indicator ' + (isPaper ? 'mi-paper' : 'mi-live');
-    }
+    if (modeEl) { modeEl.textContent = isPaper ? '📄 PAPER' : '💰 LIVE'; modeEl.className = 'mode-indicator ' + (isPaper ? 'mi-paper' : 'mi-live'); }
     if (countEl) countEl.textContent = closedCount + ' trade' + (closedCount !== 1 ? 's' : '') + ' fechado' + (closedCount !== 1 ? 's' : '');
-
     const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
-    document.getElementById('h-total').textContent  = s.total || 0;
-    const wrEl = document.getElementById('h-wr');
-    wrEl.textContent  = (s.win_rate||0).toFixed(1) + '%';
-    wrEl.className = 'kpi-val ' + (s.win_rate >= 50 ? 'g' : 'r');
-    const pnlEl = document.getElementById('h-pnl');
-    pnlEl.textContent = (s.total_pnl >= 0 ? '+' : '') + (s.total_pnl||0).toFixed(4) + ' USDT';
-    pnlEl.className = 'kpi-val ' + (s.total_pnl >= 0 ? 'g' : 'r');
-    const pfEl = document.getElementById('h-pf');
-    pfEl.textContent  = pf;
-    pfEl.className = 'kpi-val ' + (s.profit_factor > 1 ? 'g' : 'r');
-    document.getElementById('h-aw').textContent    = '+' + (s.avg_win||0).toFixed(4);
-    document.getElementById('h-al').textContent    = (s.avg_loss||0).toFixed(4);
-    document.getElementById('h-best').textContent  = '+' + (s.best_trade||0).toFixed(4);
+    document.getElementById('h-total').textContent = s.total || 0;
+    const wrEl = document.getElementById('h-wr'); wrEl.textContent = (s.win_rate||0).toFixed(1) + '%'; wrEl.className = 'kpi-val ' + (s.win_rate >= 50 ? 'g' : 'r');
+    const pnlEl = document.getElementById('h-pnl'); pnlEl.textContent = (s.total_pnl >= 0 ? '+' : '') + (s.total_pnl||0).toFixed(4) + ' USDT'; pnlEl.className = 'kpi-val ' + (s.total_pnl >= 0 ? 'g' : 'r');
+    const pfEl = document.getElementById('h-pf'); pfEl.textContent = pf; pfEl.className = 'kpi-val ' + (s.profit_factor > 1 ? 'g' : 'r');
+    document.getElementById('h-aw').textContent = '+' + (s.avg_win||0).toFixed(4);
+    document.getElementById('h-al').textContent = (s.avg_loss||0).toFixed(4);
+    document.getElementById('h-best').textContent = '+' + (s.best_trade||0).toFixed(4);
     document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
-
     const tb = document.getElementById('hist-tbl');
     const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
-    if (!trades.length) {
-      tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>';
-      return;
-    }
+    if (!trades.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
     tb.innerHTML = trades.map((t, i) => {
-      const pnl    = t.pnl_usdt || 0;
-      const pct    = t.pnl_pct  || 0;
-      const dir    = t.action === 'BUY' ? 'LONG' : 'SHORT';
-      const dc     = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
-      const pc     = pnl >= 0 ? 'g' : 'r';
-      const ep     = t.exit_price ? t.exit_price.toFixed(2) : '—';
-      const mode   = t.mode === 'paper'
-        ? '<span class="p">PAPER</span>'
-        : '<span class="g">LIVE</span>';
-      const entryFmt = (t.entry_time||'—').replace('T',' ').slice(0,19);
-      const exitFmt  = (t.exit_time ||'—').replace('T',' ').slice(0,19);
-      return `<tr>
-        <td>${i+1}</td>
-        <td class="mono" style="font-size:.7rem">${entryFmt}</td>
-        <td class="mono" style="font-size:.7rem">${exitFmt}</td>
-        <td><span class="${dc}">${dir}</span></td>
-        <td>${(t.qty||0).toFixed(4)}</td>
-        <td>${(t.entry_price||0).toFixed(2)}</td>
-        <td>${ep}</td>
-        <td class="${pc}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</td>
-        <td class="${pc}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
-        <td style="color:var(--muted)">${t.exit_reason||'—'}</td>
-        <td>${mode}</td>
-      </tr>`;
+      const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
+      const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
+      const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
+      const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
+      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
 
-async function clearHistory() {
-  await fetch('/history/clear', { method: 'POST' });
-  loadHistory();
-}
+async function clearHistory() { await fetch('/history/clear', { method: 'POST' }); loadHistory(); }
 
 async function newPaperSession() {
-  if (!confirm('Iniciar nova sessão? Isso vai limpar os trades Paper/Live atuais. Os resultados de Backtest NAO serao afetados.')) return;
+  if (!confirm('Iniciar nova sessão? Isso vai limpar os trades Paper/Live atuais.')) return;
   const m = document.getElementById('apibar-msg');
-  m.style.display = 'inline-block'; m.className = 'abm-ok';
-  m.textContent = '🆕 Nova sessão iniciada';
-  await fetch('/history/clear', { method: 'POST' });
-  loadHistory();
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '🆕 Nova sessão iniciada';
+  await fetch('/history/clear', { method: 'POST' }); loadHistory();
   setTimeout(() => m.style.display = 'none', 3000);
 }
 
-// ── Backtest ──────────────────────────────────────────────────────────────────
 async function runBacktest() {
-  const btn  = document.getElementById('btnBT');
-  const prog = document.getElementById('bt-prog');
-  btn.disabled = true; btn.textContent = 'Rodando...';
-  prog.style.width = '20%';
+  const btn = document.getElementById('btnBT'), prog = document.getElementById('bt-prog');
+  btn.disabled = true; btn.textContent = 'Rodando...'; prog.style.width = '20%';
   document.getElementById('bt-result').style.display = 'none';
   try {
-    const sym  = document.getElementById('bt-sym').value;
-    const tf   = document.getElementById('bt-tf').value;
-    const lim  = document.getElementById('bt-lim').value;
-    const cap  = document.getElementById('bt-cap').value;
-    const ofee = document.getElementById('bt-ofee').value;
-    const cfee = document.getElementById('bt-cfee').value;
+    const sym = document.getElementById('bt-sym').value, tf = document.getElementById('bt-tf').value;
+    const lim = document.getElementById('bt-lim').value, cap = document.getElementById('bt-cap').value;
+    const ofee = document.getElementById('bt-ofee').value, cfee = document.getElementById('bt-cfee').value;
     prog.style.width = '60%';
-    const url = `/backtest/run?symbol=${sym}&tf=${tf}&limit=${lim}&capital=${cap}&open_fee=${ofee}&close_fee=${cfee}`;
-    const d = await (await fetch(url, {method:'POST'})).json();
+    const d = await (await fetch(`/backtest/run?symbol=${sym}&tf=${tf}&limit=${lim}&capital=${cap}&open_fee=${ofee}&close_fee=${cfee}`, {method:'POST'})).json();
     prog.style.width = '100%';
     if (d.error) { alert('Erro: ' + d.error); return; }
-    renderBacktestResult(d);
-    loadBtHistory();
+    renderBacktestResult(d); loadBtHistory();
   } catch(e) { alert('Erro: ' + e); }
   finally { btn.disabled = false; btn.textContent = '▶ Executar'; setTimeout(() => prog.style.width = '0%', 1000); }
 }
 
 function renderBacktestResult(d) {
-  const pf      = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
+  const pf = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
   const hasFees = d.fees_enabled && (d.open_fee_pct > 0 || d.close_fee_pct > 0);
   const pnlLabel = hasFees ? 'PnL Líquido' : 'PnL Total';
-
   const kpis = [
-    [pnlLabel,       (d.total_pnl >= 0 ? '+' : '') + d.total_pnl.toFixed(2) + ' USDT', d.total_pnl >= 0 ? 'g' : 'r'],
-    ['Saldo Final',  d.final_bal.toFixed(2) + ' USDT', ''],
-    ['Win Rate',     d.win_rate.toFixed(1) + '%',  d.win_rate >= 50 ? 'g' : 'r'],
+    [pnlLabel, (d.total_pnl >= 0 ? '+' : '') + d.total_pnl.toFixed(2) + ' USDT', d.total_pnl >= 0 ? 'g' : 'r'],
+    ['Saldo Final', d.final_bal.toFixed(2) + ' USDT', ''],
+    ['Win Rate', d.win_rate.toFixed(1) + '%', d.win_rate >= 50 ? 'g' : 'r'],
     ['Total Trades', d.total_trades, ''],
-    ['Profit Factor',pf,             d.profit_factor > 1 ? 'g' : 'r'],
+    ['Profit Factor', pf, d.profit_factor > 1 ? 'g' : 'r'],
     ['Max Drawdown', d.max_drawdown.toFixed(2) + '%', 'r'],
-    ['Sharpe Ratio', d.sharpe.toFixed(3),  d.sharpe >= 1 ? 'g' : d.sharpe >= 0 ? 'y' : 'r'],
+    ['Sharpe Ratio', d.sharpe.toFixed(3), d.sharpe >= 1 ? 'g' : d.sharpe >= 0 ? 'y' : 'r'],
   ];
-  if (hasFees) {
-    kpis.push(['Taxas Pagas', '-' + (d.total_fees_paid||0).toFixed(4) + ' USDT', 'r']);
-  }
-
-  document.getElementById('bt-kpis').innerHTML = kpis.map(([lbl,val,cls]) =>
-    `<div class="kpi ${cls}"><div class="kpi-lbl">${lbl}</div><div class="kpi-val ${cls}">${val}</div></div>`
-  ).join('');
-
-  // Banner de taxas
-  const btResult = document.getElementById('bt-result');
-  let feesBanner = document.getElementById('bt-fees-banner');
-  if (!feesBanner) {
-    feesBanner = document.createElement('div');
-    feesBanner.id = 'bt-fees-banner';
-    feesBanner.style.cssText = 'font-size:.7rem;font-family:"IBM Plex Mono",monospace;padding:8px 14px;border-radius:5px;margin-bottom:16px;';
-    btResult.insertBefore(feesBanner, btResult.firstChild);
-  }
-  if (hasFees) {
-    feesBanner.style.background = 'rgba(255,77,109,.06)';
-    feesBanner.style.border = '1px solid rgba(255,77,109,.2)';
-    feesBanner.style.color = '#ff4d6d';
-    feesBanner.innerHTML = `💸 Taxas simuladas: <strong>${d.open_fee_pct}%</strong> abertura + <strong>${d.close_fee_pct}%</strong> fechamento &nbsp;|&nbsp; Total pago: <strong>-${(d.total_fees_paid||0).toFixed(4)} USDT</strong> &nbsp;|&nbsp; PnL já descontado`;
-  } else {
-    feesBanner.style.background = 'rgba(255,217,74,.05)';
-    feesBanner.style.border = '1px solid rgba(255,217,74,.15)';
-    feesBanner.style.color = '#ffd94a';
-    feesBanner.innerHTML = '⚠️ Sem taxas simuladas — resultado sem custo de corretagem (0% abertura e fechamento)';
-  }
-
-  // Cabeçalho da tabela: adiciona coluna PnL Líq se houver taxas
-  const tblHead = document.querySelector('#bt-tbl')?.closest('table')?.querySelector('thead tr');
-  if (tblHead) {
-    tblHead.innerHTML = `<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-      <th>P. Entrada</th><th>P. Saída</th>
-      <th>PnL Bruto</th>${hasFees ? '<th>Taxas</th><th>PnL Líq.</th>' : ''}
-      <th>PnL %</th><th>Motivo</th>`;
-  }
-  const colSpan = hasFees ? 13 : 10;
-
+  if (hasFees) kpis.push(['Taxas Pagas', '-' + (d.total_fees_paid||0).toFixed(4) + ' USDT', 'r']);
+  document.getElementById('bt-kpis').innerHTML = kpis.map(([lbl,val,cls]) => `<div class="kpi ${cls}"><div class="kpi-lbl">${lbl}</div><div class="kpi-val ${cls}">${val}</div></div>`).join('');
   const trades = (d.trades || []).slice().reverse();
   document.getElementById('bt-tbl').innerHTML = trades.length ? trades.map((t,i) => {
-    const pnlB  = t.pnl_usdt  || 0;
-    const pnlN  = t.pnl_net   != null ? t.pnl_net : pnlB;
-    const pct   = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
-    const fees  = t.fees_total || 0;
-    const dir   = t.action === 'BUY' ? 'LONG' : 'SHORT';
-    const dc    = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
-    const pcB   = pnlB >= 0 ? 'g' : 'r';
-    const pcN   = pnlN >= 0 ? 'g' : 'r';
-    const entryFmt = (t.entry_time||'—').replace('T',' ').slice(0,19);
-    const exitFmt  = (t.exit_time ||'—').replace('T',' ').slice(0,19);
-    const feeCols  = hasFees
-      ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td>
-         <td class="${pcN}">${pnlN >= 0 ? '+' : ''}${pnlN.toFixed(4)}</td>`
-      : '';
-    return `<tr>
-      <td>${i+1}</td>
-      <td class="mono" style="font-size:.7rem">${entryFmt}</td>
-      <td class="mono" style="font-size:.7rem">${exitFmt}</td>
-      <td><span class="${dc}">${dir}</span></td>
-      <td>${(t.qty||0).toFixed(4)}</td>
-      <td>${(t.entry_price||0).toFixed(2)}</td>
-      <td>${t.exit_price ? t.exit_price.toFixed(2) : '—'}</td>
-      <td class="${pcB}">${pnlB >= 0 ? '+' : ''}${pnlB.toFixed(4)}</td>
-      ${feeCols}
-      <td class="${pcN}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</td>
-      <td style="color:var(--muted)">${t.exit_comment||'—'}</td>
-    </tr>`;
-  }).join('') : `<tr><td colspan="${colSpan}" style="text-align:center;color:var(--muted)">Sem trades</td></tr>`;
-
+    const pnlB = t.pnl_usdt || 0, pnlN = t.pnl_net != null ? t.pnl_net : pnlB;
+    const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
+    const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
+    const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
+    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
   document.getElementById('bt-result').style.display = 'block';
 }
 
@@ -1652,55 +1433,24 @@ async function loadBtHistory() {
     const d = await (await fetch('/backtest/history')).json();
     const sessions = (d.sessions || []).slice().reverse();
     const tb = document.getElementById('bt-hist-tbl');
-    if (!sessions.length) {
-      tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>';
-      return;
-    }
-    // Atualiza cabeçalho para incluir colunas de taxa
-    const thead = tb.closest('table')?.querySelector('thead tr');
-    if (thead) {
-      thead.innerHTML = `<th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th>
-        <th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th>
-        <th>Drawdown</th><th>Sharpe</th><th>Tax.Aber.</th><th>Tax.Fech.</th>`;
-    }
+    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
     tb.innerHTML = sessions.map(s => {
-      const pf      = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
-      const pc      = s.total_pnl >= 0 ? 'g' : 'r';
-      const hasFees = s.fees_enabled || s.open_fee_pct > 0 || s.close_fee_pct > 0;
-      const feeTag  = hasFees
-        ? `<span style="color:#ff4d6d;font-size:.65rem">${(s.open_fee_pct||0).toFixed(2)}%</span>`
-        : `<span style="color:var(--muted);font-size:.65rem">0%</span>`;
-      const cFeeTag = hasFees
-        ? `<span style="color:#ff4d6d;font-size:.65rem">${(s.close_fee_pct||0).toFixed(2)}%</span>`
-        : `<span style="color:var(--muted);font-size:.65rem">0%</span>`;
-      return `<tr>
-        <td>${(s.id||'—').replace('T',' ').slice(0,19)}</td>
-        <td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td>
-        <td class="${pc}">${s.total_pnl >= 0 ? '+' : ''}${(s.total_pnl||0).toFixed(2)}</td>
-        <td class="${s.win_rate >= 50 ? 'g' : 'r'}">${(s.win_rate||0).toFixed(1)}%</td>
-        <td>${s.total_trades||0}</td>
-        <td class="${s.profit_factor > 1 ? 'g' : 'r'}">${pf}</td>
-        <td class="r">${(s.max_drawdown||0).toFixed(2)}%</td>
-        <td class="${(s.sharpe||0) >= 1 ? 'g' : (s.sharpe||0) >= 0 ? 'y' : 'r'}">${(s.sharpe||0).toFixed(3)}</td>
-        <td>${feeTag}</td><td>${cFeeTag}</td>
-      </tr>`;
+      const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
+      const pc = s.total_pnl >= 0 ? 'g' : 'r';
+      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
-
 loadBtHistory();
 
-// ── API bar helpers ───────────────────────────────────────────────────────────
 async function apiPost(route, successMsg) {
   const m = document.getElementById('apibar-msg');
   m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '...';
   try {
     const d = await (await fetch(route, { method: 'POST' })).json();
-    m.className = d.error ? 'abm-er' : 'abm-ok';
-    m.textContent = d.error || successMsg || d.message || 'OK';
+    m.className = d.error ? 'abm-er' : 'abm-ok'; m.textContent = d.error || successMsg || d.message || 'OK';
   } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
-  setTimeout(() => m.style.display = 'none', 3500);
-  setTimeout(poll, 1200);
+  setTimeout(() => m.style.display = 'none', 3500); setTimeout(poll, 1200);
 }
 
 async function exportJson(route, filename) {
@@ -1709,37 +1459,24 @@ async function exportJson(route, filename) {
   try {
     const d = await (await fetch(route)).json();
     const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = filename + '_' + new Date().toISOString().slice(0,10) + '.json';
-    a.click(); URL.revokeObjectURL(url);
-    m.textContent = '✓ Download iniciado';
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = filename + '_' + new Date().toISOString().slice(0,10) + '.json';
+    a.click(); URL.revokeObjectURL(url); m.textContent = '✓ Download iniciado';
   } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
   setTimeout(() => m.style.display = 'none', 3000);
 }
 
 async function quickBacktest() {
-  const sym = prompt('Símbolo (ex: ETH-USDT-SWAP)', 'ETH-USDT-SWAP');
-  if (!sym) return;
-  const tf  = prompt('Timeframe', '30m');
-  if (!tf)  return;
-  const lim = prompt('Candles', '500');
-  if (!lim) return;
-  const cap = prompt('Capital inicial (USDT)', '1000');
-  if (!cap) return;
+  const sym = prompt('Símbolo (ex: ETH-USDT-SWAP)', 'ETH-USDT-SWAP'); if (!sym) return;
+  const tf  = prompt('Timeframe', '30m'); if (!tf) return;
+  const lim = prompt('Candles', '500'); if (!lim) return;
+  const cap = prompt('Capital inicial (USDT)', '1000'); if (!cap) return;
   const m = document.getElementById('apibar-msg');
   m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '⏳ Rodando...';
   try {
-    const d = await (await fetch(
-      `/backtest/run?symbol=${encodeURIComponent(sym)}&tf=${tf}&limit=${lim}&capital=${cap}`,
-      { method: 'POST' }
-    )).json();
+    const d = await (await fetch(`/backtest/run?symbol=${encodeURIComponent(sym)}&tf=${tf}&limit=${lim}&capital=${cap}`, { method: 'POST' })).json();
     if (d.error) { m.className='abm-er'; m.textContent='Erro: '+d.error; }
-    else {
-      m.textContent = `✓ PnL: ${d.total_pnl>=0?'+':''}${(d.total_pnl||0).toFixed(2)} | WR: ${(d.win_rate||0).toFixed(1)}%`;
-      switchTab('backtest'); renderBacktestResult(d); loadBtHistory();
-    }
+    else { m.textContent = `✓ PnL: ${d.total_pnl>=0?'+':''}${(d.total_pnl||0).toFixed(2)} | WR: ${(d.win_rate||0).toFixed(1)}%`; switchTab('backtest'); renderBacktestResult(d); loadBtHistory(); }
   } catch(e) { m.className='abm-er'; m.textContent='Erro: '+e; }
   setTimeout(() => m.style.display = 'none', 6000);
 }
@@ -1752,7 +1489,6 @@ def _thread():
     global _trader
     log.info("📥 Baixando candles Bitget...")
     try:
-        # DataCollector usa OKX para histórico (mais candles disponíveis)
         df = DataCollector(symbol="ETH-USDT-SWAP", timeframe=TIMEFRAME,
                            limit=TOTAL_CANDLES).fetch_ohlcv()
         log.info(f"  ✅ {len(df)} candles")
@@ -1797,7 +1533,6 @@ def status():
 
 @app.route('/mode', methods=['GET', 'POST'])
 def mode_endpoint():
-    """GET → retorna modo atual. POST → altera modo (paper|live)."""
     if flask_request.method == 'GET':
         return jsonify({
             "mode":   "paper" if get_paper_mode() else "live",
@@ -1805,10 +1540,8 @@ def mode_endpoint():
             "pct":    100 if get_paper_mode() else int(LIVE_PCT * 100),
             "creds":  _creds_ok(),
         })
-
     data = flask_request.get_json(silent=True) or {}
     mode = data.get("mode", "paper").lower()
-
     if mode == "live":
         if not _creds_ok():
             return jsonify({"error": "❌ Configure BITGET_API_KEY, BITGET_SECRET_KEY e BITGET_PASSPHRASE no Render antes de usar o modo LIVE."}), 400
