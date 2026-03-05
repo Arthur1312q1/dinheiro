@@ -181,9 +181,9 @@ class PaperTrader:
         self._trade_id += 1
         return f"PAPER-{self._trade_id:05d}"
 
-    def open_long(self, qty, bal_usdt=0, px=0, ts=None):
+    def open_long(self, qty, bal_usdt=0, px=0):
         trade_id = self._new_id()
-        ts = ts or brazil_iso()
+        ts = brazil_iso()
         history_mgr.add_trade({
             "id": trade_id, "action": "BUY", "status": "open",
             "entry_time": ts, "entry_price": px,
@@ -193,9 +193,9 @@ class PaperTrader:
         log.info(f"  📄 PAPER LONG aberto | px={px:.2f} qty={qty:.4f}")
         return {"code": "0", "data": [{"ordId": trade_id}]}, qty
 
-    def open_short(self, qty, bal_usdt=0, px=0, ts=None):
+    def open_short(self, qty, bal_usdt=0, px=0):
         trade_id = self._new_id()
-        ts = ts or brazil_iso()
+        ts = brazil_iso()
         history_mgr.add_trade({
             "id": trade_id, "action": "SELL", "status": "open",
             "entry_time": ts, "entry_price": px,
@@ -205,14 +205,14 @@ class PaperTrader:
         log.info(f"  📄 PAPER SHORT aberto | px={px:.2f} qty={qty:.4f}")
         return {"code": "0", "data": [{"ordId": trade_id}]}, qty
 
-    def close_long(self, qty, exit_px=0, reason="EXIT", ts=None):
+    def close_long(self, qty, exit_px=0, reason="EXIT"):
         if not self.position or self.position["side"] != "long":
             return {"code": "0"}
         entry_px = self.position["avg_px"]
         trade_id = self.position["id"]
         pnl      = (exit_px - entry_px) * qty
         self.position = None
-        ts = ts or brazil_iso()
+        ts = brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
         except Exception as _e:
@@ -220,14 +220,14 @@ class PaperTrader:
         log.info(f"  📄 PAPER LONG fechado | px={exit_px:.2f} pnl={pnl:+.4f} USDT")
         return {"code": "0"}
 
-    def close_short(self, qty, exit_px=0, reason="EXIT", ts=None):
+    def close_short(self, qty, exit_px=0, reason="EXIT"):
         if not self.position or self.position["side"] != "short":
             return {"code": "0"}
         entry_px = self.position["avg_px"]
         trade_id = self.position["id"]
         pnl      = (entry_px - exit_px) * qty
         self.position = None
-        ts = ts or brazil_iso()
+        ts = brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
         except Exception as _e:
@@ -500,27 +500,13 @@ class LiveTrader:
         for act in actions:
             kind = act.get('action', '')
 
-            # ── PREÇO, QTY E TIMESTAMP VÊM SEMPRE DA ESTRATÉGIA ──────────
-            # Garante paridade EXATA com o backtest:
+            # ── PREÇO E QTY VÊM SEMPRE DA ESTRATÉGIA ─────────────────────
+            # Garante paridade EXATA com o backtest.
+            # A estratégia já calculou:
             #   - price: open da barra (entradas) ou stop_price (saídas)
             #   - qty:   via _lots() — mesma fórmula do backtest
-            #   - ts_act: timestamp do candle convertido pra BRT — idêntico ao backtest
             act_px  = float(act.get('price') or 0)
             act_qty = float(act.get('qty')   or 0)
-            # Converte timestamp da action para string BRT (igual ao _to_brt_str do engine)
-            _raw_ts = act.get('timestamp')
-            if _raw_ts is not None:
-                try:
-                    if hasattr(_raw_ts, 'tzinfo'):
-                        if _raw_ts.tzinfo is None:
-                            _raw_ts = _raw_ts.replace(tzinfo=timezone.utc)
-                        act_ts = _raw_ts.astimezone(BRT).strftime('%Y-%m-%dT%H:%M:%S')
-                    else:
-                        act_ts = str(_raw_ts)[:19]
-                except Exception:
-                    act_ts = brazil_iso()
-            else:
-                act_ts = brazil_iso()
 
             # ── EXIT LONG ─────────────────────────────────────────────────
             if kind == 'EXIT_LONG':
@@ -531,7 +517,7 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
-                        self.paper.close_long(pos['size'], px, reason, ts=act_ts)
+                        self.paper.close_long(pos['size'], px, reason)
                         self._add_log("EXIT_LONG", px, pos['size'], reason)
                         self._cache_pos = None
                         log.info(f"  🔴 [PAPER] EXIT LONG @ {px:.2f} | {reason}")
@@ -560,7 +546,7 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
-                        self.paper.close_short(pos['size'], px, reason, ts=act_ts)
+                        self.paper.close_short(pos['size'], px, reason)
                         self._add_log("EXIT_SHORT", px, pos['size'], reason)
                         self._cache_pos = None
                         log.info(f"  🟢 [PAPER] EXIT SHORT @ {px:.2f} | {reason}")
@@ -600,11 +586,11 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
                         # Reversão: fecha short com o mesmo preço que a estratégia usou
-                        self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
+                        self.paper.close_short(pos['size'], px, "REVERSAL")
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
                     log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
-                    r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
+                    r, qty_f = self.paper.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "0":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
@@ -644,11 +630,11 @@ class LiveTrader:
                 if self._is_paper():
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
-                        self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
+                        self.paper.close_long(pos['size'], px, "REVERSAL")
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
                     log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
-                    r, qty_f = self.paper.open_short(qty, self._cache_bal, px, ts=act_ts)
+                    r, qty_f = self.paper.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "0":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
@@ -678,16 +664,12 @@ class LiveTrader:
             self._cache_pos    = self.paper.get_position()
 
     def _wait(self, tf: int = 30):
-        """
-        Aguarda até 500ms ANTES do fechamento do candle.
-        Acorda cedo para começar o polling imediatamente quando a API
-        disponibilizar o candle fechado, minimizando latência de execução.
-        """
+        """Aguarda até o fechamento exato do próximo candle (precisão de ms)."""
         now     = brazil_now()
         tf_secs = tf * 60
         elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
-        secs    = tf_secs - elapsed - 0.5   # acorda 500ms antes do close
-        if secs < 0.5:
+        secs    = tf_secs - elapsed
+        if secs < 1:
             secs += tf_secs
         log.info(f"⏰ Aguardando {secs:.1f}s até próximo close ({tf}m)...")
         time.sleep(secs)
@@ -754,17 +736,17 @@ class LiveTrader:
                 self._wait(tf)
 
                 c = None
-                for _attempt in range(40):   # até 2s de polling (40 × 50ms)
+                for _attempt in range(10):
                     raw = self._candle()
                     if raw is None:
-                        time.sleep(0.05)
+                        time.sleep(0.2)
                         continue
                     if str(raw['timestamp']) == self._last_candle_ts:
-                        if _attempt < 39:
-                            log.info(f"  ⏳ Aguardando novo candle na API (tentativa {_attempt+1}/40)...")
-                            time.sleep(0.05)
+                        if _attempt < 9:
+                            log.info(f"  ⏳ Aguardando novo candle na API (tentativa {_attempt+1}/10)...")
+                            time.sleep(0.2)
                             continue
-                        log.warning("  ⚠️ Candle não atualizou após 40 tentativas — próximo ciclo")
+                        log.warning("  ⚠️ Candle não atualizou após 10 tentativas — próximo ciclo")
                         break
                     c = raw
                     break
