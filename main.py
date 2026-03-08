@@ -318,17 +318,25 @@ class Bitget:
             pass
         return None
 
-    def _cts(self, qty_eth):
-        """Converte ETH qty em contratos (1 contrato = CT_VAL ETH)."""
-        return max(1, int(qty_eth / self.CT_VAL))
+    def _cts(self, qty_eth, bal=0, px=0):
+        """
+        Converte ETH qty em contratos.
+        A 1x alavancagem, margem exigida = valor nocional completo.
+        Limita contratos para que o nocional não exceda bal * LIVE_PCT.
+        """
+        cts = max(1, int(qty_eth / self.CT_VAL))
+        if bal > 0 and px > 0:
+            # margem disponível para usar (ex: 95% do saldo)
+            margin_usdt = bal * LIVE_PCT
+            # a 1x, nocional = contratos × CT_VAL × preço = margem necessária
+            max_cts = max(1, int(margin_usdt / (self.CT_VAL * px)))
+            if cts > max_cts:
+                log.info(f"  ⚠️ qty capado: {cts} → {max_cts} cts "
+                         f"(bal={bal:.2f} px={px:.2f} margem_max={margin_usdt:.2f} USDT)")
+                cts = max_cts
+        return cts
 
     def _order(self, side, reduce_only, sz):
-        """
-        Envia ordem para conta unilateral (one-way / posição única).
-        Modo unilateral NÃO usa tradeSide — usa reduceOnly para fechar.
-        side: 'buy' | 'sell'
-        reduce_only: True para fechar posição, False para abrir.
-        """
         body = {
             "symbol":      self.SYMBOL,
             "productType": self.PRODUCT_TYPE,
@@ -350,45 +358,45 @@ class Bitget:
         return r
 
     def open_long(self, qty, bal=0, px=0):
-        sz = self._cts(qty)
+        sz = self._cts(qty, bal, px)
         r  = self._order("buy", False, sz)
         if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
             history_mgr.add_trade({"id": str(oid), "action": "BUY", "status": "open",
                 "entry_time": brazil_iso(), "entry_price": px,
-                "qty": qty, "balance": bal, "mode": "live"})
-        return r, qty
+                "qty": sz * self.CT_VAL, "balance": bal, "mode": "live"})
+        return r, sz * self.CT_VAL
 
     def open_short(self, qty, bal=0, px=0):
-        sz = self._cts(qty)
+        sz = self._cts(qty, bal, px)
         r  = self._order("sell", False, sz)
         if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
             history_mgr.add_trade({"id": str(oid), "action": "SELL", "status": "open",
                 "entry_time": brazil_iso(), "entry_price": px,
-                "qty": qty, "balance": bal, "mode": "live"})
-        return r, qty
+                "qty": sz * self.CT_VAL, "balance": bal, "mode": "live"})
+        return r, sz * self.CT_VAL
 
     def close_long(self, qty, exit_px=0, reason="EXIT"):
         sz = self._cts(qty)
-        r  = self._order("sell", True, sz)   # reduceOnly=YES fecha o long
+        r  = self._order("sell", True, sz)
         if r.get("code") == "00000":
             ts = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
                 if t.get("action") == "BUY" and t.get("status") == "open":
-                    pnl = (exit_px - t.get("entry_price", exit_px)) * qty
+                    pnl = (exit_px - t.get("entry_price", exit_px)) * (sz * self.CT_VAL)
                     history_mgr.close_trade(t["id"], exit_px, ts, reason, pnl)
                     break
         return r
 
     def close_short(self, qty, exit_px=0, reason="EXIT"):
         sz = self._cts(qty)
-        r  = self._order("buy", True, sz)    # reduceOnly=YES fecha o short
+        r  = self._order("buy", True, sz)
         if r.get("code") == "00000":
             ts = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
                 if t.get("action") == "SELL" and t.get("status") == "open":
-                    pnl = (t.get("entry_price", exit_px) - exit_px) * qty
+                    pnl = (t.get("entry_price", exit_px) - exit_px) * (sz * self.CT_VAL)
                     history_mgr.close_trade(t["id"], exit_px, ts, reason, pnl)
                     break
         return r
@@ -626,9 +634,8 @@ class LiveTrader:
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        cts = max(1, int(qty_f / self.bitget.ct_val()))
                         self._add_log("ENTER_LONG", px, qty_f)
-                        self._cache_pos = {'side': 'long', 'size': cts, 'avg_px': px}
+                        self._cache_pos = {'side': 'long', 'size': int(qty_f / self.bitget.ct_val()), 'avg_px': px}
                     else:
                         log.error(f"  ❌ bitget.open_long falhou")
 
@@ -670,9 +677,8 @@ class LiveTrader:
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        cts = max(1, int(qty_f / self.bitget.ct_val()))
                         self._add_log("ENTER_SHORT", px, qty_f)
-                        self._cache_pos = {'side': 'short', 'size': cts, 'avg_px': px}
+                        self._cache_pos = {'side': 'short', 'size': int(qty_f / self.bitget.ct_val()), 'avg_px': px}
                     else:
                         log.error(f"  ❌ bitget.open_short falhou")
 
