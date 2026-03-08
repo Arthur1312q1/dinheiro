@@ -318,22 +318,38 @@ class Bitget:
             pass
         return None
 
+    MIN_QTY_ETH = 0.01   # minimo da Bitget para ETH-USDT-SWAP (10 contratos)
+
     def _cts(self, qty_eth, bal=0, px=0):
         """
-        Converte ETH qty em contratos.
-        A 1x alavancagem, margem exigida = valor nocional completo.
-        Limita contratos para que o nocional não exceda bal * LIVE_PCT.
+        Converte ETH qty em contratos (1 contrato = CT_VAL ETH).
+        A 1x alavancagem, margem = nocional completo.
+        Usa 90% do saldo para deixar buffer para fees da Bitget.
+        Retorna 0 se saldo insuficiente para o minimo de 0.01 ETH.
         """
-        cts = max(1, int(qty_eth / self.CT_VAL))
+        MIN_CTS = int(self.MIN_QTY_ETH / self.CT_VAL)  # 10 contratos
+
         if bal > 0 and px > 0:
-            # margem disponível para usar (ex: 95% do saldo)
-            margin_usdt = bal * LIVE_PCT
-            # a 1x, nocional = contratos × CT_VAL × preço = margem necessária
-            max_cts = max(1, int(margin_usdt / (self.CT_VAL * px)))
-            if cts > max_cts:
-                log.info(f"  ⚠️ qty capado: {cts} → {max_cts} cts "
-                         f"(bal={bal:.2f} px={px:.2f} margem_max={margin_usdt:.2f} USDT)")
-                cts = max_cts
+            margin_usdt = bal * 0.90
+            max_eth     = margin_usdt / px
+            if max_eth < self.MIN_QTY_ETH:
+                log.warning(f"  SALDO INSUFICIENTE: maximo {max_eth:.4f} ETH disponivel "
+                            f"< minimo {self.MIN_QTY_ETH} ETH | bal={bal:.2f} px={px:.2f}")
+                return 0
+            qty_eth = min(qty_eth, max_eth)
+
+        cts = max(MIN_CTS, int(qty_eth / self.CT_VAL))
+
+        if bal > 0 and px > 0:
+            nocional = cts * self.CT_VAL * px
+            if nocional > bal * 0.90:
+                cts = int((bal * 0.90) / (self.CT_VAL * px))
+                if cts < MIN_CTS:
+                    log.warning(f"  TRADE CANCELADO: apos cap {cts*self.CT_VAL:.4f} ETH "
+                                f"< minimo {self.MIN_QTY_ETH} ETH | bal={bal:.2f}")
+                    return 0
+            log.info(f"  _cts: {cts} contratos = {cts*self.CT_VAL:.4f} ETH "
+                     f"| nocional={cts*self.CT_VAL*px:.2f} USDT | bal={bal:.2f}")
         return cts
 
     def _order(self, side, reduce_only, sz):
@@ -359,6 +375,8 @@ class Bitget:
 
     def open_long(self, qty, bal=0, px=0):
         sz = self._cts(qty, bal, px)
+        if sz == 0:
+            return {"code": "SKIP", "msg": "Saldo insuficiente para minimo 0.01 ETH"}, 0.0
         r  = self._order("buy", False, sz)
         if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
@@ -369,6 +387,8 @@ class Bitget:
 
     def open_short(self, qty, bal=0, px=0):
         sz = self._cts(qty, bal, px)
+        if sz == 0:
+            return {"code": "SKIP", "msg": "Saldo insuficiente para minimo 0.01 ETH"}, 0.0
         r  = self._order("sell", False, sz)
         if r.get("code") == "00000":
             oid = (r.get("data") or {}).get("orderId", "?")
@@ -636,6 +656,8 @@ class LiveTrader:
                     if r.get("code") == "00000":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': int(qty_f / self.bitget.ct_val()), 'avg_px': px}
+                    elif r.get("code") == "SKIP":
+                        log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
                     else:
                         log.error(f"  ❌ bitget.open_long falhou")
 
@@ -679,6 +701,8 @@ class LiveTrader:
                     if r.get("code") == "00000":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': int(qty_f / self.bitget.ct_val()), 'avg_px': px}
+                    elif r.get("code") == "SKIP":
+                        log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
                     else:
                         log.error(f"  ❌ bitget.open_short falhou")
 
@@ -905,9 +929,10 @@ def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=
 # ═══════════════════════════════════════════════════════════════════════════════
 # FLASK DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
-app   = Flask(__name__)
-_trader: Optional[LiveTrader] = None
-_lock  = threading.Lock()
+app      = Flask(__name__)
+_trader:   Optional[LiveTrader] = None
+_lock    = threading.Lock()
+_starting = False   # True entre o lançamento da thread e _trader ser setado
 _logs: List[str] = []
 
 class _LogCap(logging.Handler):
@@ -1525,7 +1550,7 @@ async function quickBacktest() {
 
 
 def _thread():
-    global _trader
+    global _trader, _starting
     log.info("📥 Baixando candles Bitget...")
     try:
         df = DataCollector(symbol="ETH-USDT-SWAP", timeframe=TIMEFRAME,
@@ -1541,7 +1566,8 @@ def _thread():
         log.error(f"❌ {type(e).__name__}: {e}\n{traceback.format_exc()}")
     finally:
         with _lock:
-            _trader = None
+            _trader   = None
+            _starting = False   # libera para novo start
         log.info("🔄 Pronto para re-iniciar")
 
 
@@ -1594,11 +1620,13 @@ def mode_endpoint():
 
 @app.route('/start', methods=['POST'])
 def start():
+    global _starting
     with _lock:
-        if _trader is not None:
+        if _trader is not None or _starting:
             return jsonify({"message": "Já está rodando"})
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
+        _starting = True   # bloqueia imediatamente — antes de lançar a thread
         threading.Thread(target=_thread, daemon=True).start()
         mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
         return jsonify({"message": f"Iniciado em modo {mode_str}"})
@@ -1652,20 +1680,17 @@ def report_page():
 
 
 def _delayed_start():
+    global _starting
     time.sleep(5)
-    if get_paper_mode():
-        log.info("📄 PAPER TRADING — auto-start...")
-        with _lock:
-            if _trader is None:
-                threading.Thread(target=_thread, daemon=True).start()
-        return
-    if not _creds_ok():
-        log.warning("⚠️ Chaves Bitget não encontradas — use o botão Iniciar após configurar.")
-        return
     with _lock:
-        if _trader is not None:
+        if _trader is not None or _starting:
             return
-        log.info("🚀 Chaves Bitget OK — auto-start LIVE...")
+        if not get_paper_mode() and not _creds_ok():
+            log.warning("⚠️ Chaves Bitget não encontradas — use o botão Iniciar após configurar.")
+            return
+        _starting = True
+        mode_str = "PAPER TRADING" if get_paper_mode() else "LIVE (Bitget)"
+        log.info(f"🚀 Auto-start {mode_str}...")
         threading.Thread(target=_thread, daemon=True).start()
 
 
