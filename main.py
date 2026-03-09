@@ -250,7 +250,7 @@ class Bitget:
     SYMBOL       = "ETHUSDT"
     PRODUCT_TYPE = "usdt-futures"
     MARGIN       = "USDT"
-    CT_VAL       = 0.001
+    CT_VAL       = 0.01    # 1 contrato = 0.01 ETH (Bitget ETH-USDT-SWAP)
 
     def _sign(self, ts, method, path, body=""):
         msg = ts + method.upper() + path + body
@@ -318,7 +318,7 @@ class Bitget:
             pass
         return None
 
-    MIN_QTY_ETH = 0.01   # minimo da Bitget para ETH-USDT-SWAP (10 contratos)
+    MIN_QTY_ETH = 0.01   # minimo da Bitget: 1 contrato = 0.01 ETH
 
     def _cts(self, qty_eth, bal=0, px=0):
         """
