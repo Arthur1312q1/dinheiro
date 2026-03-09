@@ -352,13 +352,15 @@ class Bitget:
                      f"| nocional={cts*self.CT_VAL*px:.2f} USDT | bal={bal:.2f}")
         return cts
 
-    def _order(self, side, reduce_only, sz):
+    def _order(self, side, reduce_only, sz_cts):
+        # Bitget usdt-futures: size field = ETH amount (not contracts)
+        size_eth = round(sz_cts * self.CT_VAL, 8)
         body = {
             "symbol":      self.SYMBOL,
             "productType": self.PRODUCT_TYPE,
             "marginMode":  "crossed",
             "marginCoin":  self.MARGIN,
-            "size":        str(sz),
+            "size":        str(size_eth),
             "side":        side,
             "orderType":   "market",
         }
@@ -368,9 +370,9 @@ class Bitget:
         d0 = r.get("data") or {}
         tag = f"{'CLOSE' if reduce_only else 'OPEN'}/{side.upper()}"
         if r.get("code") == "00000":
-            log.info(f"  ✅ ORDER {tag} sz={sz} ordId={d0.get('orderId','?')}")
+            log.info(f"  ✅ ORDER {tag} sz={sz_cts}cts={size_eth}ETH ordId={d0.get('orderId','?')}")
         else:
-            log.error(f"  ❌ ORDER {tag} sz={sz} code={r.get('code','')} msg={r.get('msg','')}")
+            log.error(f"  ❌ ORDER {tag} sz={sz_cts}cts={size_eth}ETH code={r.get('code','')} msg={r.get('msg','')}")
         return r
 
     def open_long(self, qty, bal=0, px=0):
