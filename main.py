@@ -5,6 +5,28 @@ Render: configurar BITGET_API_KEY, BITGET_SECRET_KEY, BITGET_PASSPHRASE
 Modo de operação selecionável via dashboard:
   - PAPER TRADING : simula trades com saldo falso (sem risco)
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
+
+══════════════════════════════════════════════════════════════════════
+FIX v2 — DELAY DE 30 MINUTOS NAS ENTRADAS LIVE (2025)
+══════════════════════════════════════════════════════════════════════
+PROBLEMA RAIZ:
+  A estratégia usa delay de 1 barra por design (anti-ghost trades).
+  No backtest: _exec_open do bar N+1 usa o open histórico de bar N+1. ✓
+  No live (código antigo):
+    1. Bar N fecha → sinal → _el=True (pendente)
+    2. AGUARDA bar N+1 FECHAR (30 min!)
+    3. Bar N+1 fecha → _exec_open → retorna BUY → envia market order
+    4. Bitget executa ao preço ATUAL ≈ open do bar N+2  ← ERRADO!
+
+SOLUÇÃO (_submit_pending_entries_live):
+  Após processar bar N e detectar _el/_es True:
+    → Envia market order IMEDIATAMENTE (segundos após bar N fechar)
+    → Bitget executa próximo ao open de bar N+1  ✓
+    → confirm_fill() sincroniza estado interno da estratégia
+    → No próximo ciclo, _exec_open encontra _el/_es=False (sem duplicata)
+
+  Paper trading NÃO foi alterado (funciona corretamente via _exec_open).
+══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
 import pandas as pd
@@ -321,12 +343,6 @@ class Bitget:
     MIN_QTY_ETH = 0.01   # minimo da Bitget: 1 contrato = 0.01 ETH
 
     def _cts(self, qty_eth, bal=0, px=0):
-        """
-        Converte ETH qty em contratos (1 contrato = CT_VAL ETH).
-        A 1x alavancagem, margem = nocional completo.
-        Usa 90% do saldo para deixar buffer para fees da Bitget.
-        Retorna 0 se saldo insuficiente para o minimo de 0.01 ETH.
-        """
         MIN_CTS = int(self.MIN_QTY_ETH / self.CT_VAL)  # 10 contratos
 
         if bal > 0 and px > 0:
@@ -353,7 +369,6 @@ class Bitget:
         return cts
 
     def _order(self, side, reduce_only, sz_cts):
-        # Bitget usdt-futures: size field = ETH amount (not contracts)
         size_eth = round(sz_cts * self.CT_VAL, 8)
         body = {
             "symbol":      self.SYMBOL,
@@ -441,7 +456,8 @@ class Bitget:
         bal = self.balance()
         px  = self.mark_price()
         log.info(f"  Bitget v2 | Saldo: {bal:.4f} USDT | Preco: {px:.2f}")
-        return bal, px   # retorna saldo real e preço
+        return bal, px
+
 
 class LiveTrader:
     def __init__(self):
@@ -512,6 +528,94 @@ class LiveTrader:
     def live_pnl(self):
         return self.strategy.net_profit - self._pnl_baseline
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # FIX: SUBMIT ENTRADAS PENDENTES IMEDIATAMENTE (apenas LIVE)
+    # ═══════════════════════════════════════════════════════════════════════
+    def _submit_pending_entries_live(self, ts):
+        """
+        Após processar o fechamento de bar N:
+          - Se a estratégia agendou _el=True ou _es=True (sinal confirmado),
+            submete a ordem market AGORA, antes de bar N+1 abrir.
+          - A ordem executa ao preço atual ≈ open de bar N+1.
+          - confirm_fill() sincroniza o estado interno da estratégia e
+            zera _el/_es para que _exec_open do próximo ciclo seja no-op.
+
+        SEM efeito em Paper Trading (paper usa o fluxo original via _exec_open).
+        """
+        if self._is_paper():
+            return  # Paper: fluxo original sem alteração
+
+        # Busca preço atual de mercado (usado para contabilidade/logging)
+        px = self._mark_price() or self._cache_px
+        if px <= 0:
+            log.warning("  ⚠️ _submit_pending_entries_live: preço indisponível, pulando")
+            return
+
+        # ── ENTRADA LONG PENDENTE ────────────────────────────────────────
+        if self.strategy._el and self.strategy.position_size <= 0.0:
+            qty = self.strategy._lots()
+            if qty <= 0:
+                log.warning("  ⚠️ LONG pendente: qty=0, cancelado")
+                self.strategy._el = False
+                return
+
+            # Reversão: fecha SHORT antes de abrir LONG
+            pos = self._cache_pos
+            if pos and pos['side'] == 'short':
+                log.info(f"  ↩️ LIVE REVERSAL (pending): fechando SHORT @ {px:.2f}")
+                self.bitget.close_short(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
+                self._cache_pos = None
+
+            log.info(f"  🟢 LIVE ENTER LONG [IMEDIATO após close bar] "
+                     f"{qty:.6f} ETH @ {px:.2f}")
+            r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
+
+            if r.get("code") == "00000":
+                # confirm_fill: atualiza position_size, position_price, _el=False
+                self.strategy.confirm_fill('BUY', px, qty_f, ts)
+                self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                self._cache_bal = self.strategy.balance
+                self._add_log("ENTER_LONG", px, qty_f, "PENDING_IMEDIATO")
+                log.info(f"  ✅ LONG submetido | qty={qty_f:.4f} px={px:.2f}")
+            elif r.get("code") == "SKIP":
+                log.warning(f"  ⛔ LONG pendente ignorado — {r.get('msg')}")
+                self.strategy._el = False
+            else:
+                log.error(f"  ❌ bitget.open_long falhou — _el mantido para retry")
+                # Mantém _el=True para tentar no próximo ciclo via _exec_open normal
+
+        # ── ENTRADA SHORT PENDENTE ───────────────────────────────────────
+        if self.strategy._es and self.strategy.position_size >= 0.0:
+            qty = self.strategy._lots()
+            if qty <= 0:
+                log.warning("  ⚠️ SHORT pendente: qty=0, cancelado")
+                self.strategy._es = False
+                return
+
+            # Reversão: fecha LONG antes de abrir SHORT
+            pos = self._cache_pos
+            if pos and pos['side'] == 'long':
+                log.info(f"  ↩️ LIVE REVERSAL (pending): fechando LONG @ {px:.2f}")
+                self.bitget.close_long(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
+                self._cache_pos = None
+
+            log.info(f"  🔴 LIVE ENTER SHORT [IMEDIATO após close bar] "
+                     f"{qty:.6f} ETH @ {px:.2f}")
+            r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
+
+            if r.get("code") == "00000":
+                # confirm_fill: atualiza position_size, position_price, _es=False
+                self.strategy.confirm_fill('SELL', px, qty_f, ts)
+                self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                self._cache_bal = self.strategy.balance
+                self._add_log("ENTER_SHORT", px, qty_f, "PENDING_IMEDIATO")
+                log.info(f"  ✅ SHORT submetido | qty={qty_f:.4f} px={px:.2f}")
+            elif r.get("code") == "SKIP":
+                log.warning(f"  ⛔ SHORT pendente ignorado — {r.get('msg')}")
+                self.strategy._es = False
+            else:
+                log.error(f"  ❌ bitget.open_short falhou — _es mantido para retry")
+
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
         close_px = float(candle['close'])
@@ -536,14 +640,8 @@ class LiveTrader:
         for act in actions:
             kind = act.get('action', '')
 
-            # ── PREÇO, QTY E TIMESTAMP VÊM SEMPRE DA ESTRATÉGIA ──────────
-            # Garante paridade EXATA com o backtest:
-            #   - price: open da barra (entradas) ou stop_price (saídas)
-            #   - qty:   via _lots() — mesma fórmula do backtest
-            #   - ts_act: timestamp do candle convertido pra BRT — idêntico ao backtest
             act_px  = float(act.get('price') or 0)
             act_qty = float(act.get('qty')   or 0)
-            # Converte timestamp da action para string BRT (igual ao _to_brt_str do engine)
             _raw_ts = act.get('timestamp')
             if _raw_ts is not None:
                 try:
@@ -561,7 +659,6 @@ class LiveTrader:
             # ── EXIT LONG ─────────────────────────────────────────────────
             if kind == 'EXIT_LONG':
                 reason = act.get('exit_reason', 'EXIT')
-                # Preço exato da estratégia (stop/trail — igual ao backtest)
                 px = act_px if act_px > 0 else close_px
 
                 if self._is_paper():
@@ -619,12 +716,24 @@ class LiveTrader:
 
             # ── ENTER LONG (BUY) ──────────────────────────────────────────
             elif kind == 'BUY':
-                cur = self.paper.get_position() if self._is_paper() else self._cache_pos
+                # ════════════════════════════════════════════════════════
+                # LIVE: Este BUY vem do _exec_open que usa candle.open JÁ
+                # PASSADO (a barra fechou há instantes). Em LIVE, a entrada
+                # é submetida por _submit_pending_entries_live() logo abaixo,
+                # IMEDIATAMENTE após o fechamento da barra ANTERIOR.
+                # Ignorar aqui evita submeter com 30 minutos de atraso.
+                # ════════════════════════════════════════════════════════
+                if not self._is_paper():
+                    log.info(f"  ℹ️ BUY de _exec_open ignorado em LIVE "
+                             f"(entrada já tratada via _submit_pending_entries_live)")
+                    continue
+
+                # Paper: comportamento original via _exec_open ──────────
+                cur = self.paper.get_position()
                 if cur and cur['side'] == 'long':
                     log.info("  ⏭️ BUY ignorado — já tem long aberto")
                     continue
 
-                # Preço e qty EXATOS da estratégia — mesmos valores do backtest
                 px  = act_px  if act_px  > 0 else close_px
                 qty = act_qty if act_qty > 0 else 0.0
 
@@ -632,45 +741,36 @@ class LiveTrader:
                     log.warning("  ⚠️ BUY ignorado — qty=0 vindo da estratégia")
                     continue
 
-                if self._is_paper():
-                    pos = self.paper.get_position()
-                    if pos and pos['side'] == 'short':
-                        # Reversão: fecha short com o mesmo preço que a estratégia usou
-                        self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
-                        self._cache_pos = None
-                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
-                    log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
-                    r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
-                    if r.get("code") == "0":
-                        self._add_log("ENTER_LONG", px, qty_f)
-                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
-                    else:
-                        log.error(f"  ❌ paper.open_long falhou")
-
-                else:  # LIVE
-                    pos = self._cache_pos
-                    if pos and pos['side'] == 'short':
-                        self.bitget.close_short(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
-                        self._cache_pos = None
-                        log.info(f"  ↩️ LIVE REVERSAL: fechou SHORT @ {px:.2f}")
-                    log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
-                    r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
-                    if r.get("code") == "00000":
-                        self._add_log("ENTER_LONG", px, qty_f)
-                        self._cache_pos = {'side': 'long', 'size': int(qty_f / self.bitget.ct_val()), 'avg_px': px}
-                    elif r.get("code") == "SKIP":
-                        log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
-                    else:
-                        log.error(f"  ❌ bitget.open_long falhou")
+                pos = self.paper.get_position()
+                if pos and pos['side'] == 'short':
+                    self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
+                    self._cache_pos = None
+                    log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
+                log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
+                r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
+                if r.get("code") == "0":
+                    self._add_log("ENTER_LONG", px, qty_f)
+                    self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                else:
+                    log.error(f"  ❌ paper.open_long falhou")
 
             # ── ENTER SHORT (SELL) ────────────────────────────────────────
             elif kind == 'SELL':
-                cur = self.paper.get_position() if self._is_paper() else self._cache_pos
+                # ════════════════════════════════════════════════════════
+                # LIVE: mesmo motivo do BUY acima — usar
+                # _submit_pending_entries_live() para timing correto.
+                # ════════════════════════════════════════════════════════
+                if not self._is_paper():
+                    log.info(f"  ℹ️ SELL de _exec_open ignorado em LIVE "
+                             f"(entrada já tratada via _submit_pending_entries_live)")
+                    continue
+
+                # Paper: comportamento original via _exec_open ──────────
+                cur = self.paper.get_position()
                 if cur and cur['side'] == 'short':
                     log.info("  ⏭️ SELL ignorado — já tem short aberto")
                     continue
 
-                # Preço e qty EXATOS da estratégia — mesmos valores do backtest
                 px  = act_px  if act_px  > 0 else close_px
                 qty = act_qty if act_qty > 0 else 0.0
 
@@ -678,38 +778,30 @@ class LiveTrader:
                     log.warning("  ⚠️ SELL ignorado — qty=0 vindo da estratégia")
                     continue
 
-                if self._is_paper():
-                    pos = self.paper.get_position()
-                    if pos and pos['side'] == 'long':
-                        self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
-                        self._cache_pos = None
-                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
-                    log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
-                    r, qty_f = self.paper.open_short(qty, self._cache_bal, px, ts=act_ts)
-                    if r.get("code") == "0":
-                        self._add_log("ENTER_SHORT", px, qty_f)
-                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                    else:
-                        log.error(f"  ❌ paper.open_short falhou")
+                pos = self.paper.get_position()
+                if pos and pos['side'] == 'long':
+                    self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
+                    self._cache_pos = None
+                    log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
+                log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
+                r, qty_f = self.paper.open_short(qty, self._cache_bal, px, ts=act_ts)
+                if r.get("code") == "0":
+                    self._add_log("ENTER_SHORT", px, qty_f)
+                    self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                else:
+                    log.error(f"  ❌ paper.open_short falhou")
 
-                else:  # LIVE
-                    pos = self._cache_pos
-                    if pos and pos['side'] == 'long':
-                        self.bitget.close_long(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
-                        self._cache_pos = None
-                        log.info(f"  ↩️ LIVE REVERSAL: fechou LONG @ {px:.2f}")
-                    log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
-                    r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
-                    if r.get("code") == "00000":
-                        self._add_log("ENTER_SHORT", px, qty_f)
-                        self._cache_pos = {'side': 'short', 'size': int(qty_f / self.bitget.ct_val()), 'avg_px': px}
-                    elif r.get("code") == "SKIP":
-                        log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
-                    else:
-                        log.error(f"  ❌ bitget.open_short falhou")
+        # ══════════════════════════════════════════════════════════════════
+        # FIX: SUBMETE ENTRADAS PENDENTES IMEDIATAMENTE (apenas LIVE)
+        # Executa APÓS processar todos os exits da barra atual.
+        # Se strategy._el ou _es=True, envia market order agora —
+        # a ordem executa segundos após o fechamento desta barra,
+        # próximo ao open da próxima barra. ✓
+        # ══════════════════════════════════════════════════════════════════
+        if not self._is_paper():
+            self._submit_pending_entries_live(ts)
 
         # Sincroniza saldo e posição com o estado EXATO da estratégia
-        # (mesma fonte de verdade que o backtest usa)
         if self._is_paper():
             self.paper.balance = self.strategy.balance
             self._cache_bal    = self.strategy.balance
@@ -718,13 +810,11 @@ class LiveTrader:
     def _wait(self, tf: int = 30):
         """
         Aguarda até 500ms ANTES do fechamento do candle.
-        Acorda cedo para começar o polling imediatamente quando a API
-        disponibilizar o candle fechado, minimizando latência de execução.
         """
         now     = brazil_now()
         tf_secs = tf * 60
         elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
-        secs    = tf_secs - elapsed - 0.5   # acorda 500ms antes do close
+        secs    = tf_secs - elapsed - 0.5
         if secs < 0.5:
             secs += tf_secs
         log.info(f"⏰ Aguardando {secs:.1f}s até próximo close ({tf}m)...")
@@ -782,7 +872,6 @@ class LiveTrader:
             if bal <= 0 and px <= 0:
                 log.error("❌ Falha ao conectar na Bitget"); return
             if bal > 0:
-                # Injeta saldo real na estratégia — substitui o 1000 fixo
                 self.strategy.ic      = bal
                 self.strategy.balance = bal
                 self._cache_bal       = bal
@@ -801,7 +890,7 @@ class LiveTrader:
                 self._wait(tf)
 
                 c = None
-                for _attempt in range(40):   # até 2s de polling (40 × 50ms)
+                for _attempt in range(40):
                     raw = self._candle()
                     if raw is None:
                         time.sleep(0.05)
@@ -831,7 +920,6 @@ class LiveTrader:
 
     def _refresh_cache(self):
         if self._is_paper():
-            # Para paper: saldo vem da estratégia (fonte de verdade), preço do mercado
             px = self._mark_price()
             if px > 0:
                 self._cache_px = px
@@ -934,7 +1022,7 @@ def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=
 app      = Flask(__name__)
 _trader:   Optional[LiveTrader] = None
 _lock    = threading.Lock()
-_starting = False   # True entre o lançamento da thread e _trader ser setado
+_starting = False
 _logs: List[str] = []
 
 class _LogCap(logging.Handler):
@@ -943,7 +1031,6 @@ class _LogCap(logging.Handler):
         if len(_logs) > 300: _logs.pop(0)
 
 class _BRTFormatter(logging.Formatter):
-    """Formatter que exibe hora no fuso de Brasília (UTC-3)."""
     def formatTime(self, record, datefmt=None):
         ct = datetime.fromtimestamp(record.created, tz=BRT)
         return ct.strftime(datefmt or '%H:%M:%S')
@@ -969,8 +1056,6 @@ DASH = """<!DOCTYPE html>
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;min-height:100vh}
 .mono{font-family:'IBM Plex Mono',monospace}
 .shell{display:flex;flex-direction:column;min-height:100vh}
-
-/* Topbar */
 .topbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:14px 28px;
         display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
 .logo{font-family:'IBM Plex Mono',monospace;font-size:1.1rem;font-weight:600;color:var(--accent);letter-spacing:2px}
@@ -978,8 +1063,6 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
 .tab{padding:7px 18px;border-radius:4px;font-size:.78rem;font-weight:500;cursor:pointer;
      color:var(--muted);border:none;background:transparent;transition:.2s}
 .tab.active{background:var(--bg2);color:var(--text);border:1px solid var(--border)}
-
-/* MODE TOGGLE */
 .mode-toggle-wrap{display:flex;align-items:center;gap:0;border-radius:8px;overflow:hidden;
   border:1px solid var(--border);background:var(--bg3);padding:3px;gap:3px}
 .mode-btn{padding:8px 20px;border:none;border-radius:6px;font-size:.78rem;font-weight:700;
@@ -997,8 +1080,6 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
   border-radius:4px;white-space:nowrap}
 .mi-paper{background:rgba(155,107,255,.12);color:var(--paper);border:1px solid rgba(155,107,255,.3)}
 .mi-live{background:rgba(245,166,35,.12);color:var(--live);border:1px solid rgba(245,166,35,.3)}
-
-/* API bar */
 .apibar{background:#06090f;border-bottom:1px solid var(--border);padding:8px 28px;
         display:flex;align-items:center;gap:16px;flex-wrap:wrap;position:sticky;top:53px;z-index:99}
 .apibar-label{font-size:.58rem;font-weight:700;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
@@ -1016,12 +1097,8 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
 #apibar-msg{font-size:.7rem;font-family:'IBM Plex Mono',monospace;padding:3px 10px;border-radius:4px;display:none}
 .abm-ok{background:rgba(0,229,122,.12);color:var(--green);border:1px solid rgba(0,229,122,.3)}
 .abm-er{background:rgba(255,77,109,.12);color:var(--red);border:1px solid rgba(255,77,109,.3)}
-
-/* Main */
 .main{flex:1;padding:24px 28px}
 .panel{display:none}.panel.active{display:block}
-
-/* Controls */
 .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:24px}
 .btn{padding:10px 22px;border:none;border-radius:5px;font-size:.82rem;font-weight:600;
      cursor:pointer;letter-spacing:.5px;transition:.15s;font-family:'IBM Plex Sans',sans-serif}
@@ -1034,8 +1111,6 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
 #sysmsg{font-size:.78rem;padding:5px 14px;border-radius:4px;display:none}
 .msg-ok{background:rgba(0,229,122,.12);color:var(--green);border:1px solid var(--green)}
 .msg-er{background:rgba(255,77,109,.12);color:var(--red);border:1px solid var(--red)}
-
-/* KPI */
 .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
 .kpi{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden}
 .kpi::before{content:'';position:absolute;top:0;left:0;width:3px;height:100%;background:var(--accent)}
@@ -1046,15 +1121,11 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
 .kpi-val{font-family:'IBM Plex Mono',monospace;font-size:1.4rem;font-weight:600;color:var(--text)}
 .kpi-val.g{color:var(--green)}.kpi-val.r{color:var(--red)}.kpi-val.y{color:var(--yellow)}
 .kpi-val.p{color:var(--paper)}.kpi-val.live-c{color:var(--live)}
-
-/* Status */
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
 .dot-run{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
 .dot-warm{background:var(--yellow);animation:pulse .8s infinite}
 .dot-stop{background:var(--muted)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-
-/* Cards/tables */
 .card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin-bottom:20px}
 .card-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .card-title{font-size:.82rem;font-weight:600;color:var(--text);letter-spacing:.5px}
@@ -1069,15 +1140,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .dir{display:inline-block;padding:2px 8px;border-radius:3px;font-size:.64rem;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
 .dir-l{background:rgba(0,229,122,.12);color:var(--green);border:1px solid rgba(0,229,122,.3)}
 .dir-s{background:rgba(255,77,109,.12);color:var(--red);border:1px solid rgba(255,77,109,.3)}
-
-/* Terminal */
 .terminal{background:#050810;border:1px solid var(--border);border-radius:8px;
   font-family:'IBM Plex Mono',monospace;font-size:.7rem;line-height:1.8;
   padding:14px;max-height:260px;overflow-y:auto;color:#5a7a9a}
 .terminal .lg{color:var(--green)}.terminal .lr{color:var(--red)}
 .terminal .ly{color:var(--yellow)}.terminal .la{color:var(--accent)}
-
-/* Backtest */
 .form-row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:24px}
 .form-group{display:flex;flex-direction:column;gap:5px}
 .form-group label{font-size:.64rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
@@ -1085,45 +1152,32 @@ tr:hover td{background:rgba(255,255,255,.02)}
   color:var(--text);padding:8px 12px;border-radius:5px;font-family:'IBM Plex Mono',monospace;font-size:.8rem;width:150px}
 .progress-bar{height:3px;background:var(--border);border-radius:2px;margin-bottom:20px;overflow:hidden}
 .progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:2px;transition:width .3s}
-
-/* Mode change toast */
 .mode-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
   padding:12px 28px;border-radius:8px;font-family:'IBM Plex Mono',monospace;font-size:.82rem;
   font-weight:600;z-index:999;display:none;animation:fadeUp .3s ease}
 @keyframes fadeUp{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
 .toast-paper{background:rgba(155,107,255,.2);color:#c8a0ff;border:1px solid rgba(155,107,255,.5)}
 .toast-live{background:rgba(245,166,35,.2);color:#ffd080;border:1px solid rgba(245,166,35,.5)}
-
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style>
 </head>
 <body>
 <div class="shell">
-
-  <!-- ═══ TOPBAR ═══ -->
   <div class="topbar">
     <span class="logo">⚡ AZLEMA</span>
     <span class="mono" style="font-size:.7rem;color:var(--muted)">ETH-USDT · 30m · Bitget</span>
-
     <div class="mode-toggle-wrap" title="Selecionar modo de operação">
-      <button class="mode-btn paper-btn" id="btnPaper" onclick="setMode('paper')">
-        📄 PAPER
-      </button>
-      <button class="mode-btn live-btn" id="btnLive" onclick="setMode('live')">
-        💰 LIVE 95%
-      </button>
+      <button class="mode-btn paper-btn" id="btnPaper" onclick="setMode('paper')">📄 PAPER</button>
+      <button class="mode-btn live-btn" id="btnLive" onclick="setMode('live')">💰 LIVE 95%</button>
     </div>
     <span class="mode-indicator" id="modeIndicator">—</span>
-
     <div class="tabs" style="margin-left:auto">
       <button class="tab active" onclick="switchTab('live')">Live</button>
       <button class="tab" onclick="switchTab('history')">Histórico</button>
       <button class="tab" onclick="switchTab('backtest')">Backtest</button>
     </div>
   </div>
-
-  <!-- ═══ API BAR ═══ -->
   <div class="apibar">
     <span class="apibar-label">API RÁPIDA</span>
     <div class="apibar-group">
@@ -1149,17 +1203,13 @@ tr:hover td{background:rgba(255,255,255,.02)}
     </div>
     <div id="apibar-msg"></div>
   </div>
-
   <div class="main">
-
-    <!-- ═══ LIVE PANEL ═══ -->
     <div class="panel active" id="panel-live">
       <div class="controls">
         <button class="btn btn-go"   id="btnStart" onclick="ctrl('start')">▶ Iniciar</button>
         <button class="btn btn-stop" id="btnStop"  onclick="ctrl('stop')">■ Parar</button>
         <span id="sysmsg"></span>
       </div>
-
       <div class="kpi-grid">
         <div class="kpi"><div class="kpi-lbl">Status</div><div class="kpi-val" id="lv-status">—</div></div>
         <div class="kpi g"><div class="kpi-lbl">Saldo</div><div class="kpi-val g" id="lv-bal">—</div></div>
@@ -1173,7 +1223,6 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <div class="kpi-val live-c" id="lv-mode">—</div>
         </div>
       </div>
-
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
@@ -1183,19 +1232,13 @@ tr:hover td{background:rgba(255,255,255,.02)}
           </table>
         </div>
       </div>
-
       <div class="card">
         <div class="card-head"><span class="card-title">LOG DO SISTEMA</span></div>
         <div style="padding:0"><div class="terminal" id="lv-log">aguardando...</div></div>
       </div>
     </div>
-
-    <!-- ═══ HISTORY PANEL ═══ -->
     <div class="panel" id="panel-history">
-      <div id="hist-session-banner" style="
-        display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
-        background:var(--bg2);border:1px solid var(--border);border-radius:8px;
-        padding:14px 18px;margin-bottom:20px">
+      <div id="hist-session-banner" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:14px 18px;margin-bottom:20px">
         <div style="display:flex;align-items:center;gap:10px">
           <span style="font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Sessão atual</span>
           <span id="hist-session-mode" class="mode-indicator mi-paper">📄 PAPER</span>
@@ -1203,18 +1246,9 @@ tr:hover td{background:rgba(255,255,255,.02)}
         </div>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem" onclick="loadHistory()">↺ Atualizar</button>
-          <button class="btn" style="padding:7px 16px;font-size:.74rem;background:rgba(0,212,255,.1);color:var(--accent);border:1px solid rgba(0,212,255,.3)"
-            onclick="newPaperSession()">
-            🆕 Nova Sessão
-          </button>
-          <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem;color:var(--red);border-color:rgba(255,77,109,.3)"
-            onclick="if(confirm('Limpar TODO o histórico de Paper/Live?'))clearHistory()">🗑 Limpar tudo</button>
+          <button class="btn" style="padding:7px 16px;font-size:.74rem;background:rgba(0,212,255,.1);color:var(--accent);border:1px solid rgba(0,212,255,.3)" onclick="newPaperSession()">🆕 Nova Sessão</button>
+          <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem;color:var(--red);border-color:rgba(255,77,109,.3)" onclick="if(confirm('Limpar TODO o histórico de Paper/Live?'))clearHistory()">🗑 Limpar tudo</button>
         </div>
-      </div>
-      <div style="font-size:.7rem;color:var(--muted);margin-bottom:16px;font-family:'IBM Plex Mono',monospace;
-        background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);border-radius:6px;padding:10px 14px">
-        ℹ️ Esta aba mostra apenas trades <strong style="color:var(--text)">Paper / Live</strong>.
-        Os trades de <strong style="color:var(--yellow)">Backtest</strong> ficam separados na aba → <strong style="color:var(--yellow)">Backtest</strong>.
       </div>
       <div class="kpi-grid">
         <div class="kpi"><div class="kpi-lbl">Total Trades</div><div class="kpi-val" id="h-total">—</div></div>
@@ -1237,39 +1271,20 @@ tr:hover td{background:rgba(255,255,255,.02)}
         </div>
       </div>
     </div>
-
-    <!-- ═══ BACKTEST PANEL ═══ -->
     <div class="panel" id="panel-backtest">
       <div class="form-row">
         <div class="form-group"><label>Símbolo</label><input id="bt-sym" value="ETH-USDT-SWAP"></div>
         <div class="form-group"><label>Timeframe</label>
-          <select id="bt-tf">
-            <option value="30m" selected>30m</option>
-            <option value="1h">1h</option><option value="4h">4h</option>
-            <option value="1d">1d</option><option value="15m">15m</option>
-          </select>
+          <select id="bt-tf"><option value="30m" selected>30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option><option value="15m">15m</option></select>
         </div>
         <div class="form-group"><label>Candles</label><input id="bt-lim" type="number" value="500" min="100" max="5000"></div>
         <div class="form-group"><label>Capital Inicial</label><input id="bt-cap" type="number" value="1000" min="100"></div>
-        <div class="form-group">
-          <label>Taxa Abertura %</label>
-          <input id="bt-ofee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px">
-        </div>
-        <div class="form-group">
-          <label>Taxa Fechamento %</label>
-          <input id="bt-cfee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px">
-        </div>
+        <div class="form-group"><label>Taxa Abertura %</label><input id="bt-ofee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px"></div>
+        <div class="form-group"><label>Taxa Fechamento %</label><input id="bt-cfee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px"></div>
         <div style="display:flex;flex-direction:column;gap:5px;justify-content:flex-end">
           <button class="btn btn-accent" id="btnBT" onclick="runBacktest()">▶ Executar</button>
-          <button class="btn btn-sec" style="font-size:.72rem;padding:6px 12px"
-            onclick="document.getElementById('bt-ofee').value='0';document.getElementById('bt-cfee').value='0'">Sem taxas</button>
+          <button class="btn btn-sec" style="font-size:.72rem;padding:6px 12px" onclick="document.getElementById('bt-ofee').value='0';document.getElementById('bt-cfee').value='0'">Sem taxas</button>
         </div>
-      </div>
-      <div style="font-size:.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;
-        background:rgba(255,217,74,.04);border:1px solid rgba(255,217,74,.12);border-radius:5px;
-        padding:8px 14px;margin-bottom:18px">
-        💡 <strong style="color:var(--yellow)">Bitget Futures (taker):</strong> 0.06% abertura + 0.06% fechamento &nbsp;|&nbsp;
-        <strong style="color:var(--yellow)">Maker:</strong> 0.02% + 0.02%
       </div>
       <div class="progress-bar"><div class="progress-fill" id="bt-prog" style="width:0%"></div></div>
       <div id="bt-result" style="display:none">
@@ -1278,8 +1293,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
             <table>
-              <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                         <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr></thead>
+              <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr></thead>
               <tbody id="bt-tbl"></tbody>
             </table>
           </div>
@@ -1289,23 +1303,17 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th>
-                       <th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr></thead>
+            <thead><tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr></thead>
             <tbody id="bt-hist-tbl"><tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr></tbody>
           </table>
         </div>
       </div>
     </div>
-
   </div>
 </div>
-
-<!-- Mode toast -->
 <div class="mode-toast" id="modeToast"></div>
-
 <script>
 let _currentMode = 'paper';
-
 function updateModeUI(mode) {
   _currentMode = mode;
   const isPaper = mode === 'paper';
@@ -1319,7 +1327,6 @@ function updateModeUI(mode) {
   const kpiMode = document.getElementById('kpi-mode');
   if (kpiMode) kpiMode.className = 'kpi ' + (isPaper ? 'p' : 'live-kpi');
 }
-
 async function setMode(mode) {
   const running = document.getElementById('btnStop').disabled === false;
   if (running) {
@@ -1336,7 +1343,6 @@ async function setMode(mode) {
   } catch (e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
   setTimeout(() => m.style.display = 'none', 4000);
 }
-
 function showToast(mode) {
   const t = document.getElementById('modeToast');
   t.className = 'mode-toast ' + (mode === 'paper' ? 'toast-paper' : 'toast-live');
@@ -1344,7 +1350,6 @@ function showToast(mode) {
   t.style.display = 'block';
   setTimeout(() => t.style.display = 'none', 4000);
 }
-
 function switchTab(t) {
   document.querySelectorAll('.tab').forEach((el,i) => { el.classList.toggle('active', ['live','history','backtest'][i] === t); });
   document.querySelectorAll('.panel').forEach(el => el.classList.remove('active'));
@@ -1352,7 +1357,6 @@ function switchTab(t) {
   if (t === 'history') loadHistory();
   if (t === 'backtest') loadBtHistory();
 }
-
 async function poll() {
   try {
     const d = await (await fetch('/status')).json();
@@ -1396,7 +1400,6 @@ async function poll() {
   } catch(e) { console.error(e); }
 }
 poll(); setInterval(poll, 4000);
-
 async function ctrl(a) {
   const m = document.getElementById('sysmsg');
   m.style.display = 'inline-block'; m.className = a === 'start' ? 'msg-ok' : 'msg-er';
@@ -1407,7 +1410,6 @@ async function ctrl(a) {
   } catch { m.className = 'msg-er'; m.textContent = 'Erro de rede'; }
   setTimeout(() => m.style.display = 'none', 5000); setTimeout(poll, 1500);
 }
-
 async function loadHistory() {
   try {
     const d = await (await fetch('/history')).json();
@@ -1439,9 +1441,7 @@ async function loadHistory() {
     }).join('');
   } catch(e) { console.error(e); }
 }
-
 async function clearHistory() { await fetch('/history/clear', { method: 'POST' }); loadHistory(); }
-
 async function newPaperSession() {
   if (!confirm('Iniciar nova sessão? Isso vai limpar os trades Paper/Live atuais.')) return;
   const m = document.getElementById('apibar-msg');
@@ -1449,7 +1449,6 @@ async function newPaperSession() {
   await fetch('/history/clear', { method: 'POST' }); loadHistory();
   setTimeout(() => m.style.display = 'none', 3000);
 }
-
 async function runBacktest() {
   const btn = document.getElementById('btnBT'), prog = document.getElementById('bt-prog');
   btn.disabled = true; btn.textContent = 'Rodando...'; prog.style.width = '20%';
@@ -1466,7 +1465,6 @@ async function runBacktest() {
   } catch(e) { alert('Erro: ' + e); }
   finally { btn.disabled = false; btn.textContent = '▶ Executar'; setTimeout(() => prog.style.width = '0%', 1000); }
 }
-
 function renderBacktestResult(d) {
   const pf = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
   const hasFees = d.fees_enabled && (d.open_fee_pct > 0 || d.close_fee_pct > 0);
@@ -1493,7 +1491,6 @@ function renderBacktestResult(d) {
   }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
   document.getElementById('bt-result').style.display = 'block';
 }
-
 async function loadBtHistory() {
   try {
     const d = await (await fetch('/backtest/history')).json();
@@ -1508,7 +1505,6 @@ async function loadBtHistory() {
   } catch(e) { console.error(e); }
 }
 loadBtHistory();
-
 async function apiPost(route, successMsg) {
   const m = document.getElementById('apibar-msg');
   m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '...';
@@ -1518,7 +1514,6 @@ async function apiPost(route, successMsg) {
   } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
   setTimeout(() => m.style.display = 'none', 3500); setTimeout(poll, 1200);
 }
-
 async function exportJson(route, filename) {
   const m = document.getElementById('apibar-msg');
   m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = 'Exportando...';
@@ -1531,7 +1526,6 @@ async function exportJson(route, filename) {
   } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
   setTimeout(() => m.style.display = 'none', 3000);
 }
-
 async function quickBacktest() {
   const sym = prompt('Símbolo (ex: ETH-USDT-SWAP)', 'ETH-USDT-SWAP'); if (!sym) return;
   const tf  = prompt('Timeframe', '30m'); if (!tf) return;
@@ -1569,11 +1563,10 @@ def _thread():
     finally:
         with _lock:
             _trader   = None
-            _starting = False   # libera para novo start
+            _starting = False
         log.info("🔄 Pronto para re-iniciar")
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
 @app.route('/')
 def index(): return DASH
 
@@ -1628,7 +1621,7 @@ def start():
             return jsonify({"message": "Já está rodando"})
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
-        _starting = True   # bloqueia imediatamente — antes de lançar a thread
+        _starting = True
         threading.Thread(target=_thread, daemon=True).start()
         mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
         return jsonify({"message": f"Iniciado em modo {mode_str}"})
