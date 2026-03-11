@@ -546,94 +546,6 @@ class LiveTrader:
     def live_pnl(self):
         return self.strategy.net_profit - self._pnl_baseline
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # FIX: SUBMIT ENTRADAS PENDENTES IMEDIATAMENTE (apenas LIVE)
-    # ═══════════════════════════════════════════════════════════════════════
-    def _submit_pending_entries_live(self, ts):
-        """
-        Após processar o fechamento de bar N:
-          - Se a estratégia agendou _el=True ou _es=True (sinal confirmado),
-            submete a ordem market AGORA, antes de bar N+1 abrir.
-          - A ordem executa ao preço atual ≈ open de bar N+1.
-          - confirm_fill() sincroniza o estado interno da estratégia e
-            zera _el/_es para que _exec_open do próximo ciclo seja no-op.
-
-        SEM efeito em Paper Trading (paper usa o fluxo original via _exec_open).
-        """
-        if self._is_paper():
-            return  # Paper: fluxo original sem alteração
-
-        # Busca preço atual de mercado (usado para contabilidade/logging)
-        px = self._mark_price() or self._cache_px
-        if px <= 0:
-            log.warning("  ⚠️ _submit_pending_entries_live: preço indisponível, pulando")
-            return
-
-        # ── ENTRADA LONG PENDENTE ────────────────────────────────────────
-        if self.strategy._el and self.strategy.position_size <= 0.0:
-            qty = self.strategy._lots()
-            if qty <= 0:
-                log.warning("  ⚠️ LONG pendente: qty=0, cancelado")
-                self.strategy._el = False
-                return
-
-            # Reversão: fecha SHORT antes de abrir LONG
-            pos = self._cache_pos
-            if pos and pos['side'] == 'short':
-                log.info(f"  ↩️ LIVE REVERSAL (pending): fechando SHORT @ {px:.2f}")
-                self.bitget.close_short(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
-                self._cache_pos = None
-
-            log.info(f"  🟢 LIVE ENTER LONG [IMEDIATO após close bar] "
-                     f"{qty:.6f} ETH @ {px:.2f}")
-            r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
-
-            if r.get("code") == "00000":
-                # confirm_fill: atualiza position_size, position_price, _el=False
-                self.strategy.confirm_fill('BUY', px, qty_f, ts)
-                self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
-                self._cache_bal = self.strategy.balance
-                self._add_log("ENTER_LONG", px, qty_f, "PENDING_IMEDIATO")
-                log.info(f"  ✅ LONG submetido | qty={qty_f:.4f} px={px:.2f}")
-            elif r.get("code") == "SKIP":
-                log.warning(f"  ⛔ LONG pendente ignorado — {r.get('msg')}")
-                self.strategy._el = False
-            else:
-                log.error(f"  ❌ bitget.open_long falhou — _el mantido para retry")
-                # Mantém _el=True para tentar no próximo ciclo via _exec_open normal
-
-        # ── ENTRADA SHORT PENDENTE ───────────────────────────────────────
-        if self.strategy._es and self.strategy.position_size >= 0.0:
-            qty = self.strategy._lots()
-            if qty <= 0:
-                log.warning("  ⚠️ SHORT pendente: qty=0, cancelado")
-                self.strategy._es = False
-                return
-
-            # Reversão: fecha LONG antes de abrir SHORT
-            pos = self._cache_pos
-            if pos and pos['side'] == 'long':
-                log.info(f"  ↩️ LIVE REVERSAL (pending): fechando LONG @ {px:.2f}")
-                self.bitget.close_long(pos['size'] * self.bitget.ct_val(), px, "REVERSAL")
-                self._cache_pos = None
-
-            log.info(f"  🔴 LIVE ENTER SHORT [IMEDIATO após close bar] "
-                     f"{qty:.6f} ETH @ {px:.2f}")
-            r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
-
-            if r.get("code") == "00000":
-                # confirm_fill: atualiza position_size, position_price, _es=False
-                self.strategy.confirm_fill('SELL', px, qty_f, ts)
-                self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                self._cache_bal = self.strategy.balance
-                self._add_log("ENTER_SHORT", px, qty_f, "PENDING_IMEDIATO")
-                log.info(f"  ✅ SHORT submetido | qty={qty_f:.4f} px={px:.2f}")
-            elif r.get("code") == "SKIP":
-                log.warning(f"  ⛔ SHORT pendente ignorado — {r.get('msg')}")
-                self.strategy._es = False
-            else:
-                log.error(f"  ❌ bitget.open_short falhou — _es mantido para retry")
-
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
         close_px = float(candle['close'])
@@ -734,75 +646,91 @@ class LiveTrader:
 
             # ── ENTER LONG (BUY) ──────────────────────────────────────────
             elif kind == 'BUY':
-                if not self._is_paper():
-                    log.info(f"  ℹ️ BUY de _exec_open ignorado em LIVE "
-                             f"(entrada já tratada via _submit_pending_entries_live)")
-                    continue
-
-                # Paper: comportamento original via _exec_open ──────────
-                cur = self.paper.get_position()
-                if cur and cur['side'] == 'long':
-                    log.info("  ⏭️ BUY ignorado — já tem long aberto")
-                    continue
-
-                px  = act_px  if act_px  > 0 else close_px
                 qty = act_qty if act_qty > 0 else 0.0
-
                 if qty <= 0:
-                    log.warning("  ⚠️ BUY ignorado — qty=0 vindo da estratégia")
+                    log.warning("  ⚠️ BUY ignorado — qty=0")
                     continue
 
-                pos = self.paper.get_position()
-                if pos and pos['side'] == 'short':
-                    self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
-                    self._cache_pos = None
-                    log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
-                log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
-                r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
-                if r.get("code") == "0":
-                    self._add_log("ENTER_LONG", px, qty_f)
-                    self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                if self._is_paper():
+                    # Paper: usa o preço histórico do open (idêntico ao backtest)
+                    px = act_px if act_px > 0 else close_px
+                    pos = self.paper.get_position()
+                    if pos and pos['side'] == 'long':
+                        log.info("  ⏭️ BUY ignorado — já tem long aberto")
+                        continue
+                    if pos and pos['side'] == 'short':
+                        self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
+                        self._cache_pos = None
+                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
+                    log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
+                    r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
+                    if r.get("code") == "0":
+                        self._add_log("ENTER_LONG", px, qty_f)
+                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                    else:
+                        log.error(f"  ❌ paper.open_long falhou")
+
                 else:
-                    log.error(f"  ❌ paper.open_long falhou")
+                    # LIVE: usa preço de mercado atual (≈ open da próxima barra)
+                    # _exec_open calculou qty e timing corretos; só ajustamos o preço real
+                    px = self._mark_price() or close_px
+                    log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
+                    r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
+                    if r.get("code") == "00000":
+                        # confirm_fill: corrige position_price/qty para valores reais
+                        # (sobrescreve os valores "phantom" que _exec_open usou)
+                        self.strategy.confirm_fill('BUY', px, qty_f, ts)
+                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                        self._cache_bal = self.strategy.balance
+                        self._add_log("ENTER_LONG", px, qty_f)
+                        log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
+                    elif r.get("code") == "SKIP":
+                        log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
+                    else:
+                        log.error(f"  ❌ bitget.open_long falhou")
 
             # ── ENTER SHORT (SELL) ────────────────────────────────────────
             elif kind == 'SELL':
-                if not self._is_paper():
-                    log.info(f"  ℹ️ SELL de _exec_open ignorado em LIVE "
-                             f"(entrada já tratada via _submit_pending_entries_live)")
-                    continue
-
-                # Paper: comportamento original via _exec_open ──────────
-                cur = self.paper.get_position()
-                if cur and cur['side'] == 'short':
-                    log.info("  ⏭️ SELL ignorado — já tem short aberto")
-                    continue
-
-                px  = act_px  if act_px  > 0 else close_px
                 qty = act_qty if act_qty > 0 else 0.0
-
                 if qty <= 0:
-                    log.warning("  ⚠️ SELL ignorado — qty=0 vindo da estratégia")
+                    log.warning("  ⚠️ SELL ignorado — qty=0")
                     continue
 
-                pos = self.paper.get_position()
-                if pos and pos['side'] == 'long':
-                    self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
-                    self._cache_pos = None
-                    log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
-                log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
-                r, qty_f = self.paper.open_short(qty, self._cache_bal, px, ts=act_ts)
-                if r.get("code") == "0":
-                    self._add_log("ENTER_SHORT", px, qty_f)
-                    self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                else:
-                    log.error(f"  ❌ paper.open_short falhou")
+                if self._is_paper():
+                    # Paper: usa o preço histórico do open (idêntico ao backtest)
+                    px = act_px if act_px > 0 else close_px
+                    pos = self.paper.get_position()
+                    if pos and pos['side'] == 'short':
+                        log.info("  ⏭️ SELL ignorado — já tem short aberto")
+                        continue
+                    if pos and pos['side'] == 'long':
+                        self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
+                        self._cache_pos = None
+                        log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
+                    log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
+                    r, qty_f = self.paper.open_short(qty, self._cache_bal, px, ts=act_ts)
+                    if r.get("code") == "0":
+                        self._add_log("ENTER_SHORT", px, qty_f)
+                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                    else:
+                        log.error(f"  ❌ paper.open_short falhou")
 
-        # ══════════════════════════════════════════════════════════════════
-        # FIX: SUBMETE ENTRADAS PENDENTES IMEDIATAMENTE (apenas LIVE)
-        # ══════════════════════════════════════════════════════════════════
-        if not self._is_paper():
-            self._submit_pending_entries_live(ts)
+                else:
+                    # LIVE: usa preço de mercado atual (≈ open da próxima barra)
+                    px = self._mark_price() or close_px
+                    log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
+                    r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
+                    if r.get("code") == "00000":
+                        # confirm_fill: corrige position_price/qty para valores reais
+                        self.strategy.confirm_fill('SELL', px, qty_f, ts)
+                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                        self._cache_bal = self.strategy.balance
+                        self._add_log("ENTER_SHORT", px, qty_f)
+                        log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
+                    elif r.get("code") == "SKIP":
+                        log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
+                    else:
+                        log.error(f"  ❌ bitget.open_short falhou")
 
         # Sincroniza saldo e posição com o estado EXATO da estratégia
         if self._is_paper():
