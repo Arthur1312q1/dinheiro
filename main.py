@@ -26,6 +26,24 @@ SOLUÇÃO (_submit_pending_entries_live):
     → No próximo ciclo, _exec_open encontra _el/_es=False (sem duplicata)
 
   Paper trading NÃO foi alterado (funciona corretamente via _exec_open).
+
+══════════════════════════════════════════════════════════════════════
+FIX v3 — CANDLE LIDO COM 1 BARRA DE ATRASO (2025)
+══════════════════════════════════════════════════════════════════════
+PROBLEMA RAIZ:
+  _wait() acordava 0.5s ANTES do fechamento da barra.
+  Neste momento a API Bitget ainda retorna:
+    data[0] = barra atual (ainda formando)
+    data[1] = barra anterior (fechada há 30 minutos!)  ← ERRADO
+  Resultado: cada candle era processado com 30 minutos de atraso,
+  fazendo exits e entradas sempre uma barra atrasados.
+
+SOLUÇÃO:
+  _wait() agora acorda 3s APÓS o fechamento da barra.
+  Neste momento a API já atualizou:
+    data[0] = nova barra (começando a formar)
+    data[1] = barra recém-fechada  ✓
+  Polling: intervalo de 1s (era 50ms) e 30 tentativas (era 40×50ms=2s).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -716,13 +734,6 @@ class LiveTrader:
 
             # ── ENTER LONG (BUY) ──────────────────────────────────────────
             elif kind == 'BUY':
-                # ════════════════════════════════════════════════════════
-                # LIVE: Este BUY vem do _exec_open que usa candle.open JÁ
-                # PASSADO (a barra fechou há instantes). Em LIVE, a entrada
-                # é submetida por _submit_pending_entries_live() logo abaixo,
-                # IMEDIATAMENTE após o fechamento da barra ANTERIOR.
-                # Ignorar aqui evita submeter com 30 minutos de atraso.
-                # ════════════════════════════════════════════════════════
                 if not self._is_paper():
                     log.info(f"  ℹ️ BUY de _exec_open ignorado em LIVE "
                              f"(entrada já tratada via _submit_pending_entries_live)")
@@ -756,10 +767,6 @@ class LiveTrader:
 
             # ── ENTER SHORT (SELL) ────────────────────────────────────────
             elif kind == 'SELL':
-                # ════════════════════════════════════════════════════════
-                # LIVE: mesmo motivo do BUY acima — usar
-                # _submit_pending_entries_live() para timing correto.
-                # ════════════════════════════════════════════════════════
                 if not self._is_paper():
                     log.info(f"  ℹ️ SELL de _exec_open ignorado em LIVE "
                              f"(entrada já tratada via _submit_pending_entries_live)")
@@ -793,10 +800,6 @@ class LiveTrader:
 
         # ══════════════════════════════════════════════════════════════════
         # FIX: SUBMETE ENTRADAS PENDENTES IMEDIATAMENTE (apenas LIVE)
-        # Executa APÓS processar todos os exits da barra atual.
-        # Se strategy._el ou _es=True, envia market order agora —
-        # a ordem executa segundos após o fechamento desta barra,
-        # próximo ao open da próxima barra. ✓
         # ══════════════════════════════════════════════════════════════════
         if not self._is_paper():
             self._submit_pending_entries_live(ts)
@@ -809,15 +812,19 @@ class LiveTrader:
 
     def _wait(self, tf: int = 30):
         """
-        Aguarda até 500ms ANTES do fechamento do candle.
+        Aguarda até 1s APÓS o fechamento do candle.
+
+        Acorda 1s depois do close: API Bitget já atualizou data[1]
+        com a barra recém-fechada. O polling de 200ms cobre os casos
+        em que a API ainda não atualizou nesse primeiro segundo.
         """
         now     = brazil_now()
         tf_secs = tf * 60
         elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
-        secs    = tf_secs - elapsed - 0.5
+        secs    = tf_secs - elapsed + 1.0   # 1s APÓS o close
         if secs < 0.5:
             secs += tf_secs
-        log.info(f"⏰ Aguardando {secs:.1f}s até próximo close ({tf}m)...")
+        log.info(f"⏰ Aguardando {secs:.1f}s até próximo close+1s ({tf}m)...")
         time.sleep(secs)
 
     def _candle(self) -> Optional[Dict]:
@@ -889,27 +896,27 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
+                # ── Polling: aguarda até 4s para a API atualizar ──────────
+                # 200ms entre tentativas × 20 = 4s max.
+                # Rápido o suficiente para não atrasar entradas live.
                 c = None
-                for _attempt in range(40):
+                for _attempt in range(20):
                     raw = self._candle()
                     if raw is None:
-                        time.sleep(0.05)
+                        time.sleep(0.2)
                         continue
                     if str(raw['timestamp']) == self._last_candle_ts:
-                        if _attempt < 39:
-                            log.info(f"  ⏳ Aguardando novo candle na API (tentativa {_attempt+1}/40)...")
-                            time.sleep(0.05)
-                            continue
-                        log.warning("  ⚠️ Candle não atualizou após 40 tentativas — próximo ciclo")
-                        break
+                        time.sleep(0.2)
+                        continue
                     c = raw
                     break
 
                 if c is None:
+                    log.warning("  ⚠️ Candle não atualizou após 4s — pulando ciclo")
                     continue
 
                 ts = str(c['timestamp'])
-                log.info(f"  ✅ Novo candle: {ts} (latência: {_attempt} retry(s))")
+                log.info(f"  ✅ Novo candle: {ts} (tentativa {_attempt+1})")
                 self._last_candle_ts = ts
                 self._refresh_cache()
                 self.process(c)
