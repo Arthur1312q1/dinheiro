@@ -740,22 +740,30 @@ class LiveTrader:
 
     def _wait(self, tf: int = 30):
         """
-        Aguarda até 1s APÓS o fechamento do candle.
-
-        Acorda 1s depois do close: API Bitget já atualizou data[1]
-        com a barra recém-fechada. O polling de 200ms cobre os casos
-        em que a API ainda não atualizou nesse primeiro segundo.
+        Aguarda até 500ms APÓS o fechamento do candle.
+        Bitget fecha a barra e atualiza data[0] quase instantaneamente.
+        500ms é suficiente para garantir que a API atualizou.
         """
         now     = brazil_now()
         tf_secs = tf * 60
         elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
-        secs    = tf_secs - elapsed + 1.0   # 1s APÓS o close
-        if secs < 0.5:
+        secs    = tf_secs - elapsed + 0.5   # 500ms APÓS o close
+        if secs < 0.1:
             secs += tf_secs
-        log.info(f"⏰ Aguardando {secs:.1f}s até próximo close+1s ({tf}m)...")
+        log.info(f"⏰ Aguardando {secs:.1f}s até próximo close+0.5s ({tf}m)...")
         time.sleep(secs)
 
     def _candle(self) -> Optional[Dict]:
+        """
+        Busca o último candle FECHADO da Bitget.
+
+        A API retorna candles em ordem DECRESCENTE (mais recente primeiro).
+        Após o close, data[0] = barra recém-fechada (CORRETA).
+        data[1] seria a barra ANTERIOR — por isso usamos data[0].
+
+        O _last_candle_ts no loop garante que não processamos a mesma barra
+        duas vezes caso a API ainda não tenha atualizado.
+        """
         TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
               "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
         tf = TF.get(TIMEFRAME, "30m")
@@ -766,7 +774,7 @@ class LiveTrader:
                     "symbol":      "ETHUSDT",
                     "productType": "usdt-futures",
                     "granularity": tf,
-                    "limit":       "3",
+                    "limit":       "2",
                 },
                 timeout=10,
             ).json()
@@ -774,10 +782,11 @@ class LiveTrader:
                 log.error(f"  ❌ Bitget candles API: code={r.get('code')} msg={r.get('msg')}")
                 return None
             data = r.get("data", [])
-            if len(data) < 2:
-                log.warning(f"  ⚠️ Bitget retornou menos de 2 candles (len={len(data)})")
+            if not data:
+                log.warning(f"  ⚠️ Bitget retornou 0 candles")
                 return None
-            c = data[1]
+            # data[0] = barra mais recente (recém-fechada após o close)
+            c = data[0]
             candle = {
                 'open':      float(c[1]),
                 'high':      float(c[2]),
