@@ -7,17 +7,17 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v4 — CORREÇÃO PARA REPLICAR BACKTEST (2025)
+FIX v5 — TEMPORIZAÇÃO PRECISA (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA RAIZ:
-  - Leitura do candle: usava data[0] (barra em formação) em vez de data[1] (última fechada).
-  - Execução de entradas: era feita imediatamente após o close, enquanto no backtest ocorre no open da próxima barra.
-  - Saldo da estratégia não era atualizado com o saldo real.
+  O método _wait() anterior usava um offset fixo de 2s após o fechamento,
+  mas não garantia execução no momento exato, podendo variar.
 
 SOLUÇÃO:
-  - _candle() agora retorna data[1] (último candle fechado).
-  - Entradas live são agendadas e executadas no open do próximo candle.
-  - Saldo sincronizado após cada ordem.
+  Agora _wait() calcula o próximo horário de fechamento (0 ou 30 minutos)
+  e dorme exatamente até HH:00:00.010 ou HH:30:00.010 (10 ms após o close).
+  Isso sincroniza perfeitamente com o fim de cada candle e dá tempo para
+  a API atualizar.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -727,16 +727,23 @@ class LiveTrader:
 
     def _wait(self, tf: int = 30):
         """
-        Aguarda até 2 segundos APÓS o fechamento do candle.
+        Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010).
         """
-        now     = brazil_now()
-        tf_secs = tf * 60
-        elapsed = (now.minute % tf) * 60 + now.second + now.microsecond / 1_000_000
-        secs    = tf_secs - elapsed + 2.0   # 2 segundos após o close
-        if secs < 0.1:
-            secs += tf_secs
-        log.info(f"⏰ Aguardando {secs:.1f}s até próximo close+2s ({tf}m)...")
-        time.sleep(secs)
+        now = brazil_now()
+        current_minute = now.minute
+        if current_minute < 30:
+            target_minute = 30
+        else:
+            target_minute = 60  # próximo minuto 0 da hora seguinte
+
+        target = now.replace(minute=target_minute if target_minute < 60 else 0,
+                             second=0, microsecond=10_000)  # 10 ms após o segundo 0
+        if target <= now:
+            target += timedelta(minutes=30)
+
+        sleep_seconds = (target - now).total_seconds()
+        log.info(f"⏰ Aguardando {sleep_seconds:.3f}s até {target.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
+        time.sleep(sleep_seconds)
 
     def _candle(self) -> Optional[Dict]:
         """
