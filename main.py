@@ -727,17 +727,22 @@ class LiveTrader:
 
     def _wait(self, tf: int = 30):
         """
-        Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010).
+        Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010) no fuso BRT.
         """
         now = brazil_now()
-        current_minute = now.minute
-        if current_minute < 30:
-            target_minute = 30
-        else:
-            target_minute = 60  # próximo minuto 0 da hora seguinte
+        minute = now.minute
 
-        target = now.replace(minute=target_minute if target_minute < 60 else 0,
-                             second=0, microsecond=10_000)  # 10 ms após o segundo 0
+        # Define o próximo alvo: se minute < 30, alvo é 30; senão, próximo minuto 0 da hora seguinte
+        if minute < 30:
+            target_minute = 30
+            target_hour = now.hour
+        else:
+            target_minute = 0
+            target_hour = now.hour + 1 if now.hour < 23 else 0  # ajuste para virada de dia
+
+        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=10_000)  # 10ms após o segundo 0
+
+        # Se target já passou (pode acontecer se agora já for após o alvo), adiciona 30 minutos
         if target <= now:
             target += timedelta(minutes=30)
 
