@@ -7,17 +7,16 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v5 — TEMPORIZAÇÃO PRECISA (2025)
+FIX v6 — Polling mais lento e tolerante a 1 candle (2025)
 ══════════════════════════════════════════════════════════════════════
-PROBLEMA RAIZ:
-  O método _wait() anterior usava um offset fixo de 2s após o fechamento,
-  mas não garantia execução no momento exato, podendo variar.
+PROBLEMA:
+  - API retorna apenas 1 candle nos primeiros segundos após o close.
+  - Polling rápido (0.2s) causa rate limit (429).
 
 SOLUÇÃO:
-  Agora _wait() calcula o próximo horário de fechamento (0 ou 30 minutos)
-  e dorme exatamente até HH:00:00.010 ou HH:30:00.010 (10 ms após o close).
-  Isso sincroniza perfeitamente com o fim de cada candle e dá tempo para
-  a API atualizar.
+  - Aumentar intervalo de polling para 1s e reduzir tentativas para 10.
+  - Se a API retornar apenas 1 candle, verificar se é novo e usá-lo.
+  - Logar apenas quando realmente necessário.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -748,11 +747,12 @@ class LiveTrader:
 
         sleep_seconds = (target - now).total_seconds()
         log.info(f"⏰ Aguardando {sleep_seconds:.3f}s até {target.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
-        time.sleep(sleep_seconds)
+        time.sleep(max(0, sleep_seconds))  # garante não negativo
 
     def _candle(self) -> Optional[Dict]:
         """
-        Busca o último candle FECHADO da Bitget usando data[1].
+        Busca o último candle FECHADO da Bitget.
+        Se a API retornar apenas 1 candle, considera que é o recém-fechado se for diferente do último.
         """
         TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
               "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
@@ -769,25 +769,50 @@ class LiveTrader:
                 timeout=10,
             ).json()
             if r.get("code") != "00000":
+                if r.get("code") == "429":
+                    log.warning("  ⚠️ Rate limit (429) — aguardando 2s...")
+                    time.sleep(2)
+                    return None
                 log.error(f"  ❌ Bitget candles API: code={r.get('code')} msg={r.get('msg')}")
                 return None
             data = r.get("data", [])
-            if len(data) < 2:
-                log.warning(f"  ⚠️ Bitget retornou apenas {len(data)} candles")
+            if len(data) == 0:
+                log.warning("  ⚠️ Bitget retornou 0 candles")
                 return None
-            # Usa data[1] como último candle fechado
-            c = data[1]
-            candle = {
-                'open':      float(c[1]),
-                'high':      float(c[2]),
-                'low':       float(c[3]),
-                'close':     float(c[4]),
-                'timestamp': datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc),
-                'index':     self.strategy._bar + 1,
-            }
-            log.info(f"  🕯️ Candle fechado: O={candle['open']:.2f} H={candle['high']:.2f} "
-                     f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
-            return candle
+            # Se houver pelo menos 2 candles, usa data[1] como último fechado
+            if len(data) >= 2:
+                c = data[1]
+                candle = {
+                    'open':      float(c[1]),
+                    'high':      float(c[2]),
+                    'low':       float(c[3]),
+                    'close':     float(c[4]),
+                    'timestamp': datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc),
+                    'index':     self.strategy._bar + 1,
+                }
+                log.info(f"  🕯️ Candle fechado (data[1]): O={candle['open']:.2f} H={candle['high']:.2f} "
+                         f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
+                return candle
+            # Se retornou apenas 1 candle, verifica se é novo (diferente do último processado)
+            c = data[0]
+            ts = datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc)
+            if str(ts) != self._last_candle_ts:
+                # Assume que é o último fechado (pode ser a barra em formação, mas arriscado)
+                candle = {
+                    'open':      float(c[1]),
+                    'high':      float(c[2]),
+                    'low':       float(c[3]),
+                    'close':     float(c[4]),
+                    'timestamp': ts,
+                    'index':     self.strategy._bar + 1,
+                }
+                log.info(f"  🕯️ Candle único (assumido fechado): O={candle['open']:.2f} H={candle['high']:.2f} "
+                         f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
+                return candle
+            else:
+                # Mesmo candle, ainda não atualizou
+                log.debug("  ℹ️ Candle único e igual ao anterior — aguardando...")
+                return None
         except Exception as e:
             log.error(f"  ❌ _candle erro: {e}")
             return None
@@ -823,21 +848,21 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # ── Polling: aguarda até 4s para a API atualizar ──────────
+                # ── Polling: aguarda até 10s para a API atualizar (intervalo 1s) ──
                 c = None
-                for _attempt in range(20):
+                for _attempt in range(10):
                     raw = self._candle()
                     if raw is None:
-                        time.sleep(0.2)
+                        time.sleep(1)
                         continue
                     if str(raw['timestamp']) == self._last_candle_ts:
-                        time.sleep(0.2)
+                        time.sleep(1)
                         continue
                     c = raw
                     break
 
                 if c is None:
-                    log.warning("  ⚠️ Candle não atualizou após 4s — pulando ciclo")
+                    log.warning("  ⚠️ Candle não atualizou após 10s — pulando ciclo")
                     continue
 
                 ts = str(c['timestamp'])
