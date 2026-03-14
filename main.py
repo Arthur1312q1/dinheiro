@@ -7,15 +7,14 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v9 — Garantia de candle fechado (2025)
+FIX v10 — Polling ultra-rápido (10ms) (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA:
-  - Às vezes a API retorna apenas 1 candle, e o sistema assumia que era o fechado.
-  - Isso causava processamento do candle anterior, atrasando as trades em 30 minutos.
+  - Polling com intervalo de 1s era lento demais para estratégias rápidas.
 
 SOLUÇÃO:
-  - _candle só retorna candle se houver pelo menos 2 dados (data[1] é o fechado).
-  - Polling aumentado para 30 tentativas (30 segundos) para garantir a atualização.
+  - Reduzido intervalo para 10ms entre tentativas.
+  - Aumentado número de tentativas para 300 (cobre 3 segundos).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -832,21 +831,21 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # ── Polling: aguarda até 30s para a API atualizar (intervalo 1s) ──
+                # ── Polling ultra-rápido: 10ms entre tentativas, até 300 tentativas (3s) ──
                 c = None
-                for _attempt in range(30):  # 30 tentativas = 30s
+                for _attempt in range(300):  # 300 tentativas * 10ms = 3 segundos
                     raw = self._candle()
                     if raw is None:
-                        time.sleep(1)
+                        time.sleep(0.01)
                         continue
                     if str(raw['timestamp']) == self._last_candle_ts:
-                        time.sleep(1)
+                        time.sleep(0.01)
                         continue
                     c = raw
                     break
 
                 if c is None:
-                    log.warning("  ⚠️ Candle não atualizou após 30s — pulando ciclo")
+                    log.warning("  ⚠️ Candle não atualizou após 3s — pulando ciclo")
                     continue
 
                 ts = str(c['timestamp'])
