@@ -7,16 +7,14 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v7 — Correção do _wait e _candle (2025)
+FIX v8 — Warmup alinhado com backtest (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA:
-  - Cálculo do próximo horário de fechamento gerava valores negativos (sleep negativo).
-  - Leitura do candle usava data[0] ou data[1] de forma inconsistente, causando repetições.
+  - Warmup no live usava 300 candles, enquanto no backtest era 50.
+  - Isso causava diferenças nos indicadores e trades perdidas.
 
 SOLUÇÃO:
-  - _wait agora calcula o alvo em UTC (horário dos candles) e usa timedelta para garantir futuro.
-  - _candle prioriza data[1] (último fechado) e só aceita candle único se for novo.
-  - Polling com intervalo de 1s e 10 tentativas.
+  - Ajustado WARMUP_CANDLES para min(50, TOTAL_CANDLES//5) = 50.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -48,7 +46,8 @@ SYMBOL    = "ETH-USDT"          # Bitget symbol
 SYMBOL_ID = "ETHUSDT"              # Bitget v2 symbol (usdt-futures)
 TIMEFRAME = "30m"
 TOTAL_CANDLES  = 300
-WARMUP_CANDLES = 300
+# Warmup alinhado com o backtest: min(50, TOTAL_CANDLES//5) = 50
+WARMUP_CANDLES = min(50, TOTAL_CANDLES // 5)
 STRATEGY_CONFIG = {
     "adaptive_method": "Cos IFM", "threshold": 0.0,
     "fixed_sl_points": 2000, "fixed_tp_points": 55, "trail_offset": 15,
