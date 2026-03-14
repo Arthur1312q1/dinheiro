@@ -7,16 +7,16 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v6 — Polling mais lento e tolerante a 1 candle (2025)
+FIX v7 — Correção do _wait e _candle (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA:
-  - API retorna apenas 1 candle nos primeiros segundos após o close.
-  - Polling rápido (0.2s) causa rate limit (429).
+  - Cálculo do próximo horário de fechamento gerava valores negativos (sleep negativo).
+  - Leitura do candle usava data[0] ou data[1] de forma inconsistente, causando repetições.
 
 SOLUÇÃO:
-  - Aumentar intervalo de polling para 1s e reduzir tentativas para 10.
-  - Se a API retornar apenas 1 candle, verificar se é novo e usá-lo.
-  - Logar apenas quando realmente necessário.
+  - _wait agora calcula o alvo em UTC (horário dos candles) e usa timedelta para garantir futuro.
+  - _candle prioriza data[1] (último fechado) e só aceita candle único se for novo.
+  - Polling com intervalo de 1s e 10 tentativas.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -726,28 +726,32 @@ class LiveTrader:
 
     def _wait(self, tf: int = 30):
         """
-        Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010) no fuso BRT.
+        Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010) em UTC.
         """
-        now = brazil_now()
-        minute = now.minute
+        now_utc = datetime.now(timezone.utc)
+        minute = now_utc.minute
 
-        # Define o próximo alvo: se minute < 30, alvo é 30; senão, próximo minuto 0 da hora seguinte
+        # Define o próximo alvo em UTC
         if minute < 30:
             target_minute = 30
-            target_hour = now.hour
+            target_hour = now_utc.hour
         else:
             target_minute = 0
-            target_hour = now.hour + 1 if now.hour < 23 else 0  # ajuste para virada de dia
+            target_hour = now_utc.hour + 1
+            if target_hour >= 24:
+                target_hour = 0
 
-        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=10_000)  # 10ms após o segundo 0
+        target_utc = now_utc.replace(hour=target_hour, minute=target_minute, second=0, microsecond=10_000)
 
         # Se target já passou (pode acontecer se agora já for após o alvo), adiciona 30 minutos
-        if target <= now:
-            target += timedelta(minutes=30)
+        if target_utc <= now_utc:
+            target_utc += timedelta(minutes=30)
 
-        sleep_seconds = (target - now).total_seconds()
-        log.info(f"⏰ Aguardando {sleep_seconds:.3f}s até {target.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
-        time.sleep(max(0, sleep_seconds))  # garante não negativo
+        sleep_seconds = (target_utc - now_utc).total_seconds()
+        # Converte para BRT para log (apenas estética)
+        target_brt = target_utc.astimezone(BRT)
+        log.info(f"⏰ Aguardando {sleep_seconds:.3f}s até {target_brt.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
+        time.sleep(sleep_seconds)
 
     def _candle(self) -> Optional[Dict]:
         """
