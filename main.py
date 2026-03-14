@@ -7,14 +7,15 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v8 — Warmup alinhado com backtest (2025)
+FIX v9 — Correção do atraso de 1 barra (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA:
-  - Warmup no live usava 300 candles, enquanto no backtest era 50.
-  - Isso causava diferenças nos indicadores e trades perdidas.
+  - O código usava data[1] como último candle fechado, mas após o fechamento
+    o candle recém-fechado é data[0]. Isso causava atraso de 30 minutos.
 
 SOLUÇÃO:
-  - Ajustado WARMUP_CANDLES para min(50, TOTAL_CANDLES//5) = 50.
+  - Agora _candle() usa sempre data[0] (o mais recente) como o último fechado.
+  - Removida lógica de "candle único", pois sempre haverá pelo menos 1.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -46,8 +47,7 @@ SYMBOL    = "ETH-USDT"          # Bitget symbol
 SYMBOL_ID = "ETHUSDT"              # Bitget v2 symbol (usdt-futures)
 TIMEFRAME = "30m"
 TOTAL_CANDLES  = 300
-# Warmup alinhado com o backtest: min(50, TOTAL_CANDLES//5) = 50
-WARMUP_CANDLES = min(50, TOTAL_CANDLES // 5)
+WARMUP_CANDLES = min(50, TOTAL_CANDLES // 5)  # igual ao backtest
 STRATEGY_CONFIG = {
     "adaptive_method": "Cos IFM", "threshold": 0.0,
     "fixed_sl_points": 2000, "fixed_tp_points": 55, "trail_offset": 15,
@@ -468,7 +468,7 @@ class LiveTrader:
         self._cache_bal: float = PAPER_BALANCE if self._paper_mode else 0.0
         self._cache_px:  float = 0.0
         self._last_candle_ts:    str = ""
-        # ── Novo: armazena entrada pendente para executar no próximo open ──
+        # ── Armazena entrada pendente para executar no próximo open ──
         self._pending_entry: Optional[tuple] = None  # (side, qty, reason)
 
     def _is_paper(self) -> bool:
@@ -572,7 +572,7 @@ class LiveTrader:
                 else:
                     log.error(f"  ❌ bitget.open_short falhou")
 
-        # ── Agora processa o candle com a estratégia (gera ações) ──────────
+        # ── Processa o candle com a estratégia (gera ações) ──────────
         actions = self.strategy.next(candle) or []
 
         log.info(f"  📊 {len(actions)} ação(ões): "
@@ -755,7 +755,7 @@ class LiveTrader:
     def _candle(self) -> Optional[Dict]:
         """
         Busca o último candle FECHADO da Bitget.
-        Se a API retornar apenas 1 candle, considera que é o recém-fechado se for diferente do último.
+        Usa data[0] (o mais recente) pois acordamos logo após o fechamento.
         """
         TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
               "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
@@ -782,40 +782,20 @@ class LiveTrader:
             if len(data) == 0:
                 log.warning("  ⚠️ Bitget retornou 0 candles")
                 return None
-            # Se houver pelo menos 2 candles, usa data[1] como último fechado
-            if len(data) >= 2:
-                c = data[1]
-                candle = {
-                    'open':      float(c[1]),
-                    'high':      float(c[2]),
-                    'low':       float(c[3]),
-                    'close':     float(c[4]),
-                    'timestamp': datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc),
-                    'index':     self.strategy._bar + 1,
-                }
-                log.info(f"  🕯️ Candle fechado (data[1]): O={candle['open']:.2f} H={candle['high']:.2f} "
-                         f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
-                return candle
-            # Se retornou apenas 1 candle, verifica se é novo (diferente do último processado)
+
+            # Usa o primeiro candle (mais recente) como o último fechado
             c = data[0]
-            ts = datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc)
-            if str(ts) != self._last_candle_ts:
-                # Assume que é o último fechado (pode ser a barra em formação, mas arriscado)
-                candle = {
-                    'open':      float(c[1]),
-                    'high':      float(c[2]),
-                    'low':       float(c[3]),
-                    'close':     float(c[4]),
-                    'timestamp': ts,
-                    'index':     self.strategy._bar + 1,
-                }
-                log.info(f"  🕯️ Candle único (assumido fechado): O={candle['open']:.2f} H={candle['high']:.2f} "
-                         f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
-                return candle
-            else:
-                # Mesmo candle, ainda não atualizou
-                log.debug("  ℹ️ Candle único e igual ao anterior — aguardando...")
-                return None
+            candle = {
+                'open':      float(c[1]),
+                'high':      float(c[2]),
+                'low':       float(c[3]),
+                'close':     float(c[4]),
+                'timestamp': datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc),
+                'index':     self.strategy._bar + 1,
+            }
+            log.info(f"  🕯️ Candle fechado: O={candle['open']:.2f} H={candle['high']:.2f} "
+                     f"L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
+            return candle
         except Exception as e:
             log.error(f"  ❌ _candle erro: {e}")
             return None
