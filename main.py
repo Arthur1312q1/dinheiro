@@ -7,14 +7,14 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v10 — Polling ultra-rápido (10ms) (2025)
+FIX v11 — Correção do _wait (cálculo robusto) (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA:
-  - Polling com intervalo de 1s era lento demais para estratégias rápidas.
+  - Cálculo anterior gerava alvos no passado em certos horários, causando sleep negativo.
 
 SOLUÇÃO:
-  - Reduzido intervalo para 10ms entre tentativas.
-  - Aumentado número de tentativas para 300 (cobre 3 segundos).
+  - Novo _wait calcula o próximo fechamento em UTC usando minutos desde meia-noite.
+  - Garantia de alvo sempre futuro.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -726,26 +726,18 @@ class LiveTrader:
     def _wait(self, tf: int = 30):
         """
         Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010) em UTC.
+        Cálculo robusto baseado em minutos desde meia-noite.
         """
         now_utc = datetime.now(timezone.utc)
-        minute = now_utc.minute
-
-        # Define o próximo alvo em UTC
-        if minute < 30:
-            target_minute = 30
-            target_hour = now_utc.hour
-        else:
-            target_minute = 0
-            target_hour = now_utc.hour + 1
-            if target_hour >= 24:
-                target_hour = 0
-
-        target_utc = now_utc.replace(hour=target_hour, minute=target_minute, second=0, microsecond=10_000)
-
-        # Se target já passou (pode acontecer se agora já for após o alvo), adiciona 30 minutos
+        # Minutos totais desde meia-noite
+        total_minutes = now_utc.hour * 60 + now_utc.minute
+        # Próximo múltiplo de 30 minutos (considerando 0 e 30)
+        next_multiple = ((total_minutes // 30) + 1) * 30
+        # Constrói o alvo: meia-noite de hoje + next_multiple minutos + 10ms
+        target_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=next_multiple, milliseconds=10)
+        # Se o alvo já passou (pode acontecer se next_multiple for exatamente total_minutes+30 e já passou alguns ms), adiciona 30 minutos
         if target_utc <= now_utc:
             target_utc += timedelta(minutes=30)
-
         sleep_seconds = (target_utc - now_utc).total_seconds()
         # Converte para BRT para log (apenas estética)
         target_brt = target_utc.astimezone(BRT)
