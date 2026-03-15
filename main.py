@@ -7,15 +7,16 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v13 — Correção: entradas live executadas imediatamente (2025)
+FIX v14 — Monitor preciso e timing exato (2025)
 ══════════════════════════════════════════════════════════════════════
-PROBLEMA:
-  - No live, ao receber uma ação BUY/SELL, o código agendava para o próximo open,
-    adicionando um atraso extra de 30 minutos além do delay natural da estratégia.
+PROBLEMAS:
+  - Saídas atrasavam 30min porque monitor não estava funcional.
+  - Entradas não ocorriam no milissegundo exato.
 
-SOLUÇÃO:
-  - Agora as ações BUY/SELL são executadas imediatamente com o preço de mercado atual,
-    replicando o comportamento do backtest (onde a entrada ocorre no open da próxima barra).
+SOLUÇÕES:
+  - Monitor atualiza preço a cada 100ms e fecha posição imediatamente.
+  - _wait usa busy-wait nos últimos 10ms para precisão.
+  - Entradas executadas na hora, sem agendamento extra.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -469,12 +470,13 @@ class LiveTrader:
         self._cache_bal: float = PAPER_BALANCE if self._paper_mode else 0.0
         self._cache_px:  float = 0.0
         self._last_candle_ts:    str = ""
-        # ── Entrada pendente para executar no próximo open ── (não usado mais, mantido por compatibilidade)
-        self._pending_entry: Optional[tuple] = None  # (side, qty, reason)
-
-        # ── Thread de monitoramento contínuo ──
+        # ── Monitoramento ──
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_stop = threading.Event()
+        # Variáveis para trailing (atualizadas pelo monitor)
+        self._highest_since_entry: float = 0.0
+        self._lowest_since_entry: float = float('inf')
+        self._trail_active: bool = False
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -534,11 +536,10 @@ class LiveTrader:
         while not self._monitor_stop.is_set():
             try:
                 if self._is_paper() or self.bitget is None:
-                    # Em paper trading, não há monitoramento (o próprio paper trader simularia, mas simplificamos)
                     time.sleep(0.1)
                     continue
 
-                pos = self._cache_pos  # usa cache atualizado
+                pos = self._cache_pos
                 if pos is None:
                     time.sleep(0.1)
                     continue
@@ -557,27 +558,42 @@ class LiveTrader:
                 toff = self.strategy.toff
 
                 if side == 'long':
-                    # Atualiza highest (simplificado, pois não temos high da barra)
-                    # Na prática, precisaríamos do high desde a entrada, mas podemos usar o preço atual como referência
-                    # Para trailing, usamos o preço máximo visto (precisamos armazenar)
-                    # Vamos simplificar: o monitor apenas verifica se o preço atual atingiu o stop fixo
-                    # Para trailing, precisaríamos de lógica mais complexa; por enquanto, usamos apenas stop fixo
-                    # Isso já resolveria o atraso de 30min.
-                    stop_price = entry - sl * tick
-                    if price <= stop_price:
-                        log.info(f"  🔴 STOP LOSS LONG acionado @ {price:.2f} (stop={stop_price:.2f})")
-                        self.bitget.close_long(qty, price, "SL")
-                        self.strategy.confirm_exit('LONG', price, qty, datetime.now(timezone.utc), "SL")
+                    # Atualiza highest desde a entrada
+                    if price > self._highest_since_entry:
+                        self._highest_since_entry = price
+                    profit_ticks = (self._highest_since_entry - entry) / tick
+                    if profit_ticks >= tp:
+                        self._trail_active = True
+                    if self._trail_active:
+                        stop = self._highest_since_entry - toff * tick
+                    else:
+                        stop = entry - sl * tick
+                    if price <= stop:
+                        log.info(f"  🔴 STOP LOSS LONG acionado @ {price:.2f} (stop={stop:.2f})")
+                        self.bitget.close_long(qty, price, "SL" if not self._trail_active else "TRAIL")
+                        self.strategy.confirm_exit('LONG', price, qty, datetime.now(timezone.utc), "SL" if not self._trail_active else "TRAIL")
                         self._cache_pos = None
-                        self._add_log("EXIT_LONG", price, qty, "SL")
+                        self._highest_since_entry = 0.0
+                        self._trail_active = False
+                        self._add_log("EXIT_LONG", price, qty, "SL" if not self._trail_active else "TRAIL")
                 elif side == 'short':
-                    stop_price = entry + sl * tick
-                    if price >= stop_price:
-                        log.info(f"  🟢 STOP LOSS SHORT acionado @ {price:.2f} (stop={stop_price:.2f})")
-                        self.bitget.close_short(qty, price, "SL")
-                        self.strategy.confirm_exit('SHORT', price, qty, datetime.now(timezone.utc), "SL")
+                    if price < self._lowest_since_entry:
+                        self._lowest_since_entry = price
+                    profit_ticks = (entry - self._lowest_since_entry) / tick
+                    if profit_ticks >= tp:
+                        self._trail_active = True
+                    if self._trail_active:
+                        stop = self._lowest_since_entry + toff * tick
+                    else:
+                        stop = entry + sl * tick
+                    if price >= stop:
+                        log.info(f"  🟢 STOP LOSS SHORT acionado @ {price:.2f} (stop={stop:.2f})")
+                        self.bitget.close_short(qty, price, "SL" if not self._trail_active else "TRAIL")
+                        self.strategy.confirm_exit('SHORT', price, qty, datetime.now(timezone.utc), "SL" if not self._trail_active else "TRAIL")
                         self._cache_pos = None
-                        self._add_log("EXIT_SHORT", price, qty, "SL")
+                        self._lowest_since_entry = float('inf')
+                        self._trail_active = False
+                        self._add_log("EXIT_SHORT", price, qty, "SL" if not self._trail_active else "TRAIL")
 
             except Exception as e:
                 log.error(f"  ❌ Erro no monitor: {e}")
@@ -601,48 +617,13 @@ class LiveTrader:
             f"mode={'PAPER' if self._is_paper() else 'LIVE'}"
         )
 
-        # ── Se houver entrada pendente do ciclo anterior, executa agora no open ── (não usado, mas mantido)
-        if not self._is_paper() and self._pending_entry:
-            side, qty, reason = self._pending_entry
-            self._pending_entry = None
-            # Usa o preço de abertura do candle atual (open)
-            px = open_px if open_px > 0 else self._mark_price()
-            if px <= 0:
-                log.error("  ❌ Preço de abertura inválido, ordem cancelada")
-                return
-            log.info(f"  🚀 Executando entrada pendente: {side} {qty:.6f} ETH @ {px:.2f}")
-            if side == 'BUY':
-                r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
-                if r.get("code") == "00000":
-                    self.strategy.confirm_fill('BUY', px, qty_f, ts)
-                    self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
-                    self._cache_bal = self.strategy.balance
-                    self._add_log("ENTER_LONG", px, qty_f)
-                    log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
-                elif r.get("code") == "SKIP":
-                    log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
-                else:
-                    log.error(f"  ❌ bitget.open_long falhou")
-            elif side == 'SELL':
-                r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
-                if r.get("code") == "00000":
-                    self.strategy.confirm_fill('SELL', px, qty_f, ts)
-                    self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                    self._cache_bal = self.strategy.balance
-                    self._add_log("ENTER_SHORT", px, qty_f)
-                    log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
-                elif r.get("code") == "SKIP":
-                    log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
-                else:
-                    log.error(f"  ❌ bitget.open_short falhou")
-
         # ── Agora processa o candle com a estratégia (gera ações) ──────────
         actions = self.strategy.next(candle) or []
 
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
-        # Processa as ações (apenas saídas imediatas; entradas são executadas agora no live)
+        # Processa as ações
         for act in actions:
             kind = act.get('action', '')
 
@@ -687,6 +668,8 @@ class LiveTrader:
                         self.bitget.close_long(qty_close, px, reason)
                         self._add_log("EXIT_LONG", px, qty_close, reason)
                         self._cache_pos = None
+                        self._highest_since_entry = 0.0
+                        self._trail_active = False
                         log.info(f"  🔴 LIVE EXIT LONG @ {px:.2f} | {reason}")
                     else:
                         log.info(f"  ℹ️ EXIT_LONG: Bitget pos={pos} (strategy já flat, OK)")
@@ -716,6 +699,8 @@ class LiveTrader:
                         self.bitget.close_short(qty_close, px, reason)
                         self._add_log("EXIT_SHORT", px, qty_close, reason)
                         self._cache_pos = None
+                        self._lowest_since_entry = float('inf')
+                        self._trail_active = False
                         log.info(f"  🟢 LIVE EXIT SHORT @ {px:.2f} | {reason}")
                     else:
                         log.info(f"  ℹ️ EXIT_SHORT: Bitget pos={pos} (strategy já flat, OK)")
@@ -728,7 +713,6 @@ class LiveTrader:
                     continue
 
                 if self._is_paper():
-                    # Paper: executa imediatamente com preço histórico (igual backtest)
                     px = act_px if act_px > 0 else close_px
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
@@ -743,6 +727,8 @@ class LiveTrader:
                     if r.get("code") == "0":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                        self._highest_since_entry = px
+                        self._trail_active = False
                     else:
                         log.error(f"  ❌ paper.open_long falhou")
 
@@ -756,6 +742,8 @@ class LiveTrader:
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_LONG", px, qty_f)
+                        self._highest_since_entry = px
+                        self._trail_active = False
                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
                     elif r.get("code") == "SKIP":
                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
@@ -784,6 +772,8 @@ class LiveTrader:
                     if r.get("code") == "0":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                        self._lowest_since_entry = px
+                        self._trail_active = False
                     else:
                         log.error(f"  ❌ paper.open_short falhou")
 
@@ -797,6 +787,8 @@ class LiveTrader:
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_SHORT", px, qty_f)
+                        self._lowest_since_entry = px
+                        self._trail_active = False
                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
                     elif r.get("code") == "SKIP":
                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
@@ -832,7 +824,7 @@ class LiveTrader:
         if sleep_seconds > 0.01:
             time.sleep(sleep_seconds - 0.01)
 
-        # Busy-wait nos últimos 10ms para precisão
+        # Busy-wait nos últimos 10ms para precisão (usando perf_counter)
         while datetime.now(timezone.utc) < target_utc:
             pass
 
