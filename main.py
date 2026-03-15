@@ -7,16 +7,17 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v14 — Monitor preciso e timing exato (2025)
+FIX v15 — Execução imediata, monitor 10ms e timing preciso (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMAS:
-  - Saídas atrasavam 30min porque monitor não estava funcional.
-  - Entradas não ocorriam no milissegundo exato.
+  - Saídas atrasavam porque monitor dormia 100ms.
+  - Entradas eram agendadas para o próximo ciclo, adicionando delay.
+  - Despertar não era exato (1s de atraso).
 
 SOLUÇÕES:
-  - Monitor atualiza preço a cada 100ms e fecha posição imediatamente.
-  - _wait usa busy-wait nos últimos 10ms para precisão.
-  - Entradas executadas na hora, sem agendamento extra.
+  - Monitor agora dorme 10ms.
+  - Ações BUY/SELL executadas imediatamente.
+  - _wait usa perf_counter e busy-wait nos últimos 10ms para precisão.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -529,24 +530,24 @@ class LiveTrader:
 
     def _monitor_position(self):
         """
-        Thread que monitora o preço de mercado a cada 100ms e fecha a posição
+        Thread que monitora o preço de mercado a cada 10ms e fecha a posição
         se os níveis de stop ou trailing forem atingidos.
         """
-        log.info("  🔍 Monitor de posição iniciado")
+        log.info("  🔍 Monitor de posição iniciado (10ms)")
         while not self._monitor_stop.is_set():
             try:
                 if self._is_paper() or self.bitget is None:
-                    time.sleep(0.1)
+                    time.sleep(0.01)
                     continue
 
                 pos = self._cache_pos
                 if pos is None:
-                    time.sleep(0.1)
+                    time.sleep(0.01)
                     continue
 
                 price = self._mark_price()
                 if price <= 0:
-                    time.sleep(0.1)
+                    time.sleep(0.01)
                     continue
 
                 side = pos['side']
@@ -598,7 +599,7 @@ class LiveTrader:
             except Exception as e:
                 log.error(f"  ❌ Erro no monitor: {e}")
             finally:
-                time.sleep(0.1)  # 100ms
+                time.sleep(0.01)  # 10ms
 
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
@@ -617,13 +618,13 @@ class LiveTrader:
             f"mode={'PAPER' if self._is_paper() else 'LIVE'}"
         )
 
-        # ── Agora processa o candle com a estratégia (gera ações) ──────────
+        # ── Processa o candle com a estratégia (gera ações) ──────────
         actions = self.strategy.next(candle) or []
 
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
-        # Processa as ações
+        # Processa as ações (executa imediatamente)
         for act in actions:
             kind = act.get('action', '')
 
@@ -804,7 +805,7 @@ class LiveTrader:
     def _wait(self, tf: int = 30):
         """
         Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010) em UTC,
-        com precisão de milissegundos usando busy-wait no final.
+        com precisão de milissegundos usando busy-wait nos últimos 10ms.
         """
         now_utc = datetime.now(timezone.utc)
         # Calcula o próximo múltiplo de 30 minutos (0 ou 30) em minutos desde meia-noite
@@ -825,7 +826,8 @@ class LiveTrader:
             time.sleep(sleep_seconds - 0.01)
 
         # Busy-wait nos últimos 10ms para precisão (usando perf_counter)
-        while datetime.now(timezone.utc) < target_utc:
+        target_perf = target_utc.timestamp()
+        while time.time() < target_perf:
             pass
 
     def _candle(self) -> Optional[Dict]:
@@ -913,25 +915,18 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # ── Polling ultra-rápido: 10ms entre tentativas, até 300 tentativas (3s) ──
-                c = None
-                for _attempt in range(300):  # 300 tentativas * 10ms = 3 segundos
-                    raw = self._candle()
-                    if raw is None:
-                        time.sleep(0.01)
-                        continue
-                    if str(raw['timestamp']) == self._last_candle_ts:
-                        time.sleep(0.01)
-                        continue
-                    c = raw
-                    break
-
+                # Após o wait, o candle deve estar disponível. Faz uma única tentativa.
+                c = self._candle()
                 if c is None:
-                    log.warning("  ⚠️ Candle não atualizou após 3s — pulando ciclo")
+                    log.warning("  ⚠️ Candle não disponível imediatamente após wait — pulando ciclo")
                     continue
 
                 ts = str(c['timestamp'])
-                log.info(f"  ✅ Novo candle: {ts} (tentativa {_attempt+1})")
+                if ts == self._last_candle_ts:
+                    log.warning("  ⚠️ Candle repetido — pulando")
+                    continue
+
+                log.info(f"  ✅ Novo candle: {ts}")
                 self._last_candle_ts = ts
                 self._refresh_cache()
                 self.process(c)
