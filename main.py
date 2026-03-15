@@ -7,14 +7,15 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v13 — Execução imediata de entradas (2025)
+FIX v13 — Correção: entradas live executadas imediatamente (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMA:
-  - Entradas live eram agendadas para o próximo open, adicionando delay extra de 1 barra.
-  - A estratégia já tem delay de 1 barra por design (anti-ghost trades).
+  - No live, ao receber uma ação BUY/SELL, o código agendava para o próximo open,
+    adicionando um atraso extra de 30 minutos além do delay natural da estratégia.
 
 SOLUÇÃO:
-  - Removido agendamento (_pending_entry) e execução imediata das ordens.
+  - Agora as ações BUY/SELL são executadas imediatamente com o preço de mercado atual,
+    replicando o comportamento do backtest (onde a entrada ocorre no open da próxima barra).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -468,6 +469,8 @@ class LiveTrader:
         self._cache_bal: float = PAPER_BALANCE if self._paper_mode else 0.0
         self._cache_px:  float = 0.0
         self._last_candle_ts:    str = ""
+        # ── Entrada pendente para executar no próximo open ── (não usado mais, mantido por compatibilidade)
+        self._pending_entry: Optional[tuple] = None  # (side, qty, reason)
 
         # ── Thread de monitoramento contínuo ──
         self._monitor_thread: Optional[threading.Thread] = None
@@ -531,10 +534,11 @@ class LiveTrader:
         while not self._monitor_stop.is_set():
             try:
                 if self._is_paper() or self.bitget is None:
+                    # Em paper trading, não há monitoramento (o próprio paper trader simularia, mas simplificamos)
                     time.sleep(0.1)
                     continue
 
-                pos = self._cache_pos
+                pos = self._cache_pos  # usa cache atualizado
                 if pos is None:
                     time.sleep(0.1)
                     continue
@@ -553,6 +557,12 @@ class LiveTrader:
                 toff = self.strategy.toff
 
                 if side == 'long':
+                    # Atualiza highest (simplificado, pois não temos high da barra)
+                    # Na prática, precisaríamos do high desde a entrada, mas podemos usar o preço atual como referência
+                    # Para trailing, usamos o preço máximo visto (precisamos armazenar)
+                    # Vamos simplificar: o monitor apenas verifica se o preço atual atingiu o stop fixo
+                    # Para trailing, precisaríamos de lógica mais complexa; por enquanto, usamos apenas stop fixo
+                    # Isso já resolveria o atraso de 30min.
                     stop_price = entry - sl * tick
                     if price <= stop_price:
                         log.info(f"  🔴 STOP LOSS LONG acionado @ {price:.2f} (stop={stop_price:.2f})")
@@ -572,7 +582,7 @@ class LiveTrader:
             except Exception as e:
                 log.error(f"  ❌ Erro no monitor: {e}")
             finally:
-                time.sleep(0.1)
+                time.sleep(0.1)  # 100ms
 
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
@@ -591,13 +601,48 @@ class LiveTrader:
             f"mode={'PAPER' if self._is_paper() else 'LIVE'}"
         )
 
-        # Processa o candle com a estratégia (gera ações)
+        # ── Se houver entrada pendente do ciclo anterior, executa agora no open ── (não usado, mas mantido)
+        if not self._is_paper() and self._pending_entry:
+            side, qty, reason = self._pending_entry
+            self._pending_entry = None
+            # Usa o preço de abertura do candle atual (open)
+            px = open_px if open_px > 0 else self._mark_price()
+            if px <= 0:
+                log.error("  ❌ Preço de abertura inválido, ordem cancelada")
+                return
+            log.info(f"  🚀 Executando entrada pendente: {side} {qty:.6f} ETH @ {px:.2f}")
+            if side == 'BUY':
+                r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
+                if r.get("code") == "00000":
+                    self.strategy.confirm_fill('BUY', px, qty_f, ts)
+                    self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                    self._cache_bal = self.strategy.balance
+                    self._add_log("ENTER_LONG", px, qty_f)
+                    log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
+                elif r.get("code") == "SKIP":
+                    log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
+                else:
+                    log.error(f"  ❌ bitget.open_long falhou")
+            elif side == 'SELL':
+                r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
+                if r.get("code") == "00000":
+                    self.strategy.confirm_fill('SELL', px, qty_f, ts)
+                    self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                    self._cache_bal = self.strategy.balance
+                    self._add_log("ENTER_SHORT", px, qty_f)
+                    log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
+                elif r.get("code") == "SKIP":
+                    log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
+                else:
+                    log.error(f"  ❌ bitget.open_short falhou")
+
+        # ── Agora processa o candle com a estratégia (gera ações) ──────────
         actions = self.strategy.next(candle) or []
 
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
-        # Processa as ações (entradas e saídas)
+        # Processa as ações (apenas saídas imediatas; entradas são executadas agora no live)
         for act in actions:
             kind = act.get('action', '')
 
@@ -702,7 +747,7 @@ class LiveTrader:
                         log.error(f"  ❌ paper.open_long falhou")
 
                 else:
-                    # LIVE: executa imediatamente com preço atual
+                    # LIVE: executa imediatamente com preço de mercado atual
                     px = self._mark_price() or close_px
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
@@ -743,7 +788,7 @@ class LiveTrader:
                         log.error(f"  ❌ paper.open_short falhou")
 
                 else:
-                    # LIVE: executa imediatamente com preço atual
+                    # LIVE: executa imediatamente com preço de mercado atual
                     px = self._mark_price() or close_px
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
@@ -770,10 +815,12 @@ class LiveTrader:
         com precisão de milissegundos usando busy-wait no final.
         """
         now_utc = datetime.now(timezone.utc)
+        # Calcula o próximo múltiplo de 30 minutos (0 ou 30) em minutos desde meia-noite
         total_minutes = now_utc.hour * 60 + now_utc.minute
         next_multiple = ((total_minutes // 30) + 1) * 30
         target_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=next_multiple, milliseconds=10)
 
+        # Se o alvo já passou (pode acontecer se next_multiple for exatamente total_minutes+30 e já passou alguns ms), adiciona 30 minutos
         if target_utc <= now_utc:
             target_utc += timedelta(minutes=30)
 
@@ -781,9 +828,11 @@ class LiveTrader:
         target_brt = target_utc.astimezone(BRT)
         log.info(f"⏰ Aguardando {sleep_seconds:.3f}s até {target_brt.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
 
+        # Dorme até 10ms antes do alvo
         if sleep_seconds > 0.01:
             time.sleep(sleep_seconds - 0.01)
 
+        # Busy-wait nos últimos 10ms para precisão
         while datetime.now(timezone.utc) < target_utc:
             pass
 
@@ -815,8 +864,10 @@ class LiveTrader:
                 return None
             data = r.get("data", [])
             if len(data) < 2:
+                # Ainda não temos o candle fechado
                 log.debug("  ℹ️ Apenas 1 candle disponível — aguardando...")
                 return None
+            # Usa data[1] como último candle fechado
             c = data[1]
             candle = {
                 'open':      float(c[1]),
@@ -857,6 +908,7 @@ class LiveTrader:
         self.warmup(df)
         log.info(f"  ✅ Pronto para receber candles ao vivo da Bitget")
 
+        # Inicia thread de monitoramento
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_position, daemon=True)
         self._monitor_thread.start()
@@ -869,8 +921,9 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
+                # ── Polling ultra-rápido: 10ms entre tentativas, até 300 tentativas (3s) ──
                 c = None
-                for _attempt in range(300):
+                for _attempt in range(300):  # 300 tentativas * 10ms = 3 segundos
                     raw = self._candle()
                     if raw is None:
                         time.sleep(0.01)
@@ -1019,7 +1072,510 @@ _lh = _LogCap()
 _lh.setFormatter(_BRTFormatter('%(asctime)s %(message)s', '%H:%M:%S'))
 log.addHandler(_lh)
 
-DASH = """... (conteúdo idêntico ao original) ..."""
+DASH = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AZLEMA Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:#080c14; --bg2:#0d1422; --bg3:#111927; --border:#1a2535;
+  --accent:#00d4ff; --green:#00e57a; --red:#ff4d6d; --yellow:#ffd94a;
+  --text:#c8d8ec; --muted:#4a6080; --paper:#9b6bff; --live:#f5a623;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;min-height:100vh}
+.mono{font-family:'IBM Plex Mono',monospace}
+.shell{display:flex;flex-direction:column;min-height:100vh}
+.topbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:14px 28px;
+        display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.logo{font-family:'IBM Plex Mono',monospace;font-size:1.1rem;font-weight:600;color:var(--accent);letter-spacing:2px}
+.tabs{margin-left:auto;display:flex;gap:2px;background:var(--bg3);border-radius:6px;padding:3px}
+.tab{padding:7px 18px;border-radius:4px;font-size:.78rem;font-weight:500;cursor:pointer;
+     color:var(--muted);border:none;background:transparent;transition:.2s}
+.tab.active{background:var(--bg2);color:var(--text);border:1px solid var(--border)}
+.mode-toggle-wrap{display:flex;align-items:center;gap:0;border-radius:8px;overflow:hidden;
+  border:1px solid var(--border);background:var(--bg3);padding:3px;gap:3px}
+.mode-btn{padding:8px 20px;border:none;border-radius:6px;font-size:.78rem;font-weight:700;
+  cursor:pointer;letter-spacing:.8px;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;
+  transition:all .2s;opacity:.45;background:transparent;white-space:nowrap}
+.mode-btn.paper-btn{color:var(--paper)}
+.mode-btn.live-btn{color:var(--live)}
+.mode-btn.active{opacity:1;transform:none}
+.mode-btn.paper-btn.active{background:rgba(155,107,255,.18);border:1px solid rgba(155,107,255,.5);
+  box-shadow:0 0 12px rgba(155,107,255,.25)}
+.mode-btn.live-btn.active{background:rgba(245,166,35,.15);border:1px solid rgba(245,166,35,.5);
+  box-shadow:0 0 12px rgba(245,166,35,.25)}
+.mode-btn:hover:not(.active){opacity:.75}
+.mode-indicator{font-size:.65rem;font-family:'IBM Plex Mono',monospace;padding:4px 10px;
+  border-radius:4px;white-space:nowrap}
+.mi-paper{background:rgba(155,107,255,.12);color:var(--paper);border:1px solid rgba(155,107,255,.3)}
+.mi-live{background:rgba(245,166,35,.12);color:var(--live);border:1px solid rgba(245,166,35,.3)}
+.apibar{background:#06090f;border-bottom:1px solid var(--border);padding:8px 28px;
+        display:flex;align-items:center;gap:16px;flex-wrap:wrap;position:sticky;top:53px;z-index:99}
+.apibar-label{font-size:.58rem;font-weight:700;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
+.apibar-group{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.apibar-section{font-size:.58rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-right:2px}
+.apibtn{display:inline-flex;align-items:center;padding:4px 10px;border-radius:4px;font-size:.68rem;
+  font-weight:600;cursor:pointer;border:none;text-decoration:none;font-family:'IBM Plex Mono',monospace;
+  transition:.15s;white-space:nowrap}
+.apibtn:hover{filter:brightness(1.25);transform:translateY(-1px)}
+.apibtn-blue{background:rgba(0,212,255,.12);color:#00d4ff;border:1px solid rgba(0,212,255,.25)}
+.apibtn-green{background:rgba(0,229,122,.12);color:#00e57a;border:1px solid rgba(0,229,122,.25)}
+.apibtn-red{background:rgba(255,77,109,.12);color:#ff4d6d;border:1px solid rgba(255,77,109,.25)}
+.apibtn-yellow{background:rgba(255,217,74,.1);color:#ffd94a;border:1px solid rgba(255,217,74,.25)}
+.apibtn-purple{background:rgba(155,107,255,.12);color:#9b6bff;border:1px solid rgba(155,107,255,.25)}
+#apibar-msg{font-size:.7rem;font-family:'IBM Plex Mono',monospace;padding:3px 10px;border-radius:4px;display:none}
+.abm-ok{background:rgba(0,229,122,.12);color:var(--green);border:1px solid rgba(0,229,122,.3)}
+.abm-er{background:rgba(255,77,109,.12);color:var(--red);border:1px solid rgba(255,77,109,.3)}
+.main{flex:1;padding:24px 28px}
+.panel{display:none}.panel.active{display:block}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:24px}
+.btn{padding:10px 22px;border:none;border-radius:5px;font-size:.82rem;font-weight:600;
+     cursor:pointer;letter-spacing:.5px;transition:.15s;font-family:'IBM Plex Sans',sans-serif}
+.btn-go{background:var(--green);color:#000}.btn-go:hover{filter:brightness(1.1)}
+.btn-go:disabled,.btn-stop:disabled{opacity:.3;cursor:default}
+.btn-stop{background:var(--red);color:#fff}.btn-stop:hover{filter:brightness(1.1)}
+.btn-sec{background:var(--bg3);color:var(--text);border:1px solid var(--border)}
+.btn-sec:hover{border-color:var(--accent);color:var(--accent)}
+.btn-accent{background:var(--accent);color:#000}.btn-accent:hover{filter:brightness(1.1)}
+#sysmsg{font-size:.78rem;padding:5px 14px;border-radius:4px;display:none}
+.msg-ok{background:rgba(0,229,122,.12);color:var(--green);border:1px solid var(--green)}
+.msg-er{background:rgba(255,77,109,.12);color:var(--red);border:1px solid var(--red)}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.kpi{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden}
+.kpi::before{content:'';position:absolute;top:0;left:0;width:3px;height:100%;background:var(--accent)}
+.kpi.g::before{background:var(--green)}.kpi.r::before{background:var(--red)}
+.kpi.y::before{background:var(--yellow)}.kpi.p::before{background:var(--paper)}
+.kpi.live-kpi::before{background:var(--live)}
+.kpi-lbl{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:6px}
+.kpi-val{font-family:'IBM Plex Mono',monospace;font-size:1.4rem;font-weight:600;color:var(--text)}
+.kpi-val.g{color:var(--green)}.kpi-val.r{color:var(--red)}.kpi-val.y{color:var(--yellow)}
+.kpi-val.p{color:var(--paper)}.kpi-val.live-c{color:var(--live)}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+.dot-run{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+.dot-warm{background:var(--yellow);animation:pulse .8s infinite}
+.dot-stop{background:var(--muted)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin-bottom:20px}
+.card-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-size:.82rem;font-weight:600;color:var(--text);letter-spacing:.5px}
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.76rem}
+th{padding:10px 14px;text-align:left;color:var(--muted);font-size:.64rem;text-transform:uppercase;
+   letter-spacing:1px;border-bottom:1px solid var(--border);font-weight:500;white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid rgba(26,37,53,.5);font-family:'IBM Plex Mono',monospace;font-size:.74rem;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.g{color:var(--green)}.r{color:var(--red)}.y{color:var(--yellow)}.p{color:var(--paper)}
+.dir{display:inline-block;padding:2px 8px;border-radius:3px;font-size:.64rem;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.dir-l{background:rgba(0,229,122,.12);color:var(--green);border:1px solid rgba(0,229,122,.3)}
+.dir-s{background:rgba(255,77,109,.12);color:var(--red);border:1px solid rgba(255,77,109,.3)}
+.terminal{background:#050810;border:1px solid var(--border);border-radius:8px;
+  font-family:'IBM Plex Mono',monospace;font-size:.7rem;line-height:1.8;
+  padding:14px;max-height:260px;overflow-y:auto;color:#5a7a9a}
+.terminal .lg{color:var(--green)}.terminal .lr{color:var(--red)}
+.terminal .ly{color:var(--yellow)}.terminal .la{color:var(--accent)}
+.form-row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:24px}
+.form-group{display:flex;flex-direction:column;gap:5px}
+.form-group label{font-size:.64rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.form-group input,.form-group select{background:var(--bg3);border:1px solid var(--border);
+  color:var(--text);padding:8px 12px;border-radius:5px;font-family:'IBM Plex Mono',monospace;font-size:.8rem;width:150px}
+.progress-bar{height:3px;background:var(--border);border-radius:2px;margin-bottom:20px;overflow:hidden}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:2px;transition:width .3s}
+.mode-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  padding:12px 28px;border-radius:8px;font-family:'IBM Plex Mono',monospace;font-size:.82rem;
+  font-weight:600;z-index:999;display:none;animation:fadeUp .3s ease}
+@keyframes fadeUp{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
+.toast-paper{background:rgba(155,107,255,.2);color:#c8a0ff;border:1px solid rgba(155,107,255,.5)}
+.toast-live{background:rgba(245,166,35,.2);color:#ffd080;border:1px solid rgba(245,166,35,.5)}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="topbar">
+    <span class="logo">⚡ AZLEMA</span>
+    <span class="mono" style="font-size:.7rem;color:var(--muted)">ETH-USDT · 30m · Bitget</span>
+    <div class="mode-toggle-wrap" title="Selecionar modo de operação">
+      <button class="mode-btn paper-btn" id="btnPaper" onclick="setMode('paper')">📄 PAPER</button>
+      <button class="mode-btn live-btn" id="btnLive" onclick="setMode('live')">💰 LIVE 95%</button>
+    </div>
+    <span class="mode-indicator" id="modeIndicator">—</span>
+    <div class="tabs" style="margin-left:auto">
+      <button class="tab active" onclick="switchTab('live')">Live</button>
+      <button class="tab" onclick="switchTab('history')">Histórico</button>
+      <button class="tab" onclick="switchTab('backtest')">Backtest</button>
+    </div>
+  </div>
+  <div class="apibar">
+    <span class="apibar-label">API RÁPIDA</span>
+    <div class="apibar-group">
+      <span class="apibar-section">STATUS</span>
+      <a class="apibtn apibtn-blue" href="/status" target="_blank">/status</a>
+      <a class="apibtn apibtn-blue" href="/health" target="_blank">/health</a>
+    </div>
+    <div class="apibar-group">
+      <span class="apibar-section">TRADER</span>
+      <button class="apibtn apibtn-green" onclick="apiPost('/start','Trader iniciado!')">▶ /start</button>
+      <button class="apibtn apibtn-red"   onclick="apiPost('/stop','Trader parado!')">■ /stop</button>
+    </div>
+    <div class="apibar-group">
+      <span class="apibar-section">HISTÓRICO</span>
+      <a class="apibtn apibtn-purple" href="/report" target="_blank">📊 Relatório</a>
+      <button class="apibtn apibtn-purple" onclick="exportJson('/history','trades_history')">⬇ JSON</button>
+      <button class="apibtn apibtn-red" onclick="if(confirm('Limpar histórico?'))apiPost('/history/clear','Limpo!')">🗑</button>
+    </div>
+    <div class="apibar-group">
+      <span class="apibar-section">BACKTEST</span>
+      <button class="apibtn apibtn-yellow" onclick="quickBacktest()">▶ Rodar BT</button>
+      <button class="apibtn apibtn-yellow" onclick="exportJson('/backtest/history','bt_history')">⬇ JSON</button>
+    </div>
+    <div id="apibar-msg"></div>
+  </div>
+  <div class="main">
+    <div class="panel active" id="panel-live">
+      <div class="controls">
+        <button class="btn btn-go"   id="btnStart" onclick="ctrl('start')">▶ Iniciar</button>
+        <button class="btn btn-stop" id="btnStop"  onclick="ctrl('stop')">■ Parar</button>
+        <span id="sysmsg"></span>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-lbl">Status</div><div class="kpi-val" id="lv-status">—</div></div>
+        <div class="kpi g"><div class="kpi-lbl">Saldo</div><div class="kpi-val g" id="lv-bal">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">PnL Sessão</div><div class="kpi-val" id="lv-pnl">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Posição</div><div class="kpi-val" id="lv-pos">FLAT</div></div>
+        <div class="kpi y"><div class="kpi-lbl">Period</div><div class="kpi-val y" id="lv-per">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">EC</div><div class="kpi-val mono" id="lv-ec">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">EMA</div><div class="kpi-val mono" id="lv-ema">—</div></div>
+        <div class="kpi live-kpi" id="kpi-mode">
+          <div class="kpi-lbl">Modo / Exposição</div>
+          <div class="kpi-val live-c" id="lv-mode">—</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr></thead>
+            <tbody id="lv-trades"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="card-title">LOG DO SISTEMA</span></div>
+        <div style="padding:0"><div class="terminal" id="lv-log">aguardando...</div></div>
+      </div>
+    </div>
+    <div class="panel" id="panel-history">
+      <div id="hist-session-banner" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:14px 18px;margin-bottom:20px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Sessão atual</span>
+          <span id="hist-session-mode" class="mode-indicator mi-paper">📄 PAPER</span>
+          <span id="hist-session-count" style="font-size:.72rem;font-family:'IBM Plex Mono',monospace;color:var(--muted)">0 trades</span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem" onclick="loadHistory()">↺ Atualizar</button>
+          <button class="btn" style="padding:7px 16px;font-size:.74rem;background:rgba(0,212,255,.1);color:var(--accent);border:1px solid rgba(0,212,255,.3)" onclick="newPaperSession()">🆕 Nova Sessão</button>
+          <button class="btn btn-sec" style="padding:7px 14px;font-size:.74rem;color:var(--red);border-color:rgba(255,77,109,.3)" onclick="if(confirm('Limpar TODO o histórico de Paper/Live?'))clearHistory()">🗑 Limpar tudo</button>
+        </div>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-lbl">Total Trades</div><div class="kpi-val" id="h-total">—</div></div>
+        <div class="kpi g"><div class="kpi-lbl">Win Rate</div><div class="kpi-val g" id="h-wr">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">PnL Total</div><div class="kpi-val" id="h-pnl">—</div></div>
+        <div class="kpi g"><div class="kpi-lbl">Profit Factor</div><div class="kpi-val g" id="h-pf">—</div></div>
+        <div class="kpi g"><div class="kpi-lbl">Avg Win</div><div class="kpi-val g" id="h-aw">—</div></div>
+        <div class="kpi r"><div class="kpi-lbl">Avg Loss</div><div class="kpi-val r" id="h-al">—</div></div>
+        <div class="kpi g"><div class="kpi-lbl">Melhor Trade</div><div class="kpi-val g" id="h-best">—</div></div>
+        <div class="kpi r"><div class="kpi-lbl">Pior Trade</div><div class="kpi-val r" id="h-worst">—</div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr></thead>
+            <tbody id="hist-tbl"><tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="panel" id="panel-backtest">
+      <div class="form-row">
+        <div class="form-group"><label>Símbolo</label><input id="bt-sym" value="ETH-USDT-SWAP"></div>
+        <div class="form-group"><label>Timeframe</label>
+          <select id="bt-tf"><option value="30m" selected>30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option><option value="15m">15m</option></select>
+        </div>
+        <div class="form-group"><label>Candles</label><input id="bt-lim" type="number" value="500" min="100" max="5000"></div>
+        <div class="form-group"><label>Capital Inicial</label><input id="bt-cap" type="number" value="1000" min="100"></div>
+        <div class="form-group"><label>Taxa Abertura %</label><input id="bt-ofee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px"></div>
+        <div class="form-group"><label>Taxa Fechamento %</label><input id="bt-cfee" type="number" value="0.06" min="0" max="1" step="0.01" style="width:120px"></div>
+        <div style="display:flex;flex-direction:column;gap:5px;justify-content:flex-end">
+          <button class="btn btn-accent" id="btnBT" onclick="runBacktest()">▶ Executar</button>
+          <button class="btn btn-sec" style="font-size:.72rem;padding:6px 12px" onclick="document.getElementById('bt-ofee').value='0';document.getElementById('bt-cfee').value='0'">Sem taxas</button>
+        </div>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="bt-prog" style="width:0%"></div></div>
+      <div id="bt-result" style="display:none">
+        <div class="kpi-grid" id="bt-kpis"></div>
+        <div class="card">
+          <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr></thead>
+              <tbody id="bt-tbl"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:20px">
+        <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr></thead>
+            <tbody id="bt-hist-tbl"><tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="mode-toast" id="modeToast"></div>
+<script>
+let _currentMode = 'paper';
+function updateModeUI(mode) {
+  _currentMode = mode;
+  const isPaper = mode === 'paper';
+  document.getElementById('btnPaper').classList.toggle('active', isPaper);
+  document.getElementById('btnLive').classList.toggle('active', !isPaper);
+  const ind = document.getElementById('modeIndicator');
+  if (isPaper) { ind.textContent = '📄 Saldo Simulado'; ind.className = 'mode-indicator mi-paper'; }
+  else { ind.textContent = '💰 95% Saldo Real'; ind.className = 'mode-indicator mi-live'; }
+  const lv = document.getElementById('lv-mode');
+  if (lv) { lv.textContent = isPaper ? 'PAPER' : 'LIVE · 95%'; lv.className = 'kpi-val ' + (isPaper ? 'p' : 'live-c'); }
+  const kpiMode = document.getElementById('kpi-mode');
+  if (kpiMode) kpiMode.className = 'kpi ' + (isPaper ? 'p' : 'live-kpi');
+}
+async function setMode(mode) {
+  const running = document.getElementById('btnStop').disabled === false;
+  if (running) {
+    if (!confirm(`O trader está rodando. Parar e trocar para ${mode === 'paper' ? 'PAPER' : 'LIVE 95%'}?`)) return;
+    await fetch('/stop', { method: 'POST' });
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = 'Alterando modo...';
+  try {
+    const d = await (await fetch('/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })).json();
+    if (d.error) { m.className = 'abm-er'; m.textContent = d.error; }
+    else { updateModeUI(mode); showToast(mode); m.textContent = d.message || 'OK'; }
+  } catch (e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
+  setTimeout(() => m.style.display = 'none', 4000);
+}
+function showToast(mode) {
+  const t = document.getElementById('modeToast');
+  t.className = 'mode-toast ' + (mode === 'paper' ? 'toast-paper' : 'toast-live');
+  t.textContent = mode === 'paper' ? '📄 Modo PAPER ativado — trades simulados' : '💰 Modo LIVE ativado — usando 95% do saldo real na Bitget';
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 4000);
+}
+function switchTab(t) {
+  document.querySelectorAll('.tab').forEach((el,i) => { el.classList.toggle('active', ['live','history','backtest'][i] === t); });
+  document.querySelectorAll('.panel').forEach(el => el.classList.remove('active'));
+  document.getElementById('panel-' + t).classList.add('active');
+  if (t === 'history') loadHistory();
+  if (t === 'backtest') loadBtHistory();
+}
+async function poll() {
+  try {
+    const d = await (await fetch('/status')).json();
+    const run = d.status === 'running', warm = d.status === 'warming';
+    updateModeUI(d.paper ? 'paper' : 'live');
+    document.getElementById('btnStart').disabled = run || warm;
+    document.getElementById('btnStop').disabled  = !(run || warm);
+    const se = document.getElementById('lv-status');
+    if (run) se.innerHTML = '<span class="status-dot dot-run"></span><span class="g">Rodando</span>';
+    else if (warm) se.innerHTML = '<span class="status-dot dot-warm"></span><span class="y">Warmup...</span>';
+    else se.innerHTML = '<span class="status-dot dot-stop"></span><span style="color:var(--muted)">Parado</span>';
+    if (d.bal  != null) document.getElementById('lv-bal').textContent  = d.bal.toFixed(2) + ' USDT';
+    const pe = document.getElementById('lv-pnl');
+    if (d.pnl  != null) { pe.textContent = (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(4) + ' USDT'; pe.className = 'kpi-val ' + (d.pnl >= 0 ? 'g' : 'r'); }
+    const pp = document.getElementById('lv-pos');
+    if (d.pos) { const s = d.pos.side; pp.innerHTML = `<span class="${s === 'long' ? 'g' : 'r'}">${s.toUpperCase()}</span>`; }
+    else { pp.innerHTML = '<span style="color:var(--muted)">FLAT</span>'; }
+    if (d.period != null) document.getElementById('lv-per').textContent = d.period;
+    if (d.ec     != null) document.getElementById('lv-ec').textContent  = d.ec.toFixed(2);
+    if (d.ema    != null) document.getElementById('lv-ema').textContent = d.ema.toFixed(2);
+    const tb = document.getElementById('lv-trades');
+    const tr = [...(d.trades || [])].reverse();
+    if (tr.length) {
+      tb.innerHTML = tr.map(t => {
+        const ac = t.action || ''; let cl = 'dir', lb = ac;
+        if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
+        if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
+        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
+      }).join('');
+    }
+    const lb = document.getElementById('lv-log');
+    if (d.log && d.log.length) {
+      lb.innerHTML = d.log.slice(-80).map(l => {
+        let cls = '';
+        if (/✅|LONG|BUY/.test(l)) cls = 'lg'; else if (/❌|EXIT|SHORT/.test(l)) cls = 'lr';
+        else if (/⚠️|WARN/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
+        return `<div class="${cls}">${l}</div>`;
+      }).join('');
+      lb.scrollTop = lb.scrollHeight;
+    }
+  } catch(e) { console.error(e); }
+}
+poll(); setInterval(poll, 4000);
+async function ctrl(a) {
+  const m = document.getElementById('sysmsg');
+  m.style.display = 'inline-block'; m.className = a === 'start' ? 'msg-ok' : 'msg-er';
+  m.textContent = a === 'start' ? 'Iniciando...' : 'Parando...';
+  try {
+    const d = await (await fetch('/' + a, { method: 'POST' })).json();
+    m.className = d.error ? 'msg-er' : 'msg-ok'; m.textContent = d.message || d.error || 'OK';
+  } catch { m.className = 'msg-er'; m.textContent = 'Erro de rede'; }
+  setTimeout(() => m.style.display = 'none', 5000); setTimeout(poll, 1500);
+}
+async function loadHistory() {
+  try {
+    const d = await (await fetch('/history')).json();
+    const s = d.stats || {};
+    const isPaper = _currentMode === 'paper';
+    const modeEl = document.getElementById('hist-session-mode');
+    const countEl = document.getElementById('hist-session-count');
+    const closedCount = (d.trades||[]).filter(t => t.status === 'closed').length;
+    if (modeEl) { modeEl.textContent = isPaper ? '📄 PAPER' : '💰 LIVE'; modeEl.className = 'mode-indicator ' + (isPaper ? 'mi-paper' : 'mi-live'); }
+    if (countEl) countEl.textContent = closedCount + ' trade' + (closedCount !== 1 ? 's' : '') + ' fechado' + (closedCount !== 1 ? 's' : '');
+    const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
+    document.getElementById('h-total').textContent = s.total || 0;
+    const wrEl = document.getElementById('h-wr'); wrEl.textContent = (s.win_rate||0).toFixed(1) + '%'; wrEl.className = 'kpi-val ' + (s.win_rate >= 50 ? 'g' : 'r');
+    const pnlEl = document.getElementById('h-pnl'); pnlEl.textContent = (s.total_pnl >= 0 ? '+' : '') + (s.total_pnl||0).toFixed(4) + ' USDT'; pnlEl.className = 'kpi-val ' + (s.total_pnl >= 0 ? 'g' : 'r');
+    const pfEl = document.getElementById('h-pf'); pfEl.textContent = pf; pfEl.className = 'kpi-val ' + (s.profit_factor > 1 ? 'g' : 'r');
+    document.getElementById('h-aw').textContent = '+' + (s.avg_win||0).toFixed(4);
+    document.getElementById('h-al').textContent = (s.avg_loss||0).toFixed(4);
+    document.getElementById('h-best').textContent = '+' + (s.best_trade||0).toFixed(4);
+    document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
+    const tb = document.getElementById('hist-tbl');
+    const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
+    if (!trades.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
+    tb.innerHTML = trades.map((t, i) => {
+      const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
+      const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
+      const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
+      const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
+      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+async function clearHistory() { await fetch('/history/clear', { method: 'POST' }); loadHistory(); }
+async function newPaperSession() {
+  if (!confirm('Iniciar nova sessão? Isso vai limpar os trades Paper/Live atuais.')) return;
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '🆕 Nova sessão iniciada';
+  await fetch('/history/clear', { method: 'POST' }); loadHistory();
+  setTimeout(() => m.style.display = 'none', 3000);
+}
+async function runBacktest() {
+  const btn = document.getElementById('btnBT'), prog = document.getElementById('bt-prog');
+  btn.disabled = true; btn.textContent = 'Rodando...'; prog.style.width = '20%';
+  document.getElementById('bt-result').style.display = 'none';
+  try {
+    const sym = document.getElementById('bt-sym').value, tf = document.getElementById('bt-tf').value;
+    const lim = document.getElementById('bt-lim').value, cap = document.getElementById('bt-cap').value;
+    const ofee = document.getElementById('bt-ofee').value, cfee = document.getElementById('bt-cfee').value;
+    prog.style.width = '60%';
+    const d = await (await fetch(`/backtest/run?symbol=${sym}&tf=${tf}&limit=${lim}&capital=${cap}&open_fee=${ofee}&close_fee=${cfee}`, {method:'POST'})).json();
+    prog.style.width = '100%';
+    if (d.error) { alert('Erro: ' + d.error); return; }
+    renderBacktestResult(d); loadBtHistory();
+  } catch(e) { alert('Erro: ' + e); }
+  finally { btn.disabled = false; btn.textContent = '▶ Executar'; setTimeout(() => prog.style.width = '0%', 1000); }
+}
+function renderBacktestResult(d) {
+  const pf = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
+  const hasFees = d.fees_enabled && (d.open_fee_pct > 0 || d.close_fee_pct > 0);
+  const pnlLabel = hasFees ? 'PnL Líquido' : 'PnL Total';
+  const kpis = [
+    [pnlLabel, (d.total_pnl >= 0 ? '+' : '') + d.total_pnl.toFixed(2) + ' USDT', d.total_pnl >= 0 ? 'g' : 'r'],
+    ['Saldo Final', d.final_bal.toFixed(2) + ' USDT', ''],
+    ['Win Rate', d.win_rate.toFixed(1) + '%', d.win_rate >= 50 ? 'g' : 'r'],
+    ['Total Trades', d.total_trades, ''],
+    ['Profit Factor', pf, d.profit_factor > 1 ? 'g' : 'r'],
+    ['Max Drawdown', d.max_drawdown.toFixed(2) + '%', 'r'],
+    ['Sharpe Ratio', d.sharpe.toFixed(3), d.sharpe >= 1 ? 'g' : d.sharpe >= 0 ? 'y' : 'r'],
+  ];
+  if (hasFees) kpis.push(['Taxas Pagas', '-' + (d.total_fees_paid||0).toFixed(4) + ' USDT', 'r']);
+  document.getElementById('bt-kpis').innerHTML = kpis.map(([lbl,val,cls]) => `<div class="kpi ${cls}"><div class="kpi-lbl">${lbl}</div><div class="kpi-val ${cls}">${val}</div></div>`).join('');
+  const trades = (d.trades || []).slice().reverse();
+  document.getElementById('bt-tbl').innerHTML = trades.length ? trades.map((t,i) => {
+    const pnlB = t.pnl_usdt || 0, pnlN = t.pnl_net != null ? t.pnl_net : pnlB;
+    const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
+    const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
+    const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
+    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
+  document.getElementById('bt-result').style.display = 'block';
+}
+async function loadBtHistory() {
+  try {
+    const d = await (await fetch('/backtest/history')).json();
+    const sessions = (d.sessions || []).slice().reverse();
+    const tb = document.getElementById('bt-hist-tbl');
+    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
+    tb.innerHTML = sessions.map(s => {
+      const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
+      const pc = s.total_pnl >= 0 ? 'g' : 'r';
+      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+loadBtHistory();
+async function apiPost(route, successMsg) {
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '...';
+  try {
+    const d = await (await fetch(route, { method: 'POST' })).json();
+    m.className = d.error ? 'abm-er' : 'abm-ok'; m.textContent = d.error || successMsg || d.message || 'OK';
+  } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
+  setTimeout(() => m.style.display = 'none', 3500); setTimeout(poll, 1200);
+}
+async function exportJson(route, filename) {
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = 'Exportando...';
+  try {
+    const d = await (await fetch(route)).json();
+    const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = filename + '_' + new Date().toISOString().slice(0,10) + '.json';
+    a.click(); URL.revokeObjectURL(url); m.textContent = '✓ Download iniciado';
+  } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
+  setTimeout(() => m.style.display = 'none', 3000);
+}
+async function quickBacktest() {
+  const sym = prompt('Símbolo (ex: ETH-USDT-SWAP)', 'ETH-USDT-SWAP'); if (!sym) return;
+  const tf  = prompt('Timeframe', '30m'); if (!tf) return;
+  const lim = prompt('Candles', '500'); if (!lim) return;
+  const cap = prompt('Capital inicial (USDT)', '1000'); if (!cap) return;
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '⏳ Rodando...';
+  try {
+    const d = await (await fetch(`/backtest/run?symbol=${encodeURIComponent(sym)}&tf=${tf}&limit=${lim}&capital=${cap}`, { method: 'POST' })).json();
+    if (d.error) { m.className='abm-er'; m.textContent='Erro: '+d.error; }
+    else { m.textContent = `✓ PnL: ${d.total_pnl>=0?'+':''}${(d.total_pnl||0).toFixed(2)} | WR: ${(d.win_rate||0).toFixed(1)}%`; switchTab('backtest'); renderBacktestResult(d); loadBtHistory(); }
+  } catch(e) { m.className='abm-er'; m.textContent='Erro: '+e; }
+  setTimeout(() => m.style.display = 'none', 6000);
+}
+</script>
+</body>
+</html>"""
 
 
 def _thread():
