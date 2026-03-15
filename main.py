@@ -7,17 +7,17 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v15 — Execução imediata, monitor 10ms e timing preciso (2025)
+FIX v15 — Monitor 10ms e polling sem pular ciclo (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMAS:
-  - Saídas atrasavam porque monitor dormia 100ms.
-  - Entradas eram agendadas para o próximo ciclo, adicionando delay.
-  - Despertar não era exato (1s de atraso).
+  - Monitor de posição era lento (100ms) → atraso nas saídas.
+  - Após o wait, se candle não estivesse disponível, pulava ciclo.
+  - Entradas no live estavam sendo agendadas, causando atraso extra.
 
 SOLUÇÕES:
-  - Monitor agora dorme 10ms.
-  - Ações BUY/SELL executadas imediatamente.
-  - _wait usa perf_counter e busy-wait nos últimos 10ms para precisão.
+  - Monitor agora verifica a cada 10ms.
+  - Polling após wait: continua tentando indefinidamente até obter o candle.
+  - Entradas executadas na hora, sem agendamento (igual paper).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -559,7 +559,6 @@ class LiveTrader:
                 toff = self.strategy.toff
 
                 if side == 'long':
-                    # Atualiza highest desde a entrada
                     if price > self._highest_since_entry:
                         self._highest_since_entry = price
                     profit_ticks = (self._highest_since_entry - entry) / tick
@@ -624,7 +623,7 @@ class LiveTrader:
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
-        # Processa as ações (executa imediatamente)
+        # Processa as ações (todas executadas imediatamente, sem agendamento)
         for act in actions:
             kind = act.get('action', '')
 
@@ -805,7 +804,7 @@ class LiveTrader:
     def _wait(self, tf: int = 30):
         """
         Aguarda até o próximo horário de fechamento do candle (HH:00:00.010 ou HH:30:00.010) em UTC,
-        com precisão de milissegundos usando busy-wait nos últimos 10ms.
+        com precisão de milissegundos usando busy-wait no final.
         """
         now_utc = datetime.now(timezone.utc)
         # Calcula o próximo múltiplo de 30 minutos (0 ou 30) em minutos desde meia-noite
@@ -825,9 +824,8 @@ class LiveTrader:
         if sleep_seconds > 0.01:
             time.sleep(sleep_seconds - 0.01)
 
-        # Busy-wait nos últimos 10ms para precisão (usando perf_counter)
-        target_perf = target_utc.timestamp()
-        while time.time() < target_perf:
+        # Busy-wait nos últimos 10ms para precisão
+        while datetime.now(timezone.utc) < target_utc:
             pass
 
     def _candle(self) -> Optional[Dict]:
@@ -915,18 +913,24 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # Após o wait, o candle deve estar disponível. Faz uma única tentativa.
-                c = self._candle()
-                if c is None:
-                    log.warning("  ⚠️ Candle não disponível imediatamente após wait — pulando ciclo")
-                    continue
+                # ── Polling: tenta indefinidamente até obter o candle ──
+                c = None
+                attempt = 0
+                while c is None:
+                    raw = self._candle()
+                    if raw is None:
+                        time.sleep(0.01)
+                        attempt += 1
+                        continue
+                    if str(raw['timestamp']) == self._last_candle_ts:
+                        time.sleep(0.01)
+                        attempt += 1
+                        continue
+                    c = raw
+                    break
 
                 ts = str(c['timestamp'])
-                if ts == self._last_candle_ts:
-                    log.warning("  ⚠️ Candle repetido — pulando")
-                    continue
-
-                log.info(f"  ✅ Novo candle: {ts}")
+                log.info(f"  ✅ Novo candle: {ts} (após {attempt} tentativas)")
                 self._last_candle_ts = ts
                 self._refresh_cache()
                 self.process(c)
