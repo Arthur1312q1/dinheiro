@@ -526,23 +526,23 @@ class LiveTrader:
 
     def _monitor_position(self):
         """
-        Thread que monitora o preço de mercado a cada 5ms e fecha a posição
+        Thread que monitora o preço de mercado a cada 1ms e fecha a posição
         se os níveis de stop ou trailing forem atingidos.
         Funciona tanto para PAPER quanto para LIVE.
         """
-        log.info("  🔍 Monitor de posição iniciado (5ms)")
+        log.info("  🔍 Monitor de posição iniciado (1ms)")
         while not self._monitor_stop.is_set():
             try:
                 # Obtém preço atual (via API Bitget, mesmo para PAPER)
                 price = self._mark_price()
                 if price <= 0:
-                    time.sleep(0.005)
+                    time.sleep(0.001)
                     continue
 
                 # Pega a posição do cache (que é atualizado periodicamente)
                 pos = self._cache_pos
                 if pos is None:
-                    time.sleep(0.005)
+                    time.sleep(0.001)
                     continue
 
                 side = pos['side']
@@ -613,7 +613,7 @@ class LiveTrader:
             except Exception as e:
                 log.error(f"  ❌ Erro no monitor: {e}")
             finally:
-                time.sleep(0.005)  # 5ms
+                time.sleep(0.001)  # 1ms
 
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
@@ -820,6 +820,7 @@ class LiveTrader:
         """
         Aguarda até o próximo fechamento de candle (HH:00:00.000 ou HH:30:00.000) em UTC,
         com precisão de microssegundos usando busy-wait no final.
+        Após o busy-wait, aguarda 1ms para garantir que o candle já esteja disponível.
         """
         now_utc = datetime.now(timezone.utc)
         total_minutes = now_utc.hour * 60 + now_utc.minute
@@ -838,6 +839,9 @@ class LiveTrader:
         # Busy-wait com precisão de microssegundos
         while datetime.now(timezone.utc) < target_utc:
             pass
+
+        # Aguarda 1ms extra para o candle ser disponibilizado pela exchange
+        time.sleep(0.001)
 
     def _candle(self) -> Optional[Dict]:
         """
