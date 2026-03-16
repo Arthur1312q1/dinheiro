@@ -7,17 +7,16 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v15 — Monitor 10ms e polling sem pular ciclo (2025)
+FIX v14 — Monitor preciso e timing exato (2025)
 ══════════════════════════════════════════════════════════════════════
 PROBLEMAS:
-  - Monitor de posição era lento (100ms) → atraso nas saídas.
-  - Após o wait, se candle não estivesse disponível, pulava ciclo.
-  - Entradas no live estavam sendo agendadas, causando atraso extra.
+  - Saídas atrasavam 30min porque monitor não estava funcional.
+  - Entradas não ocorriam no milissegundo exato.
 
 SOLUÇÕES:
-  - Monitor agora verifica a cada 10ms.
-  - Polling após wait: continua tentando indefinidamente até obter o candle.
-  - Entradas executadas na hora, sem agendamento (igual paper).
+  - Monitor atualiza preço a cada 100ms e fecha posição imediatamente.
+  - _wait usa busy-wait nos últimos 10ms para precisão.
+  - Entradas executadas na hora, sem agendamento extra.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -227,7 +226,6 @@ class PaperTrader:
         trade_id = self.position["id"]
         pnl      = (exit_px - entry_px) * qty
         self.position = None
-        self.balance += pnl  # atualiza saldo
         ts = ts or brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
@@ -243,7 +241,6 @@ class PaperTrader:
         trade_id = self.position["id"]
         pnl      = (entry_px - exit_px) * qty
         self.position = None
-        self.balance += pnl  # atualiza saldo
         ts = ts or brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
@@ -507,10 +504,6 @@ class LiveTrader:
     def warmup(self, df: pd.DataFrame):
         self._warming = True
         log.info(f"🔄 Warmup: {len(df)} candles...")
-        # Salva o valor original de warmup_bars
-        original_warmup = self.strategy.warmup_bars
-        # Define um valor alto para que todos os candles sejam considerados warmup
-        self.strategy.warmup_bars = len(df)
         for _, row in df.iterrows():
             self.strategy.next({
                 'open':      float(row['open']),
@@ -520,8 +513,6 @@ class LiveTrader:
                 'timestamp': row.get('timestamp', 0),
                 'index':     int(row.get('index', 0)),
             })
-        # Restaura o valor original
-        self.strategy.warmup_bars = original_warmup
         self._pnl_baseline = self.strategy.net_profit
         self._warming      = False
         last_close = float(df['close'].iloc[-1])
@@ -538,24 +529,24 @@ class LiveTrader:
 
     def _monitor_position(self):
         """
-        Thread que monitora o preço de mercado a cada 10ms e fecha a posição
+        Thread que monitora o preço de mercado a cada 100ms e fecha a posição
         se os níveis de stop ou trailing forem atingidos.
         """
-        log.info("  🔍 Monitor de posição iniciado (10ms)")
+        log.info("  🔍 Monitor de posição iniciado")
         while not self._monitor_stop.is_set():
             try:
                 if self._is_paper() or self.bitget is None:
-                    time.sleep(0.01)
+                    time.sleep(0.1)
                     continue
 
                 pos = self._cache_pos
                 if pos is None:
-                    time.sleep(0.01)
+                    time.sleep(0.1)
                     continue
 
                 price = self._mark_price()
                 if price <= 0:
-                    time.sleep(0.01)
+                    time.sleep(0.1)
                     continue
 
                 side = pos['side']
@@ -567,6 +558,7 @@ class LiveTrader:
                 toff = self.strategy.toff
 
                 if side == 'long':
+                    # Atualiza highest desde a entrada
                     if price > self._highest_since_entry:
                         self._highest_since_entry = price
                     profit_ticks = (self._highest_since_entry - entry) / tick
@@ -606,7 +598,7 @@ class LiveTrader:
             except Exception as e:
                 log.error(f"  ❌ Erro no monitor: {e}")
             finally:
-                time.sleep(0.01)  # 10ms
+                time.sleep(0.1)  # 100ms
 
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
@@ -625,13 +617,13 @@ class LiveTrader:
             f"mode={'PAPER' if self._is_paper() else 'LIVE'}"
         )
 
-        # ── Processa o candle com a estratégia (gera ações) ──────────
+        # ── Agora processa o candle com a estratégia (gera ações) ──────────
         actions = self.strategy.next(candle) or []
 
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
-        # Processa as ações (todas executadas imediatamente, sem agendamento)
+        # Processa as ações
         for act in actions:
             kind = act.get('action', '')
 
@@ -832,7 +824,7 @@ class LiveTrader:
         if sleep_seconds > 0.01:
             time.sleep(sleep_seconds - 0.01)
 
-        # Busy-wait nos últimos 10ms para precisão
+        # Busy-wait nos últimos 10ms para precisão (usando perf_counter)
         while datetime.now(timezone.utc) < target_utc:
             pass
 
@@ -921,24 +913,25 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # ── Polling: tenta indefinidamente até obter o candle ──
+                # ── Polling ultra-rápido: 10ms entre tentativas, até 300 tentativas (3s) ──
                 c = None
-                attempt = 0
-                while c is None:
+                for _attempt in range(300):  # 300 tentativas * 10ms = 3 segundos
                     raw = self._candle()
                     if raw is None:
                         time.sleep(0.01)
-                        attempt += 1
                         continue
                     if str(raw['timestamp']) == self._last_candle_ts:
                         time.sleep(0.01)
-                        attempt += 1
                         continue
                     c = raw
                     break
 
+                if c is None:
+                    log.warning("  ⚠️ Candle não atualizou após 3s — pulando ciclo")
+                    continue
+
                 ts = str(c['timestamp'])
-                log.info(f"  ✅ Novo candle: {ts} (após {attempt} tentativas)")
+                log.info(f"  ✅ Novo candle: {ts} (tentativa {_attempt+1})")
                 self._last_candle_ts = ts
                 self._refresh_cache()
                 self.process(c)
