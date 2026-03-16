@@ -526,24 +526,23 @@ class LiveTrader:
 
     def _monitor_position(self):
         """
-        Thread que monitora o preço de mercado a cada 100ms e fecha a posição
+        Thread que monitora o preço de mercado a cada 5ms e fecha a posição
         se os níveis de stop ou trailing forem atingidos.
+        Funciona tanto para PAPER quanto para LIVE.
         """
-        log.info("  🔍 Monitor de posição iniciado")
+        log.info("  🔍 Monitor de posição iniciado (5ms)")
         while not self._monitor_stop.is_set():
             try:
-                if self._is_paper() or self.bitget is None:
-                    time.sleep(0.1)
-                    continue
-
-                pos = self._cache_pos
-                if pos is None:
-                    time.sleep(0.1)
-                    continue
-
+                # Obtém preço atual (via API Bitget, mesmo para PAPER)
                 price = self._mark_price()
                 if price <= 0:
-                    time.sleep(0.1)
+                    time.sleep(0.005)
+                    continue
+
+                # Pega a posição do cache (que é atualizado periodicamente)
+                pos = self._cache_pos
+                if pos is None:
+                    time.sleep(0.005)
                     continue
 
                 side = pos['side']
@@ -565,14 +564,24 @@ class LiveTrader:
                         stop = self._highest_since_entry - toff * tick
                     else:
                         stop = entry - sl * tick
+
                     if price <= stop:
+                        close_price = stop  # usa o preço de stop exato (para PAPER)
+                        reason = "SL" if not self._trail_active else "TRAIL"
                         log.info(f"  🔴 STOP LOSS LONG acionado @ {price:.2f} (stop={stop:.2f})")
-                        self.bitget.close_long(qty, price, "SL" if not self._trail_active else "TRAIL")
-                        self.strategy.confirm_exit('LONG', price, qty, datetime.now(timezone.utc), "SL" if not self._trail_active else "TRAIL")
+
+                        if self._is_paper():
+                            self.paper.close_long(qty, close_price, reason, ts=brazil_iso())
+                        else:
+                            self.bitget.close_long(qty, close_price, reason)
+
+                        self.strategy.confirm_exit('LONG', close_price, qty,
+                                                   datetime.now(timezone.utc), reason)
                         self._cache_pos = None
                         self._highest_since_entry = 0.0
                         self._trail_active = False
-                        self._add_log("EXIT_LONG", price, qty, "SL" if not self._trail_active else "TRAIL")
+                        self._add_log("EXIT_LONG", close_price, qty, reason)
+
                 elif side == 'short':
                     if price < self._lowest_since_entry:
                         self._lowest_since_entry = price
@@ -583,19 +592,28 @@ class LiveTrader:
                         stop = self._lowest_since_entry + toff * tick
                     else:
                         stop = entry + sl * tick
+
                     if price >= stop:
+                        close_price = stop
+                        reason = "SL" if not self._trail_active else "TRAIL"
                         log.info(f"  🟢 STOP LOSS SHORT acionado @ {price:.2f} (stop={stop:.2f})")
-                        self.bitget.close_short(qty, price, "SL" if not self._trail_active else "TRAIL")
-                        self.strategy.confirm_exit('SHORT', price, qty, datetime.now(timezone.utc), "SL" if not self._trail_active else "TRAIL")
+
+                        if self._is_paper():
+                            self.paper.close_short(qty, close_price, reason, ts=brazil_iso())
+                        else:
+                            self.bitget.close_short(qty, close_price, reason)
+
+                        self.strategy.confirm_exit('SHORT', close_price, qty,
+                                                   datetime.now(timezone.utc), reason)
                         self._cache_pos = None
                         self._lowest_since_entry = float('inf')
                         self._trail_active = False
-                        self._add_log("EXIT_SHORT", price, qty, "SL" if not self._trail_active else "TRAIL")
+                        self._add_log("EXIT_SHORT", close_price, qty, reason)
 
             except Exception as e:
                 log.error(f"  ❌ Erro no monitor: {e}")
             finally:
-                time.sleep(0.1)  # 100ms
+                time.sleep(0.005)  # 5ms
 
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
