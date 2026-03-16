@@ -419,7 +419,7 @@ class LiveTrader:
         self._warming = False
         self._log_entries: List[Dict] = []          # ações executadas (para dashboard)
         self._pnl_baseline = 0.0
-        self._last_candle_ts = ""
+        self._last_candle_ts_ms = 0                  # armazena timestamp do último candle em ms
 
         # Cache para dashboard (atualizado a cada ciclo)
         self._cache_pos: Optional[Dict] = None
@@ -475,7 +475,7 @@ class LiveTrader:
         if last_close > 0:
             self._cache_px = last_close
         self._refresh_cache()
-        self._last_candle_ts = ""
+        self._last_candle_ts_ms = 0
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} | EC={self.strategy.EC:.2f} | px_cache={self._cache_px:.2f}")
 
     @property
@@ -665,27 +665,31 @@ class LiveTrader:
 
     def _wait(self, tf: int = 30):
         """
-        Aguarda até o próximo fechamento de candle (HH:00:00.010 ou HH:30:00.010 UTC),
-        com busy-wait nos últimos 10ms.
+        Aguarda até o próximo fechamento de candle (HH:00:00.000 ou HH:30:00.000) em UTC,
+        com precisão de microssegundos usando busy-wait no final.
         """
         now_utc = datetime.now(timezone.utc)
         total_minutes = now_utc.hour * 60 + now_utc.minute
         next_multiple = ((total_minutes // 30) + 1) * 30
-        target_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=next_multiple, milliseconds=10)
+        target_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=next_multiple)
         if target_utc <= now_utc:
             target_utc += timedelta(minutes=30)
+
         sleep_seconds = (target_utc - now_utc).total_seconds()
         target_brt = target_utc.astimezone(BRT)
-        log.info(f"⏰ Aguardando {sleep_seconds:.3f}s até {target_brt.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
-        if sleep_seconds > 0.01:
-            time.sleep(sleep_seconds - 0.01)
+        log.info(f"⏰ Aguardando {sleep_seconds:.6f}s até {target_brt.strftime('%H:%M:%S.%f')[:-3]} ({tf}m)...")
+
+        if sleep_seconds > 0.001:
+            time.sleep(sleep_seconds - 0.001)
+
+        # Busy-wait com precisão de microssegundos
         while datetime.now(timezone.utc) < target_utc:
             pass
 
     def _candle(self) -> Optional[Dict]:
         """
-        Busca o último candle fechado da Bitget (data[1]).
-        Retorna None se não houver 2 candles disponíveis.
+        Busca o candle mais recente da Bitget (apenas 1 candle).
+        Retorna None se não conseguir ou se o timestamp não tiver mudado.
         """
         tf_map = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
                   "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
@@ -697,31 +701,34 @@ class LiveTrader:
                     "symbol": "ETHUSDT",
                     "productType": "usdt-futures",
                     "granularity": tf,
-                    "limit": "2",
+                    "limit": "1",          # apenas o último candle
                 },
-                timeout=10,
+                timeout=5,                  # timeout reduzido
             ).json()
             if r.get("code") != "00000":
                 if r.get("code") == "429":
-                    log.warning("  ⚠️ Rate limit (429) — aguardando...")
-                    time.sleep(2)
-                else:
-                    log.error(f"  ❌ Bitget candles: {r.get('msg')}")
+                    log.warning("  ⚠️ Rate limit (429)")
+                    return None
+                log.error(f"  ❌ Bitget candles: {r.get('msg')}")
                 return None
             data = r.get("data", [])
-            if len(data) < 2:
-                log.debug("  ℹ️ Apenas 1 candle disponível")
+            if not data:
                 return None
-            c = data[1]  # último candle fechado
+            c = data[0]
+            candle_ts = int(c[0])
+            # Se o timestamp for igual ao último já processado, ignora
+            if candle_ts == self._last_candle_ts_ms:
+                return None
             candle = {
                 'open': float(c[1]),
                 'high': float(c[2]),
                 'low': float(c[3]),
                 'close': float(c[4]),
-                'timestamp': datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc),
+                'timestamp': datetime.fromtimestamp(candle_ts / 1000, tz=timezone.utc),
                 'index': self.strategy._bar + 1,
             }
-            log.info(f"  🕯️ Candle fechado: O={candle['open']:.2f} H={candle['high']:.2f} L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
+            self._last_candle_ts_ms = candle_ts
+            log.info(f"  🕯️ Candle obtido: O={candle['open']:.2f} H={candle['high']:.2f} L={candle['low']:.2f} C={candle['close']:.2f} @ {candle['timestamp']}")
             return candle
         except Exception as e:
             log.error(f"  ❌ _candle erro: {e}")
@@ -764,33 +771,26 @@ class LiveTrader:
             try:
                 self._wait(tf)
 
-                # Polling rápido para obter novo candle
+                # Polling ultrarrápido: tenta a cada 1ms até obter o novo candle (máx 200ms)
                 candle = None
-                for _ in range(300):  # 3s
+                start_poll = time.perf_counter()
+                while time.perf_counter() - start_poll < 0.2:  # 200ms limite
                     raw = self._candle()
-                    if raw is None:
-                        time.sleep(0.01)
-                        continue
-                    ts_str = str(raw['timestamp'])
-                    if ts_str == self._last_candle_ts:
-                        time.sleep(0.01)
-                        continue
-                    candle = raw
-                    break
+                    if raw is not None:
+                        candle = raw
+                        break
+                    time.sleep(0.001)  # 1ms entre tentativas
 
                 if candle is None:
-                    log.warning("  ⚠️ Candle não atualizou após 3s — pulando ciclo")
+                    log.warning("  ⚠️ Candle não disponível após 200ms — pulando ciclo")
                     continue
 
-                self._last_candle_ts = str(candle['timestamp'])
                 self._refresh_cache()
-                log.info(f"  ✅ Novo candle processado")
+                log.info(f"  ✅ Novo candle processado (tempo de obtenção: {(time.perf_counter()-start_poll)*1000:.1f}ms)")
 
-                # Processa a estratégia com o candle fechado
                 actions = self.strategy.next(candle) or []
                 log.info(f"  📊 {len(actions)} ação(ões): {[(a.get('action'), round(a.get('price',0),2)) for a in actions]}")
 
-                # Executa cada ação imediatamente
                 for act in actions:
                     self._execute_action(act, candle['close'])
 
