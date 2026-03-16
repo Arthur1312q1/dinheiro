@@ -22,49 +22,9 @@
 #         (Pine last-wins: SELL cancela BUY quando pos=0)
 #    6. Salva sinais → _buy_prev, _sell_prev
 #
-# CORREÇÕES APLICADAS (cada uma explica um gap com TradingView):
-# ──────────────────────────────────────────────────────────────
-#  ✅ FIX 1 — Exit ao stop_price (não ao next open):
-#     Pine fill = stop_price (slippage=0). Python antigo usava next open.
-#     Resultado: win rate 48% → 96%
-#
-#  ✅ FIX 2 — Pending vê pos=0 no mesmo close do exit:
-#     Após exit intra-barra, pos=0 imediatamente.
-#     Pending agenda entrada → executa no OPEN da próxima barra (não 2 barras).
-#     Resultado: timing correto, +28 trades recuperados
-#
-#  ✅ FIX 3 — warmup_bars=0 (Pine não tem warmup):
-#     Python anterior: warmup=300 → 18+ trades perdidos nas primeiras barras
-#     Resultado: ~19 trades recuperados
-#
-#  ✅ FIX 4 — Period=0 permitido (Pine exato):
-#     Pine: lenC=0 → Period=round(0)=0 → alpha=2/(0+1)=2
-#     Python anterior: max(1, period) → alpha=1 → EMA/EC diferentes
-#     Resultado: sinais corretos nas primeiras ~50-100 barras
-#
-#  ✅ FIX 5 — crossover usa <= (Pine v3 exato):
-#     Pine v3 crossover(a,b) = a[1] <= b[1] AND a > b
-#     Pine v3 crossunder(a,b)= a[1] >= b[1] AND a < b
-#
-#  ✅ FIX 6 — Pine last-wins (SELL cancela BUY quando pos=0)
-#
-# USO PARA LIVE TRADING:
-# ──────────────────────────────────────────────────────────────
-#   strategy = AdaptiveZeroLagEMA(...)
-#
-#   # A cada close de barra:
-#   actions = strategy.next(candle)
-#
-#   # Verificar orders pendentes para executar no próximo open:
-#   pending = strategy.get_pending_orders()
-#   if pending:
-#       # Enviar para exchange (BingX, etc.)
-#       for order in pending:
-#           exchange.send_order(order)
-#
-#   # Quando exchange confirmar fill:
-#   strategy.confirm_fill(side, price, qty, timestamp)
-#
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODIFICAÇÃO SOLICITADA: Forçar trade em todos os candles (alternando compra/venda)
+# sem alterar parâmetros e mantendo o delay de uma barra.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -519,8 +479,18 @@ class AdaptiveZeroLagEMA:
             self._sched_entries()
 
         # ── Salva sinais para próxima barra ───────────────────────────────
-        self._buy_prev  = buy_sig
-        self._sell_prev = sell_sig
+        # MODIFICAÇÃO: Forçar trade em todos os candles após warmup
+        if self._bar <= self.warmup_bars:
+            self._buy_prev  = buy_sig
+            self._sell_prev = sell_sig
+        else:
+            # Alternar compra e venda a cada candle (mantendo delay de 1 barra)
+            if self._bar % 2 == 0:
+                self._buy_prev = True
+                self._sell_prev = False
+            else:
+                self._buy_prev = False
+                self._sell_prev = True
 
         # ── Log periódico ─────────────────────────────────────────────────
         if idx % 500 == 0:
@@ -528,7 +498,7 @@ class AdaptiveZeroLagEMA:
             print(
                 f"{wu_tag}[{idx:5d}] "
                 f"P={self.Period:3d} EC={ec:.4f} EMA={ema:.4f} "
-                f"xo={int(buy_sig)} xu={int(sell_sig)} "
+                f"xo={int(self._buy_prev)} xu={int(self._sell_prev)} "
                 f"pos={self.position_size:+.4f} "
                 f"trail={'ON' if self._trail_active else 'off'} "
                 f"el={self._el} es={self._es} "
