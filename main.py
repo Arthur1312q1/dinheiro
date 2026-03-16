@@ -227,6 +227,7 @@ class PaperTrader:
         trade_id = self.position["id"]
         pnl      = (exit_px - entry_px) * qty
         self.position = None
+        self.balance += pnl  # atualiza saldo
         ts = ts or brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
@@ -242,6 +243,7 @@ class PaperTrader:
         trade_id = self.position["id"]
         pnl      = (entry_px - exit_px) * qty
         self.position = None
+        self.balance += pnl  # atualiza saldo
         ts = ts or brazil_iso()
         try:
             history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
@@ -505,6 +507,10 @@ class LiveTrader:
     def warmup(self, df: pd.DataFrame):
         self._warming = True
         log.info(f"🔄 Warmup: {len(df)} candles...")
+        # Salva o valor original de warmup_bars
+        original_warmup = self.strategy.warmup_bars
+        # Define um valor alto para que todos os candles sejam considerados warmup
+        self.strategy.warmup_bars = len(df)
         for _, row in df.iterrows():
             self.strategy.next({
                 'open':      float(row['open']),
@@ -514,6 +520,8 @@ class LiveTrader:
                 'timestamp': row.get('timestamp', 0),
                 'index':     int(row.get('index', 0)),
             })
+        # Restaura o valor original
+        self.strategy.warmup_bars = original_warmup
         self._pnl_baseline = self.strategy.net_profit
         self._warming      = False
         last_close = float(df['close'].iloc[-1])
