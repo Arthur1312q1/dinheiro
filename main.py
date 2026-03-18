@@ -7,11 +7,11 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v21 — Monitor contínuo reativado (saídas em tempo real)
+FIX v22 — Monitor corrigido (stop fixo durante o candle, trailing só no fechamento)
 ══════════════════════════════════════════════════════════════════════
 - Entradas PAPER usam open do candle (como backtest)
-- Saídas monitoradas em tempo real (thread 1ms) usando stops da estratégia
-- Reversões tratadas pela estratégia no próximo candle
+- Monitor verifica preço a cada 1ms e fecha se stop fixo for atingido
+- Trailing stop só é atualizado no fechamento do candle (pela estratégia)
 - Dashboard HTML completo mantido
 ══════════════════════════════════════════════════════════════════════
 """
@@ -441,7 +441,7 @@ class Bitget:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LIVE TRADER (COM MONITOR CONTÍNUO PARA SAÍDAS EM TEMPO REAL)
+# LIVE TRADER (COM MONITOR CORRIGIDO – STOP FIXO DURANTE O CANDLE)
 # ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
     def __init__(self):
@@ -521,25 +521,22 @@ class LiveTrader:
     def _monitor_position(self):
         """
         Thread que monitora o preço de mercado a cada 1ms e fecha a posição
-        se os níveis de stop ou trailing forem atingidos.
-        Funciona para PAPER e LIVE.
+        se o stop fixo ou trailing (atualizado apenas no candle) for atingido.
+        NÃO atualiza _highest/_lowest em tempo real – usa os valores da estratégia.
         """
-        log.info("  🔍 Monitor de posição iniciado (1ms)")
+        log.info("  🔍 Monitor de posição iniciado (1ms) – stop fixo durante o candle")
         while not self._monitor_stop.is_set():
             try:
-                # Obtém preço atual
                 price = self._mark_price()
                 if price <= 0:
                     time.sleep(0.001)
                     continue
 
-                # Verifica se há posição na estratégia
                 pos_size = self.strategy.position_size
                 if pos_size == 0:
                     time.sleep(0.001)
                     continue
 
-                # Obtém parâmetros da estratégia
                 entry = self.strategy.position_price
                 tick = self.strategy.tick
                 sl = self.strategy.sl
@@ -547,19 +544,10 @@ class LiveTrader:
                 toff = self.strategy.toff
 
                 if pos_size > 0:  # LONG
-                    # Atualiza highest desde a entrada (a estratégia já faz isso no candle, mas aqui precisamos do valor atual)
-                    # Para trailing, usamos o highest armazenado na estratégia (atualizado a cada candle)
+                    # Usa o highest armazenado pela estratégia (atualizado no candle)
                     highest = self.strategy._highest
-                    if price > highest:
-                        # A thread pode atualizar o highest para um trailing mais preciso?
-                        # Mas a estratégia recalcula no próximo candle. Para manter consistência, usamos o valor da estratégia.
-                        # Se quisermos um trailing mais preciso, podemos atualizar aqui também.
-                        # Vamos atualizar o highest na estratégia para que o trailing seja mais responsivo.
-                        self.strategy._highest = price
-                        highest = price
                     profit_ticks = (highest - entry) / tick
-                    if profit_ticks >= tp:
-                        self.strategy._trail_active = True
+                    # O trailing active é decidido pela estratégia no candle
                     if self.strategy._trail_active:
                         stop = highest - toff * tick
                         rsn = "TRAIL"
@@ -573,7 +561,6 @@ class LiveTrader:
                             self.paper.close_long(pos_size, stop, rsn, ts=brazil_iso())
                         else:
                             self.bitget.close_long(pos_size, stop, rsn)
-                        # Notifica a estratégia
                         self.strategy.confirm_exit('LONG', stop, pos_size, datetime.now(timezone.utc), rsn)
                         self._cache_pos = None
                         self._cache_bal = self.strategy.balance
@@ -582,12 +569,7 @@ class LiveTrader:
                 elif pos_size < 0:  # SHORT
                     size = abs(pos_size)
                     lowest = self.strategy._lowest
-                    if price < lowest:
-                        self.strategy._lowest = price
-                        lowest = price
                     profit_ticks = (entry - lowest) / tick
-                    if profit_ticks >= tp:
-                        self.strategy._trail_active = True
                     if self.strategy._trail_active:
                         stop = lowest + toff * tick
                         rsn = "TRAIL"
@@ -650,7 +632,7 @@ class LiveTrader:
             else:
                 act_ts = brazil_iso()
 
-            # ── EXIT LONG (gerado pela estratégia no backtest, mas no live ignoramos pois o monitor cuida)
+            # ── EXIT LONG (ignorado – monitor cuida) ─────────────────────
             if kind == 'EXIT_LONG':
                 log.debug("  ℹ️ EXIT_LONG ignorada (monitor ativo)")
                 continue
@@ -668,9 +650,8 @@ class LiveTrader:
                     continue
 
                 if self._is_paper():
-                    px = open_px  # usa o open do candle (como no backtest)
+                    px = open_px
                     pos = self.paper.get_position()
-                    # Reversão: se houver posição contrária, fecha primeiro (a estratégia já deve ter gerado saída, mas garantimos)
                     if pos and pos['side'] == 'short':
                         self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
                         self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
@@ -691,12 +672,10 @@ class LiveTrader:
 
                 else:  # LIVE
                     px = self._mark_price() or close_px
-                    # Consulta posição atual da Bitget para evitar duplicidade
                     pos = self.bitget.position()
                     if pos and pos['side'] == 'long':
                         log.info("  ⏭️ BUY ignorado — já tem long aberto")
                         continue
-                    # Se houver posição contrária, a estratégia já deve ter gerado saída, mas podemos garantir:
                     if pos and pos['side'] == 'short':
                         log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {px:.2f}")
                         self.bitget.close_short(pos['size'], px, "REVERSAL")
@@ -767,7 +746,7 @@ class LiveTrader:
                     else:
                         log.error(f"  ❌ bitget.open_short falhou")
 
-        # Sincroniza saldo e posição com o estado da estratégia (apenas paper)
+        # Sincroniza saldo e posição com a estratégia (apenas paper)
         if self._is_paper():
             self.paper.balance = self.strategy.balance
             self._cache_bal    = self.strategy.balance
@@ -864,7 +843,7 @@ class LiveTrader:
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_position, daemon=True)
         self._monitor_thread.start()
-        log.info("  🔍 Monitor de posição ativo (1ms)")
+        log.info("  🔍 Monitor de posição ativo (1ms) – stop fixo durante o candle")
 
         self._running = True
         tf = int(TIMEFRAME.replace('m','').replace('h','')) * \
