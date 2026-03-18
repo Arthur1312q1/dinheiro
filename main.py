@@ -503,8 +503,42 @@ class LiveTrader:
                 'timestamp': row.get('timestamp', 0),
                 'index':     int(row.get('index', 0)),
             })
-        self._pnl_baseline = self.strategy.net_profit
+
+        # ── Sincronização pós-warmup ──────────────────────────────────────
+        # Durante o warmup, a estratégia processa candles históricos e pode
+        # abrir/fechar posições INTERNAMENTE (bars > warmup_bars). Porém,
+        # NENHUMA dessas ordens foi executada no paper/live.
+        # Resetamos o estado de POSIÇÃO e ORDENS para flat, preservando
+        # apenas o estado dos INDICADORES (EMA, EC, Period, IFM) que é o
+        # objetivo do warmup. Os sinais _buy_prev/_sell_prev do último candle
+        # histórico são mantidos para que a primeira ordem ao vivo seja
+        # idêntica à do backtest.
+        if self.strategy.position_size != 0:
+            log.info(f"  ↩️ Posição virtual do warmup descartada: "
+                     f"{self.strategy.position_size:+.6f} ETH "
+                     f"@ {self.strategy.position_price:.2f} "
+                     f"(nunca executada no {'paper' if self._is_paper() else 'live'})")
+
+        # Reset estado de posição (não afeta indicadores)
+        self.strategy.position_size  = 0.0
+        self.strategy.position_price = 0.0
+        self.strategy._highest       = 0.0
+        self.strategy._lowest        = float('inf')
+        self.strategy._trail_active  = False
+        self.strategy._monitored     = False
+        # Reset ordens pendentes (serão recriadas pelo primeiro candle ao vivo
+        # via _buy_prev/_sell_prev que foram mantidos do último candle histórico)
+        self.strategy._el            = False
+        self.strategy._es            = False
+        self.strategy._pBuy          = False
+        self.strategy._pSell         = False
+        # Reset PnL — paper/live começa do zero, não do PnL das trades virtuais
+        self.strategy.net_profit     = 0.0
+        self.strategy.balance        = self.strategy.ic
+
+        self._pnl_baseline = 0.0
         self._warming      = False
+
         last_close = float(df['close'].iloc[-1])
         if last_close > 0:
             self._cache_px = last_close
@@ -512,7 +546,9 @@ class LiveTrader:
         self._last_candle_ts = ""
         self._last_candle_ts_ms = 0
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} | "
-                 f"EC={self.strategy.EC:.2f} | px_cache={self._cache_px:.2f}")
+                 f"EC={self.strategy.EC:.2f} | EMA={self.strategy.EMA:.2f} | "
+                 f"buy_prev={self.strategy._buy_prev} sell_prev={self.strategy._sell_prev} | "
+                 f"px_cache={self._cache_px:.2f}")
 
     @property
     def live_pnl(self):
