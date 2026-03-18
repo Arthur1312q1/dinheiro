@@ -7,13 +7,13 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v19 — Saídas 100% alinhadas com backtest (versão final)
+FIX v20 — Saídas 100% alinhadas com backtest (versão final com HTML completo)
 ══════════════════════════════════════════════════════════════════════
 - Entradas PAPER usam open do candle (como backtest)
 - Saídas acionadas pelas ações EXIT_LONG/EXIT_SHORT da estratégia
-- Reversões tratadas pela própria estratégia (não duplicadas)
 - Preço de saída exato vindo da estratégia (stop_price calculado)
-- Refresh de cache apenas com preço de mercado
+- Refresh de cache apenas com preço de mercado (sem consultas pesadas)
+- Dashboard HTML mantido integralmente
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -559,7 +559,6 @@ class LiveTrader:
                 pos = self._cache_pos
                 if pos and pos['side'] == 'long':
                     qty = pos['size']
-                    # Usa o preço exato fornecido pela ação (stop_price)
                     if 'price' not in act:
                         log.error("  ❌ EXIT_LONG sem preço na ação!")
                         continue
@@ -608,7 +607,6 @@ class LiveTrader:
 
                 if self._is_paper():
                     px = open_px
-                    # Não verificamos posição contrária aqui, pois a estratégia já gerou saída se necessário
                     log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
                     if r.get("code") == "0":
@@ -621,6 +619,11 @@ class LiveTrader:
 
                 else:  # LIVE
                     px = self._mark_price() or close_px
+                    # Consulta posição atual da Bitget para evitar duplicidade
+                    pos = self.bitget.position()
+                    if pos and pos['side'] == 'long':
+                        log.info("  ⏭️ BUY ignorado — já tem long aberto")
+                        continue
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
@@ -655,6 +658,10 @@ class LiveTrader:
 
                 else:  # LIVE
                     px = self._mark_price() or close_px
+                    pos = self.bitget.position()
+                    if pos and pos['side'] == 'short':
+                        log.info("  ⏭️ SELL ignorado — já tem short aberto")
+                        continue
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
