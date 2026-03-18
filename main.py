@@ -7,11 +7,12 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v16 — Saídas PAPER via monitor 1ms (igual ao backtest)
+FIX v17 — Saídas sincronizadas com backtest (sem monitor contínuo)
 ══════════════════════════════════════════════════════════════════════
 - Entradas PAPER usam open do candle (como backtest)
-- Monitor ativo para PAPER e LIVE (1ms)
-- Saídas acionadas pelo monitor garantem preço do stop exato
+- Saídas acionadas pelas ações EXIT_LONG/EXIT_SHORT da estratégia
+- Reversões tratadas explicitamente antes de novas entradas
+- Monitor de posição removido (fechamentos agora via candle)
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -446,6 +447,9 @@ class Bitget:
         return bal, px
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE TRADER (MODIFICADO – SEM MONITOR CONTÍNUO)
+# ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
     def __init__(self):
         self._paper_mode = get_paper_mode()
@@ -466,13 +470,6 @@ class LiveTrader:
         self._cache_px:  float = 0.0
         self._last_candle_ts:    str = ""
         self._last_candle_ts_ms: int = 0  # timestamp em ms para evitar repetição
-        # ── Monitoramento (para PAPER e LIVE) ──
-        self._monitor_thread: Optional[threading.Thread] = None
-        self._monitor_stop = threading.Event()
-        # Variáveis para trailing (atualizadas pelo monitor)
-        self._highest_since_entry: float = 0.0
-        self._lowest_since_entry: float = float('inf')
-        self._trail_active: bool = False
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -524,97 +521,6 @@ class LiveTrader:
     def live_pnl(self):
         return self.strategy.net_profit - self._pnl_baseline
 
-    def _monitor_position(self):
-        """
-        Thread que monitora o preço de mercado a cada 1ms e fecha a posição
-        se os níveis de stop ou trailing forem atingidos.
-        Funciona para PAPER e LIVE.
-        """
-        log.info("  🔍 Monitor de posição iniciado (1ms)")
-        while not self._monitor_stop.is_set():
-            try:
-                # Obtém preço atual (via API Bitget, mesmo para PAPER)
-                price = self._mark_price()
-                if price <= 0:
-                    time.sleep(0.001)
-                    continue
-
-                # Pega a posição do cache (que é atualizado periodicamente)
-                pos = self._cache_pos
-                if pos is None:
-                    time.sleep(0.001)
-                    continue
-
-                side = pos['side']
-                entry = pos['avg_px']
-                qty = pos['size']
-                tick = self.strategy.tick
-                sl = self.strategy.sl
-                tp = self.strategy.tp
-                toff = self.strategy.toff
-
-                if side == 'long':
-                    # Atualiza highest desde a entrada
-                    if price > self._highest_since_entry:
-                        self._highest_since_entry = price
-                    profit_ticks = (self._highest_since_entry - entry) / tick
-                    if profit_ticks >= tp:
-                        self._trail_active = True
-                    if self._trail_active:
-                        stop = self._highest_since_entry - toff * tick
-                    else:
-                        stop = entry - sl * tick
-
-                    if price <= stop:
-                        close_price = stop  # usa o preço de stop exato
-                        reason = "SL" if not self._trail_active else "TRAIL"
-                        log.info(f"  🔴 STOP LOSS LONG acionado @ {price:.2f} (stop={stop:.2f})")
-
-                        if self._is_paper():
-                            self.paper.close_long(qty, close_price, reason, ts=brazil_iso())
-                        else:
-                            self.bitget.close_long(qty, close_price, reason)
-
-                        self.strategy.confirm_exit('LONG', close_price, qty,
-                                                   datetime.now(timezone.utc), reason)
-                        self._cache_pos = None
-                        self._highest_since_entry = 0.0
-                        self._trail_active = False
-                        self._add_log("EXIT_LONG", close_price, qty, reason)
-
-                elif side == 'short':
-                    if price < self._lowest_since_entry:
-                        self._lowest_since_entry = price
-                    profit_ticks = (entry - self._lowest_since_entry) / tick
-                    if profit_ticks >= tp:
-                        self._trail_active = True
-                    if self._trail_active:
-                        stop = self._lowest_since_entry + toff * tick
-                    else:
-                        stop = entry + sl * tick
-
-                    if price >= stop:
-                        close_price = stop
-                        reason = "SL" if not self._trail_active else "TRAIL"
-                        log.info(f"  🟢 STOP LOSS SHORT acionado @ {price:.2f} (stop={stop:.2f})")
-
-                        if self._is_paper():
-                            self.paper.close_short(qty, close_price, reason, ts=brazil_iso())
-                        else:
-                            self.bitget.close_short(qty, close_price, reason)
-
-                        self.strategy.confirm_exit('SHORT', close_price, qty,
-                                                   datetime.now(timezone.utc), reason)
-                        self._cache_pos = None
-                        self._lowest_since_entry = float('inf')
-                        self._trail_active = False
-                        self._add_log("EXIT_SHORT", close_price, qty, reason)
-
-            except Exception as e:
-                log.error(f"  ❌ Erro no monitor: {e}")
-            finally:
-                time.sleep(0.001)  # 1ms
-
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
         open_px  = float(candle['open'])
@@ -632,13 +538,13 @@ class LiveTrader:
             f"mode={'PAPER' if self._is_paper() else 'LIVE'}"
         )
 
-        # ── Agora processa o candle com a estratégia (gera ações) ──────────
+        # Processa o candle com a estratégia (gera ações)
         actions = self.strategy.next(candle) or []
 
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
-        # Processa as ações (apenas entradas; saídas serão tratadas pelo monitor)
+        # Processa todas as ações
         for act in actions:
             kind = act.get('action', '')
 
@@ -658,15 +564,43 @@ class LiveTrader:
             else:
                 act_ts = brazil_iso()
 
-            # ── EXIT LONG ─────────────────────────────────────────────────
+            # ── EXIT LONG (saída por stop/trailing) ─────────────────────────
             if kind == 'EXIT_LONG':
-                # Ignoramos saídas da estratégia, pois o monitor cuidará delas
-                log.debug("  ℹ️ EXIT_LONG ignorada (monitor ativo)")
+                pos = self._cache_pos
+                if pos and pos['side'] == 'long':
+                    qty = pos['size']
+                    exit_price = act.get('price', self._mark_price())
+                    reason = act.get('exit_reason', 'EXIT')
+                    log.info(f"  🔴 EXIT LONG acionado pela estratégia @ {exit_price:.2f} ({reason})")
+                    if self._is_paper():
+                        self.paper.close_long(qty, exit_price, reason, ts=act_ts)
+                    else:
+                        self.bitget.close_long(qty, exit_price, reason)
+                    # A estratégia já atualizou seu estado (position_size, balance) ao gerar a ação.
+                    self._cache_pos = None
+                    self._cache_bal = self.strategy.balance
+                    self._add_log("EXIT_LONG", exit_price, qty, reason)
+                else:
+                    log.warning(f"  ⚠️ EXIT_LONG recebido mas sem posição compatível: pos={pos}")
                 continue
 
-            # ── EXIT SHORT ────────────────────────────────────────────────
+            # ── EXIT SHORT (saída por stop/trailing) ────────────────────────
             elif kind == 'EXIT_SHORT':
-                log.debug("  ℹ️ EXIT_SHORT ignorada (monitor ativo)")
+                pos = self._cache_pos
+                if pos and pos['side'] == 'short':
+                    qty = pos['size']
+                    exit_price = act.get('price', self._mark_price())
+                    reason = act.get('exit_reason', 'EXIT')
+                    log.info(f"  🟢 EXIT SHORT acionado pela estratégia @ {exit_price:.2f} ({reason})")
+                    if self._is_paper():
+                        self.paper.close_short(qty, exit_price, reason, ts=act_ts)
+                    else:
+                        self.bitget.close_short(qty, exit_price, reason)
+                    self._cache_pos = None
+                    self._cache_bal = self.strategy.balance
+                    self._add_log("EXIT_SHORT", exit_price, qty, reason)
+                else:
+                    log.warning(f"  ⚠️ EXIT_SHORT recebido mas sem posição compatível: pos={pos}")
                 continue
 
             # ── ENTER LONG (BUY) ──────────────────────────────────────────
@@ -679,38 +613,44 @@ class LiveTrader:
                 if self._is_paper():
                     px = open_px  # usa o open do candle (como no backtest)
                     pos = self.paper.get_position()
-                    if pos and pos['side'] == 'long':
-                        log.info("  ⏭️ BUY ignorado — já tem long aberto")
-                        continue
+                    # Reversão: se houver posição contrária, fecha primeiro
                     if pos and pos['side'] == 'short':
-                        # Fecha short via monitor? Não, o monitor fecharia se atingir stop, mas aqui é reversão no open
                         self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
+                        self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
+                    elif pos and pos['side'] == 'long':
+                        log.info("  ⏭️ BUY ignorado — já tem long aberto")
+                        continue
                     log.info(f"  🟢 [PAPER] ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.paper.open_long(qty, self._cache_bal, px, ts=act_ts)
                     if r.get("code") == "0":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
-                        # Notifica a estratégia
-                        self.strategy.confirm_fill('BUY', px, qty_f, ts)
-                        self._highest_since_entry = px
-                        self._trail_active = False
+                        self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
+                        self._cache_bal = self.strategy.balance
                     else:
                         log.error(f"  ❌ paper.open_long falhou")
 
-                else:
-                    # LIVE: executa imediatamente com preço de mercado atual
+                else:  # LIVE
                     px = self._mark_price() or close_px
+                    pos = self.bitget.position()  # consulta posição real
+                    # Reversão: se houver posição contrária, fecha primeiro
+                    if pos and pos['side'] == 'short':
+                        log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {px:.2f}")
+                        self.bitget.close_short(pos['size'], px, "REVERSAL")
+                        self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
+                        self._cache_pos = None
+                    elif pos and pos['side'] == 'long':
+                        log.info("  ⏭️ BUY ignorado — já tem long aberto")
+                        continue
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        self.strategy.confirm_fill('BUY', px, qty_f, ts)
+                        self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_LONG", px, qty_f)
-                        self._highest_since_entry = px
-                        self._trail_active = False
                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
                     elif r.get("code") == "SKIP":
                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
@@ -725,38 +665,44 @@ class LiveTrader:
                     continue
 
                 if self._is_paper():
-                    px = open_px  # usa o open do candle
+                    px = open_px
                     pos = self.paper.get_position()
-                    if pos and pos['side'] == 'short':
-                        log.info("  ⏭️ SELL ignorado — já tem short aberto")
-                        continue
                     if pos and pos['side'] == 'long':
                         self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
+                        self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
+                    elif pos and pos['side'] == 'short':
+                        log.info("  ⏭️ SELL ignorado — já tem short aberto")
+                        continue
                     log.info(f"  🔴 [PAPER] ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.paper.open_short(qty, self._cache_bal, px, ts=act_ts)
                     if r.get("code") == "0":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                        self.strategy.confirm_fill('SELL', px, qty_f, ts)
-                        self._lowest_since_entry = px
-                        self._trail_active = False
+                        self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
+                        self._cache_bal = self.strategy.balance
                     else:
                         log.error(f"  ❌ paper.open_short falhou")
 
-                else:
-                    # LIVE: executa imediatamente com preço de mercado atual
+                else:  # LIVE
                     px = self._mark_price() or close_px
+                    pos = self.bitget.position()
+                    if pos and pos['side'] == 'long':
+                        log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {px:.2f}")
+                        self.bitget.close_long(pos['size'], px, "REVERSAL")
+                        self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")
+                        self._cache_pos = None
+                    elif pos and pos['side'] == 'short':
+                        log.info("  ⏭️ SELL ignorado — já tem short aberto")
+                        continue
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        self.strategy.confirm_fill('SELL', px, qty_f, ts)
+                        self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_SHORT", px, qty_f)
-                        self._lowest_since_entry = px
-                        self._trail_active = False
                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
                     elif r.get("code") == "SKIP":
                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
@@ -871,11 +817,7 @@ class LiveTrader:
         self.warmup(df)
         log.info(f"  ✅ Pronto para receber candles ao vivo da Bitget")
 
-        # Inicia thread de monitoramento para ambos os modos (PAPER e LIVE)
-        self._monitor_stop.clear()
-        self._monitor_thread = threading.Thread(target=self._monitor_position, daemon=True)
-        self._monitor_thread.start()
-        log.info("  🔍 Monitor de posição ativo (1ms)")
+        # Monitor de posição removido – as saídas agora são tratadas no processamento do candle
 
         self._running = True
         tf = int(TIMEFRAME.replace('m','').replace('h','')) * \
@@ -914,11 +856,15 @@ class LiveTrader:
             px = self._mark_price()
             if px > 0:
                 self._cache_px = px
-            self._cache_bal = self.strategy.balance
-            self._cache_pos = self.paper.get_position()
-            log.info(f"  🔄 cache | bal={self._cache_bal:.2f} px={self._cache_px:.2f} "
-                     f"pos={self._cache_pos}")
+            # Saldo e posição já vêm da estratégia via process()
         else:
+            # Apenas atualiza preço de mercado; posição e saldo são gerenciados via estratégia
+            px = self._mark_price()
+            if px > 0:
+                self._cache_px = px
+            # Opcional: consultar posição real da Bitget para debug, mas não é essencial
+            # pois confiamos no estado da estratégia após cada operação.
+            # Para manter compatibilidade, mantemos a consulta, mas sem travar.
             results = {}
             def _fp():
                 try:    results['pos'] = self.bitget.position()
@@ -926,25 +872,21 @@ class LiveTrader:
             def _fbp():
                 try:
                     results['bal'] = self.bitget.balance()
-                    results['px']  = self.bitget.mark_price()
                 except:
                     results['bal'] = self._cache_bal
-                    results['px']  = 0.0
             t1 = threading.Thread(target=_fp, daemon=True)
             t2 = threading.Thread(target=_fbp, daemon=True)
             t1.start(); t2.start()
-            t1.join(timeout=5); t2.join(timeout=5)
-            self._cache_pos = results.get('pos', self._cache_pos)
-            bal = results.get('bal', self._cache_bal)
-            px  = results.get('px',  0.0)
-            if bal > 0: self._cache_bal = bal
-            if px  > 0: self._cache_px  = px
+            t1.join(timeout=2); t2.join(timeout=2)
+            if 'pos' in results and results['pos'] is not None:
+                self._cache_pos = results['pos']
+            if 'bal' in results and results['bal'] > 0:
+                self._cache_bal = results['bal']
 
     def stop(self):
         self._running = False
-        self._monitor_stop.set()
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=2)
+        # Não há mais thread de monitor para parar
+        log.info("🛑 Trader parado")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
