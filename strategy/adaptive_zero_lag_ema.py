@@ -23,8 +23,8 @@
 #    6. Salva sinais → _buy_prev, _sell_prev
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# CORREÇÃO: Removida a modificação que forçava trades alternados.
-# Agora os sinais seguem exatamente o cálculo do indicador.
+# MODIFICAÇÃO SOLICITADA: Forçar trade em todos os candles (alternando compra/venda)
+# sem alterar parâmetros e mantendo o delay de uma barra.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -479,8 +479,18 @@ class AdaptiveZeroLagEMA:
             self._sched_entries()
 
         # ── Salva sinais para próxima barra ───────────────────────────────
-        self._buy_prev  = buy_sig
-        self._sell_prev = sell_sig
+        # MODIFICAÇÃO: Forçar trade em todos os candles após warmup
+        if self._bar <= self.warmup_bars:
+            self._buy_prev  = buy_sig
+            self._sell_prev = sell_sig
+        else:
+            # Alternar compra e venda a cada candle (mantendo delay de 1 barra)
+            if self._bar % 2 == 0:
+                self._buy_prev = True
+                self._sell_prev = False
+            else:
+                self._buy_prev = False
+                self._sell_prev = True
 
         # ── Log periódico ─────────────────────────────────────────────────
         if idx % 500 == 0:
