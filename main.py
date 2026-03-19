@@ -12,7 +12,6 @@ FIX v23 — Fechamento de trades corrigido (process() processa EXIT do candle)
 - EXIT_LONG / EXIT_SHORT gerados pelo strategy.next() (via _check_trail)
   agora são processados imediatamente no process(), sem esperar 30min
 - Replica exatamente o comportamento do backtest (intra-candle via H/L)
-- Monitor de 1ms mantido como fallback para stops não pegos pelo candle
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -463,10 +462,7 @@ class LiveTrader:
         self._cache_px:  float = 0.0
         self._last_candle_ts:    str = ""
         self._last_candle_ts_ms: int = 0
-
-        # Thread de monitoramento (fallback para stops intra-candle ao vivo)
-        self._monitor_thread: Optional[threading.Thread] = None
-        self._monitor_stop = threading.Event()
+        # Monitor removido – stops são processados via candle em strategy.next()
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -553,78 +549,6 @@ class LiveTrader:
     @property
     def live_pnl(self):
         return self.strategy.net_profit - self._pnl_baseline
-
-    def _monitor_position(self):
-        """
-        Thread de monitoramento como FALLBACK.
-        O fechamento principal acontece em process() via strategy.next().
-        Esta thread só atua se o stop não foi pego pelo H/L do candle
-        (ex: gap de preço, dados atrasados, etc.).
-        """
-        log.info("  🔍 Monitor de posição iniciado (fallback 1ms)")
-        while not self._monitor_stop.is_set():
-            try:
-                price = self._mark_price()
-                if price <= 0:
-                    time.sleep(0.001)
-                    continue
-
-                pos_size = self.strategy.position_size
-                if pos_size == 0:
-                    time.sleep(0.001)
-                    continue
-
-                entry = self.strategy.position_price
-                tick = self.strategy.tick
-                sl = self.strategy.sl
-                tp = self.strategy.tp
-                toff = self.strategy.toff
-
-                if pos_size > 0:  # LONG
-                    highest = self.strategy._highest
-                    if self.strategy._trail_active:
-                        stop = highest - toff * tick
-                        rsn = "TRAIL"
-                    else:
-                        stop = entry - sl * tick
-                        rsn = "SL"
-
-                    if price <= stop:
-                        log.info(f"  🔴 [MONITOR] STOP LONG @ {price:.2f} (stop={stop:.2f})")
-                        if self._is_paper():
-                            self.paper.close_long(pos_size, stop, rsn, ts=brazil_iso())
-                        else:
-                            self.bitget.close_long(pos_size, stop, rsn)
-                        self.strategy.confirm_exit('LONG', stop, pos_size, datetime.now(timezone.utc), rsn)
-                        self._cache_pos = None
-                        self._cache_bal = self.strategy.balance
-                        self._add_log("EXIT_LONG", stop, pos_size, rsn)
-
-                elif pos_size < 0:  # SHORT
-                    size = abs(pos_size)
-                    lowest = self.strategy._lowest
-                    if self.strategy._trail_active:
-                        stop = lowest + toff * tick
-                        rsn = "TRAIL"
-                    else:
-                        stop = entry + sl * tick
-                        rsn = "SL"
-
-                    if price >= stop:
-                        log.info(f"  🟢 [MONITOR] STOP SHORT @ {price:.2f} (stop={stop:.2f})")
-                        if self._is_paper():
-                            self.paper.close_short(size, stop, rsn, ts=brazil_iso())
-                        else:
-                            self.bitget.close_short(size, stop, rsn)
-                        self.strategy.confirm_exit('SHORT', stop, size, datetime.now(timezone.utc), rsn)
-                        self._cache_pos = None
-                        self._cache_bal = self.strategy.balance
-                        self._add_log("EXIT_SHORT", stop, size, rsn)
-
-            except Exception as e:
-                log.error(f"  ❌ Erro no monitor: {e}")
-            finally:
-                time.sleep(0.001)
 
     def process(self, candle: Dict):
         ts       = candle.get('timestamp', brazil_now())
@@ -909,12 +833,6 @@ class LiveTrader:
         self.warmup(df)
         log.info(f"  ✅ Pronto para receber candles ao vivo da Bitget")
 
-        # Inicia thread de monitoramento (fallback)
-        self._monitor_stop.clear()
-        self._monitor_thread = threading.Thread(target=self._monitor_position, daemon=True)
-        self._monitor_thread.start()
-        log.info("  🔍 Monitor de posição ativo (fallback 1ms)")
-
         self._running = True
         tf = int(TIMEFRAME.replace('m','').replace('h','')) * \
              (60 if 'h' in TIMEFRAME else 1)
@@ -953,9 +871,7 @@ class LiveTrader:
 
     def stop(self):
         self._running = False
-        self._monitor_stop.set()
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=2)
+        # Monitor removido – nada mais a parar
         log.info("🛑 Trader parado")
 
 
