@@ -648,7 +648,7 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
                         self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
-                        self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
+                        # self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
                     elif pos and pos['side'] == 'long':
@@ -659,7 +659,7 @@ class LiveTrader:
                     if r.get("code") == "0":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
-                        self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
+                        # self.strategy.confirm_fill('BUY', px, qty_f, act_ts)  # REMOVIDO
                         self._cache_bal = self.strategy.balance
                     else:
                         log.error(f"  ❌ paper.open_long falhou")
@@ -673,12 +673,12 @@ class LiveTrader:
                     if pos and pos['side'] == 'short':
                         log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {px:.2f}")
                         self.bitget.close_short(pos['size'], px, "REVERSAL")
-                        self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
+                        # self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
                         self._cache_pos = None
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
+                        # self.strategy.confirm_fill('BUY', px, qty_f, act_ts)  # REMOVIDO
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_LONG", px, qty_f)
@@ -700,7 +700,7 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
                         self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
-                        self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")
+                        # self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
                     elif pos and pos['side'] == 'short':
@@ -711,7 +711,7 @@ class LiveTrader:
                     if r.get("code") == "0":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                        self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
+                        # self.strategy.confirm_fill('SELL', px, qty_f, act_ts)  # REMOVIDO
                         self._cache_bal = self.strategy.balance
                     else:
                         log.error(f"  ❌ paper.open_short falhou")
@@ -725,12 +725,12 @@ class LiveTrader:
                     if pos and pos['side'] == 'long':
                         log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {px:.2f}")
                         self.bitget.close_long(pos['size'], px, "REVERSAL")
-                        self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")
+                        # self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
                         self._cache_pos = None
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
+                        # self.strategy.confirm_fill('SELL', px, qty_f, act_ts)  # REMOVIDO
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_SHORT", px, qty_f)
