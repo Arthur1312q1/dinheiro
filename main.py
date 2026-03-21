@@ -605,12 +605,14 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
                         self.paper.close_long(pos['size'], exit_px, exit_reason, ts=act_ts)
-                        self._cache_pos = None
-                        self._add_log("EXIT_LONG", exit_px, exit_qty, exit_reason)
                 else:
                     self.bitget.close_long(exit_qty, exit_px, exit_reason)
-                    self._cache_pos = None
-                    self._add_log("EXIT_LONG", exit_px, exit_qty, exit_reason)
+
+                # AVISA A ESTRATÉGIA QUE A POSIÇÃO FOI FECHADA
+                self.strategy.confirm_exit('LONG', exit_px, exit_qty, act_ts, exit_reason)
+
+                self._cache_pos = None
+                self._add_log("EXIT_LONG", exit_px, exit_qty, exit_reason)
                 self._cache_bal = self.strategy.balance
                 continue
 
@@ -627,12 +629,14 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
                         self.paper.close_short(pos['size'], exit_px, exit_reason, ts=act_ts)
-                        self._cache_pos = None
-                        self._add_log("EXIT_SHORT", exit_px, exit_qty, exit_reason)
                 else:
                     self.bitget.close_short(exit_qty, exit_px, exit_reason)
-                    self._cache_pos = None
-                    self._add_log("EXIT_SHORT", exit_px, exit_qty, exit_reason)
+
+                # AVISA A ESTRATÉGIA QUE A POSIÇÃO FOI FECHADA
+                self.strategy.confirm_exit('SHORT', exit_px, exit_qty, act_ts, exit_reason)
+
+                self._cache_pos = None
+                self._add_log("EXIT_SHORT", exit_px, exit_qty, exit_reason)
                 self._cache_bal = self.strategy.balance
                 continue
 
@@ -648,7 +652,8 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'short':
                         self.paper.close_short(pos['size'], px, "REVERSAL", ts=act_ts)
-                        # self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
+                        # AVISA REVERSAL: fecha short
+                        self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou SHORT @ {px:.2f}")
                     elif pos and pos['side'] == 'long':
@@ -659,7 +664,8 @@ class LiveTrader:
                     if r.get("code") == "0":
                         self._add_log("ENTER_LONG", px, qty_f)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
-                        # self.strategy.confirm_fill('BUY', px, qty_f, act_ts)  # REMOVIDO
+                        # AVISA QUE ABRIU LONG
+                        self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
                         self._cache_bal = self.strategy.balance
                     else:
                         log.error(f"  ❌ paper.open_long falhou")
@@ -673,12 +679,14 @@ class LiveTrader:
                     if pos and pos['side'] == 'short':
                         log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {px:.2f}")
                         self.bitget.close_short(pos['size'], px, "REVERSAL")
-                        # self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
+                        # AVISA REVERSAL: fecha short
+                        self.strategy.confirm_exit('SHORT', px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
                     log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        # self.strategy.confirm_fill('BUY', px, qty_f, act_ts)  # REMOVIDO
+                        # AVISA QUE ABRIU LONG
+                        self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_LONG", px, qty_f)
@@ -700,7 +708,8 @@ class LiveTrader:
                     pos = self.paper.get_position()
                     if pos and pos['side'] == 'long':
                         self.paper.close_long(pos['size'], px, "REVERSAL", ts=act_ts)
-                        # self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
+                        # AVISA REVERSAL: fecha long
+                        self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
                         log.info(f"  ↩️ [PAPER] REVERSAL: fechou LONG @ {px:.2f}")
                     elif pos and pos['side'] == 'short':
@@ -711,7 +720,8 @@ class LiveTrader:
                     if r.get("code") == "0":
                         self._add_log("ENTER_SHORT", px, qty_f)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
-                        # self.strategy.confirm_fill('SELL', px, qty_f, act_ts)  # REMOVIDO
+                        # AVISA QUE ABRIU SHORT
+                        self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
                         self._cache_bal = self.strategy.balance
                     else:
                         log.error(f"  ❌ paper.open_short falhou")
@@ -725,12 +735,14 @@ class LiveTrader:
                     if pos and pos['side'] == 'long':
                         log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {px:.2f}")
                         self.bitget.close_long(pos['size'], px, "REVERSAL")
-                        # self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")  # REMOVIDO
+                        # AVISA REVERSAL: fecha long
+                        self.strategy.confirm_exit('LONG', px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
                     log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, px)
                     if r.get("code") == "00000":
-                        # self.strategy.confirm_fill('SELL', px, qty_f, act_ts)  # REMOVIDO
+                        # AVISA QUE ABRIU SHORT
+                        self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_SHORT", px, qty_f)
@@ -1148,10 +1160,15 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr></thead>
-            <tbody id="lv-trades"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr></tbody>
-          </table>
+          表格
+            <thead>…
+              <th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th>
+            </tr>
+            </thead>
+            <tbody id="lv-trades">
+              <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr>
+            </tbody>
+          表格
         </div>
       </div>
       <div class="card">
@@ -1186,10 +1203,15 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
           <table>
-            <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr></thead>
-            <tbody id="hist-tbl"><tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr></tbody>
-          </table>
+            <thead>
+              <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+                  <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th>
+              </tr>
+            </thead>
+            <tbody id="hist-tbl">
+              <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr>
+            </tbody>
+          表格
         </div>
       </div>
     </div>
