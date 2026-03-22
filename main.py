@@ -444,16 +444,20 @@ class Bitget:
 # ═══════════════════════════════════════════════════════════════════════════════
 class RealTimeStopMonitor:
     """
-    Replica a lógica _check_trail da strategy em tempo real.
+    Replica _check_trail da strategy em tempo real (50ms poll).
 
-    ESTADO SINCRONIZADO:
-    A cada candle fechado, process() chama sync_from_strategy() para copiar
-    _highest / _lowest / _trail_active diretamente da strategy (que usou o
-    H/L real do candle). Assim o monitor usa EXATAMENTE os mesmos níveis de
-    stop que o backtest calcularia — sem divergência.
+    ESTADO SINCRONIZADO — FIX DO PREÇO DIFERENTE:
+    O monitor atualiza _highest/_lowest de dois lugares:
+      1. Poll loop (mark_price a cada 50ms) — captura movimento intra-candle
+      2. sync_from_strategy() — chamado ao FINAL de cada candle, copia
+         _highest/_lowest/_trail_active da strategy (que usou H/L real do candle)
 
-    Durante o candle, o monitor só poleia o preço atual e verifica se cruzou
-    o stop calculado com base no estado sincronizado.
+    O stop_px é SEMPRE calculado com max(_highest_polled, candle_HIGH), então
+    o nível de stop fica idêntico ao backtest.
+
+    PREÇO DE SAÍDA:
+    O monitor sai ao stop_px calculado (não ao mark_price), exatamente como
+    o backtest usa stop_price exato (Pine slippage=0).
     """
 
     POLL_INTERVAL = 0.05   # 50ms — ~20 req/s, dentro do limite público Bitget
@@ -464,12 +468,11 @@ class RealTimeStopMonitor:
         self._thread     = None
         self._active     = False
         self._stop_evt   = threading.Event()
-        self._session    = requests.Session()   # TCP reuse — sem overhead de handshake
+        self._session    = requests.Session()   # TCP keep-alive: sem overhead de handshake
 
         self._side       : Optional[str] = None
         self._entry      : float = 0.0
         self._qty        : float = 0.0
-        # Estes três são sincronizados com strategy após cada candle:
         self._highest    : float = 0.0
         self._lowest     : float = float('inf')
         self._trail_on   : bool  = False
@@ -484,7 +487,6 @@ class RealTimeStopMonitor:
     def _tick(self): return self.trader.strategy.tick
 
     def arm(self, side: str, entry: float, qty: float) -> None:
-        """Arma o monitor logo após abertura de posição."""
         with self._lock:
             self._side     = side
             self._entry    = entry
@@ -509,7 +511,6 @@ class RealTimeStopMonitor:
             self._thread.start()
 
     def disarm(self) -> None:
-        """Desarma o monitor (posição fechada)."""
         with self._lock:
             if self._active:
                 log.info("  🔕 StopMonitor desarmado")
@@ -518,34 +519,27 @@ class RealTimeStopMonitor:
 
     def sync_from_strategy(self) -> None:
         """
-        Sincroniza _highest / _lowest / _trail_on com o estado ATUAL da strategy.
+        Sincroniza _highest/_lowest/_trail_on com o estado da strategy.
 
-        Chamado ao final de cada candle (em process()), depois que strategy.next()
-        rodou com o H/L real. Isso garante que o monitor use os mesmos níveis
-        de stop que o backtest — sem divergência por diferença de dados.
+        Chamado ao final de cada candle (após strategy.next() usar H/L real).
+        Garante que o stop do monitor seja IDÊNTICO ao do backtest.
         """
         strat = self.trader.strategy
         with self._lock:
             if not self._active:
                 return
             prev_trail = self._trail_on
-            # Usa o máximo entre o que o monitor viu (mark_price) e o que a
-            # strategy viu (candle HIGH/LOW). Garante paridade com backtest.
+            # Usa o MÁXIMO entre mark_price polado e candle HIGH/LOW real
             self._highest = max(self._highest, strat._highest)
             self._lowest  = min(self._lowest,  strat._lowest)
-            # Trail ativa se a strategy ativou (candle HIGH/LOW pode ter ativado
+            # Trail ativa se a strategy ativou (candle H/L pode ter ativado
             # mesmo que o mark_price polado não tenha chegado lá)
             if strat._trail_active:
                 self._trail_on = True
             if not prev_trail and self._trail_on:
                 log.info(
-                    f"  🔄 Monitor sync → trail ATIVADO | "
+                    f"  🔄 Monitor sync → TRAIL ATIVADO | "
                     f"highest={self._highest:.2f} lowest={self._lowest:.2f}"
-                )
-            else:
-                log.debug(
-                    f"  🔄 Monitor sync | highest={self._highest:.2f} "
-                    f"lowest={self._lowest:.2f} trail={'ON' if self._trail_on else 'off'}"
                 )
 
     def _fetch_price(self) -> float:
@@ -724,6 +718,17 @@ class LiveTrader:
     def warmup(self, df: pd.DataFrame):
         self._warming = True
         self._stop_monitor.disarm()
+
+        # ── FIX DE DIREÇÃO: garantia de paridade par ──────────────────────────
+        # A strategy alterna BUY/SELL com _bar % 2 (fora do warmup_bars).
+        # Se o fetcher retornar N ímpar de candles (dedup/filtragem), _bar
+        # termina ímpar → _sell_prev=True → todas as trades ficam invertidas.
+        # Backtest usa 500 candles (par) → _bar termina par → _buy_prev=True.
+        # Garantimos paridade par descartando o candle mais antigo se necessário.
+        if len(df) % 2 != 0:
+            df = df.iloc[1:].reset_index(drop=True)
+            log.info(f"  📐 Paridade: descartado 1 candle antigo → {len(df)} candles (par)")
+
         log.info(f"🔄 Warmup: {len(df)} candles...")
         for _, row in df.iterrows():
             self.strategy.next({
@@ -997,12 +1002,8 @@ class LiveTrader:
             self._cache_bal    = self.strategy.balance
             self._cache_pos    = self.paper.get_position()
 
-        # ── Sincroniza monitor com o estado real da strategy ──────────────────
-        # Após strategy.next() rodar com o H/L real do candle, copiamos
-        # _highest / _lowest / _trail_active para o monitor. Isso garante que
-        # os níveis de stop do monitor sejam IDÊNTICOS ao backtest —
-        # eliminando a divergência causada por diferença entre mark_price
-        # polado vs candle HIGH/LOW real.
+        # ── Sincroniza _highest/_lowest/_trail com H/L real do candle ────────
+        # Garante que o stop do monitor use os mesmos níveis que o backtest.
         self._stop_monitor.sync_from_strategy()
 
     def _wait(self, tf: int = 30):
