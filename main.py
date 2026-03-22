@@ -527,6 +527,27 @@ class RealTimeStopMonitor:
             log.debug(f"  monitor _fetch_price: {e}")
             return 0.0
 
+    def sync_from_strategy(self) -> None:
+        """
+        Copia _highest/_lowest/_trail_active da strategy ao final de cada candle.
+        Substitui (não max/min) para paridade exata com o backtest:
+        o stop é ancorado no H/L real do candle, não no mark_price polado.
+        """
+        strat = self.trader.strategy
+        with self._lock:
+            if not self._active:
+                return
+            prev_trail = self._trail_on
+            self._highest = strat._highest
+            self._lowest  = strat._lowest
+            if strat._trail_active:
+                self._trail_on = True
+            if not prev_trail and self._trail_on:
+                log.info(
+                    f"  🔄 Monitor sync → TRAIL ATIVADO | "
+                    f"highest={self._highest:.2f} lowest={self._lowest:.2f}"
+                )
+
     def _loop(self) -> None:
         log.info(f"  ▶️  StopMonitor thread iniciada ({int(self.POLL_INTERVAL*1000)}ms)")
 
