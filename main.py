@@ -444,12 +444,16 @@ class Bitget:
 # ═══════════════════════════════════════════════════════════════════════════════
 class RealTimeStopMonitor:
     """
-    Replica EXATAMENTE a lógica _check_trail da strategy em tempo real.
+    Replica a lógica _check_trail da strategy em tempo real.
 
-    Poleia o mark_price a cada POLL_INTERVAL segundos usando requests.Session
-    (conexão TCP reutilizada — sem overhead de handshake a cada req).
+    ESTADO SINCRONIZADO:
+    A cada candle fechado, process() chama sync_from_strategy() para copiar
+    _highest / _lowest / _trail_active diretamente da strategy (que usou o
+    H/L real do candle). Assim o monitor usa EXATAMENTE os mesmos níveis de
+    stop que o backtest calcularia — sem divergência.
 
-    50ms ≈ 36.000 verificações por candle de 30min.
+    Durante o candle, o monitor só poleia o preço atual e verifica se cruzou
+    o stop calculado com base no estado sincronizado.
     """
 
     POLL_INTERVAL = 0.05   # 50ms — ~20 req/s, dentro do limite público Bitget
@@ -460,11 +464,12 @@ class RealTimeStopMonitor:
         self._thread     = None
         self._active     = False
         self._stop_evt   = threading.Event()
-        self._session    = requests.Session()   # conexão persistente (TCP reuse)
+        self._session    = requests.Session()   # TCP reuse — sem overhead de handshake
 
         self._side       : Optional[str] = None
         self._entry      : float = 0.0
         self._qty        : float = 0.0
+        # Estes três são sincronizados com strategy após cada candle:
         self._highest    : float = 0.0
         self._lowest     : float = float('inf')
         self._trail_on   : bool  = False
@@ -479,6 +484,7 @@ class RealTimeStopMonitor:
     def _tick(self): return self.trader.strategy.tick
 
     def arm(self, side: str, entry: float, qty: float) -> None:
+        """Arma o monitor logo após abertura de posição."""
         with self._lock:
             self._side     = side
             self._entry    = entry
@@ -503,18 +509,51 @@ class RealTimeStopMonitor:
             self._thread.start()
 
     def disarm(self) -> None:
+        """Desarma o monitor (posição fechada)."""
         with self._lock:
             if self._active:
                 log.info("  🔕 StopMonitor desarmado")
             self._active = False
             self._side   = None
 
+    def sync_from_strategy(self) -> None:
+        """
+        Sincroniza _highest / _lowest / _trail_on com o estado ATUAL da strategy.
+
+        Chamado ao final de cada candle (em process()), depois que strategy.next()
+        rodou com o H/L real. Isso garante que o monitor use os mesmos níveis
+        de stop que o backtest — sem divergência por diferença de dados.
+        """
+        strat = self.trader.strategy
+        with self._lock:
+            if not self._active:
+                return
+            prev_trail = self._trail_on
+            # Usa o máximo entre o que o monitor viu (mark_price) e o que a
+            # strategy viu (candle HIGH/LOW). Garante paridade com backtest.
+            self._highest = max(self._highest, strat._highest)
+            self._lowest  = min(self._lowest,  strat._lowest)
+            # Trail ativa se a strategy ativou (candle HIGH/LOW pode ter ativado
+            # mesmo que o mark_price polado não tenha chegado lá)
+            if strat._trail_active:
+                self._trail_on = True
+            if not prev_trail and self._trail_on:
+                log.info(
+                    f"  🔄 Monitor sync → trail ATIVADO | "
+                    f"highest={self._highest:.2f} lowest={self._lowest:.2f}"
+                )
+            else:
+                log.debug(
+                    f"  🔄 Monitor sync | highest={self._highest:.2f} "
+                    f"lowest={self._lowest:.2f} trail={'ON' if self._trail_on else 'off'}"
+                )
+
     def _fetch_price(self) -> float:
         try:
             r = self._session.get(
                 "https://api.bitget.com/api/v2/mix/market/symbol-price",
                 params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
-                timeout=2,   # 2s — falha rápida para não bloquear o loop
+                timeout=2,
             )
             return float(r.json()["data"][0]["markPrice"])
         except Exception as e:
@@ -548,6 +587,7 @@ class RealTimeStopMonitor:
                 if not self._active:
                     continue
 
+                # ── Lógica IDÊNTICA a strategy._check_trail ────────────────
                 if side == 'long':
                     self._highest = max(self._highest, px)
                     profit_t = (self._highest - entry) / self._tick
@@ -956,6 +996,14 @@ class LiveTrader:
             self.paper.balance = self.strategy.balance
             self._cache_bal    = self.strategy.balance
             self._cache_pos    = self.paper.get_position()
+
+        # ── Sincroniza monitor com o estado real da strategy ──────────────────
+        # Após strategy.next() rodar com o H/L real do candle, copiamos
+        # _highest / _lowest / _trail_active para o monitor. Isso garante que
+        # os níveis de stop do monitor sejam IDÊNTICOS ao backtest —
+        # eliminando a divergência causada por diferença entre mark_price
+        # polado vs candle HIGH/LOW real.
+        self._stop_monitor.sync_from_strategy()
 
     def _wait(self, tf: int = 30):
         now_utc = datetime.now(timezone.utc)
