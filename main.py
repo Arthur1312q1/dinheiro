@@ -446,28 +446,13 @@ class RealTimeStopMonitor:
     """
     Replica EXATAMENTE a lógica _check_trail da strategy em tempo real.
 
-    Poleia o mark_price a cada POLL_INTERVAL segundos e dispara o exit
-    assim que o stop/trail é atingido — sem esperar o candle fechar (30min).
+    Poleia o mark_price a cada POLL_INTERVAL segundos usando requests.Session
+    (conexão TCP reutilizada — sem overhead de handshake a cada req).
 
-    Lógica idêntica ao strategy._check_trail:
-      LONG: highest = max(highest, px)
-            se profit_ticks >= tp → trail ativa
-            stop = highest - toff*tick  [trail]  ou  entry - sl*tick  [SL]
-            se px <= stop → EXIT_LONG imediato
-
-      SHORT: lowest = min(lowest, px)
-             se profit_ticks >= tp → trail ativa
-             stop = lowest + toff*tick  [trail]  ou  entry + sl*tick  [SL]
-             se px >= stop → EXIT_SHORT imediato
-
-    _pos_lock do LiveTrader garante que monitor e process() não colidam.
-    Se o monitor fechar antes do candle: strategy.position_size=0
-      → _check_trail retorna None → sem double-exit.
+    50ms ≈ 36.000 verificações por candle de 30min.
     """
 
-    # 100ms = mínimo prático para API pública Bitget (~20 req/s)
-    # Equivale a ~18.000 verificações por candle de 30min
-    POLL_INTERVAL = 0.1   # segundos
+    POLL_INTERVAL = 0.05   # 50ms — ~20 req/s, dentro do limite público Bitget
 
     def __init__(self, trader: 'LiveTrader'):
         self.trader      = trader
@@ -475,16 +460,15 @@ class RealTimeStopMonitor:
         self._thread     = None
         self._active     = False
         self._stop_evt   = threading.Event()
+        self._session    = requests.Session()   # conexão persistente (TCP reuse)
 
-        # Estado local espelhado da posição aberta
-        self._side       : Optional[str] = None   # 'long' | 'short'
+        self._side       : Optional[str] = None
         self._entry      : float = 0.0
         self._qty        : float = 0.0
         self._highest    : float = 0.0
         self._lowest     : float = float('inf')
         self._trail_on   : bool  = False
 
-    # Lê parâmetros direto da strategy (sempre atualizados)
     @property
     def _sl(self):   return self.trader.strategy.sl
     @property
@@ -495,7 +479,6 @@ class RealTimeStopMonitor:
     def _tick(self): return self.trader.strategy.tick
 
     def arm(self, side: str, entry: float, qty: float) -> None:
-        """Arma o monitor logo após abertura de posição."""
         with self._lock:
             self._side     = side
             self._entry    = entry
@@ -504,12 +487,13 @@ class RealTimeStopMonitor:
             self._lowest   = entry
             self._trail_on = False
             self._active   = True
-            self._stop_evt.set()   # acorda thread imediatamente
+            self._stop_evt.set()
 
         log.info(
             f"  🔔 StopMonitor ARMADO | {side.upper()} "
             f"entry={entry:.2f} qty={qty:.4f} | "
-            f"SL={self._sl}t  TP={self._tp}t  TRAIL={self._toff}t"
+            f"SL={self._sl}t  TP={self._tp}t  TRAIL={self._toff}t  "
+            f"poll={int(self.POLL_INTERVAL*1000)}ms"
         )
 
         if self._thread is None or not self._thread.is_alive():
@@ -519,7 +503,6 @@ class RealTimeStopMonitor:
             self._thread.start()
 
     def disarm(self) -> None:
-        """Desarma o monitor (posição fechada externamente ou pelo candle)."""
         with self._lock:
             if self._active:
                 log.info("  🔕 StopMonitor desarmado")
@@ -527,21 +510,19 @@ class RealTimeStopMonitor:
             self._side   = None
 
     def _fetch_price(self) -> float:
-        """Busca mark_price atual da Bitget. Retorna 0.0 em caso de erro."""
         try:
-            r = requests.get(
+            r = self._session.get(
                 "https://api.bitget.com/api/v2/mix/market/symbol-price",
                 params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
-                timeout=3,
-            ).json()
-            return float(r["data"][0]["markPrice"])
+                timeout=2,   # 2s — falha rápida para não bloquear o loop
+            )
+            return float(r.json()["data"][0]["markPrice"])
         except Exception as e:
             log.debug(f"  monitor _fetch_price: {e}")
             return 0.0
 
     def _loop(self) -> None:
-        """Loop principal — roda em thread daemon separada."""
-        log.info("  ▶️  StopMonitor thread iniciada")
+        log.info(f"  ▶️  StopMonitor thread iniciada ({int(self.POLL_INTERVAL*1000)}ms)")
 
         while True:
             self._stop_evt.wait(self.POLL_INTERVAL)
@@ -549,7 +530,6 @@ class RealTimeStopMonitor:
 
             with self._lock:
                 if not self._active or self._side is None:
-                    # Dorme mais quando desarmado
                     self._stop_evt.wait(1.0)
                     continue
                 side  = self._side
@@ -568,7 +548,6 @@ class RealTimeStopMonitor:
                 if not self._active:
                     continue
 
-                # ── Lógica IDÊNTICA a strategy._check_trail ────────────────
                 if side == 'long':
                     self._highest = max(self._highest, px)
                     profit_t = (self._highest - entry) / self._tick
@@ -608,22 +587,15 @@ class RealTimeStopMonitor:
                 self._execute_exit(side, stop_px, qty, reason)
 
     def _execute_exit(self, side: str, price: float, qty: float, reason: str) -> None:
-        """
-        Executa o fechamento no paper/live e confirma na strategy.
-        Usa _pos_lock para evitar race condition com process().
-        """
         ts     = brazil_iso()
         trader = self.trader
 
-        # Desarma ANTES do lock para evitar re-entrada
         self.disarm()
 
         with trader._pos_lock:
-            # Guarda de segurança: se strategy já fechou (candle nos bateu), skip
             if trader.strategy.position_size == 0.0:
                 log.debug("  monitor: posição já estava fechada — skip")
                 return
-
             try:
                 if side == 'long':
                     if trader._is_paper():
@@ -642,7 +614,6 @@ class RealTimeStopMonitor:
                         trader.bitget.close_short(qty, price, reason)
                     trader._add_log("EXIT_SHORT", price, qty, reason)
 
-                # Confirma na strategy → position_size = 0
                 strat_side = 'LONG' if side == 'long' else 'SHORT'
                 trader.strategy.confirm_exit(strat_side, price, qty, ts, reason)
                 trader._cache_pos = None
@@ -653,10 +624,8 @@ class RealTimeStopMonitor:
 
                 log.info(
                     f"  ✅ EXIT [{side.upper()}] pelo monitor | "
-                    f"px={price:.2f} {reason} | "
-                    f"novo_bal={trader.strategy.balance:.2f}"
+                    f"px={price:.2f} {reason} | novo_bal={trader.strategy.balance:.2f}"
                 )
-
             except Exception as e:
                 log.error(f"❌ StopMonitor _execute_exit: {e}\n{traceback.format_exc()}")
 
@@ -686,8 +655,6 @@ class LiveTrader:
         self._last_candle_ts_ms: int = 0
         # Monitor removido – stops são processados via candle em strategy.next()
 
-        # ── Monitor de stop em tempo real ─────────────────────────────────
-        # _pos_lock: previne race condition entre monitor e process()
         self._pos_lock     = threading.Lock()
         self._stop_monitor = RealTimeStopMonitor(self)
 
@@ -716,7 +683,7 @@ class LiveTrader:
 
     def warmup(self, df: pd.DataFrame):
         self._warming = True
-        self._stop_monitor.disarm()   # garante monitor desarmado durante warmup
+        self._stop_monitor.disarm()
         log.info(f"🔄 Warmup: {len(df)} candles...")
         for _, row in df.iterrows():
             self.strategy.next({
@@ -1115,7 +1082,6 @@ class LiveTrader:
 
     def stop(self):
         self._running = False
-        # Monitor removido – nada mais a parar
         self._stop_monitor.disarm()
         log.info("🛑 Trader parado")
 
