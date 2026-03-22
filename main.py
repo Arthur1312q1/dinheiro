@@ -517,15 +517,22 @@ class RealTimeStopMonitor:
     def sync_from_strategy(self) -> None:
         """
         Copia _highest/_lowest/_trail_active da strategy ao final de cada candle.
-        Garante que o stop do monitor use o candle H/L real — idêntico ao backtest.
+
+        SUBSTITUI (não max/min) para garantir paridade exata com backtest:
+        - Backtest usa candle H/L real para calcular _highest/_lowest
+        - mark_price polado pode ultrapassar ligeiramente o candle HIGH
+          (mark price ≠ traded price), causando stop em nível errado
+        - Ao substituir, o monitor fica ancorado no mesmo valor que o backtest
+        - Durante o próximo candle, o monitor cresce a partir desse valor via poll
         """
         strat = self.trader.strategy
         with self._lock:
             if not self._active:
                 return
             prev_trail = self._trail_on
-            self._highest = max(self._highest, strat._highest)
-            self._lowest  = min(self._lowest,  strat._lowest)
+            # SUBSTITUI — não max/min — para paridade exata com backtest
+            self._highest = strat._highest
+            self._lowest  = strat._lowest
             if strat._trail_active:
                 self._trail_on = True
             if not prev_trail and self._trail_on:
