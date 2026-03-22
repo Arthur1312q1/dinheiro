@@ -440,65 +440,66 @@ class Bitget:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# REAL-TIME STOP MONITOR
+# REAL-TIME STOP MONITOR  (somente SL fixo intra-candle)
 # ═══════════════════════════════════════════════════════════════════════════════
 class RealTimeStopMonitor:
     """
-    Replica _check_trail da strategy em tempo real (50ms poll, TCP keep-alive).
+    Monitora APENAS o SL fixo durante o candle aberto (50ms poll).
+    O trailing stop é processado integralmente pelo strategy.next() no
+    fechamento de cada candle com o H/L real — idêntico ao backtest.
 
-    ALINHAMENTO COM BACKTEST:
-    - entry  : sempre open_px (igual ao backtest _exec_open)
-    - highest/lowest/trail : sincronizados com strategy após cada candle
-      via sync_from_strategy(), garantindo mesmos níveis de stop.
+    POR QUE NÃO MONITORAR TRAIL INTRA-CANDLE:
+    O backtest calcula _lowest/_highest com o LOW/HIGH do candle inteiro
+    de uma só vez. Se o trail fosse monitorado tick-a-tick, qualquer
+    micro-movimento ativaria o trail e fecharia na primeira pequena
+    reversão — completamente diferente do backtest.
+
+    Exemplo SHORT em 2057:
+      Backtest: _lowest = candle_LOW = 2024 → stop = 2024.15 ✅
+      Monitor tick-a-tick: _lowest = 2055.73 (primeiro dip) →
+        stop = 2055.88 → fecha na primeira micro-reversão ❌
+
+    O que o monitor faz:
+      LONG: se mark_price cair abaixo de  (entry - sl*tick) → EXIT_LONG
+      SHORT: se mark_price subir acima de (entry + sl*tick) → EXIT_SHORT
+
+    Isso protege apenas contra movimentos catastróficos intra-candle
+    (o SL nunca é atingido em operações normais com trail ativo).
     """
 
-    POLL_INTERVAL = 0.05   # 50ms — ~20 req/s, dentro do limite público Bitget
+    POLL_INTERVAL = 0.05   # 50ms — TCP keep-alive, ~20 req/s
 
     def __init__(self, trader: 'LiveTrader'):
-        self.trader      = trader
-        self._lock       = threading.Lock()
-        self._thread     = None
-        self._active     = False
-        self._stop_evt   = threading.Event()
-        self._session    = requests.Session()   # TCP keep-alive — sem overhead de handshake
+        self.trader    = trader
+        self._lock     = threading.Lock()
+        self._thread   = None
+        self._active   = False
+        self._stop_evt = threading.Event()
+        self._session  = requests.Session()
 
-        self._side       : Optional[str] = None
-        self._entry      : float = 0.0
-        self._qty        : float = 0.0
-        self._highest    : float = 0.0
-        self._lowest     : float = float('inf')
-        self._trail_on   : bool  = False
+        self._side  : Optional[str] = None
+        self._entry : float = 0.0
+        self._qty   : float = 0.0
 
     @property
     def _sl(self):   return self.trader.strategy.sl
     @property
-    def _tp(self):   return self.trader.strategy.tp
-    @property
-    def _toff(self): return self.trader.strategy.toff
-    @property
     def _tick(self): return self.trader.strategy.tick
 
     def arm(self, side: str, entry: float, qty: float) -> None:
-        """
-        Arma o monitor após abertura de posição.
-        entry deve ser open_px (igual ao backtest) para que os stop levels
-        sejam idênticos: SL = open_px ± sl*tick.
-        """
         with self._lock:
-            self._side     = side
-            self._entry    = entry
-            self._qty      = qty
-            self._highest  = entry
-            self._lowest   = entry
-            self._trail_on = False
-            self._active   = True
+            self._side   = side
+            self._entry  = entry
+            self._qty    = qty
+            self._active = True
             self._stop_evt.set()
 
+        sl_price = entry - self._sl * self._tick if side == 'long' \
+                   else entry + self._sl * self._tick
         log.info(
             f"  🔔 StopMonitor ARMADO | {side.upper()} "
-            f"entry={entry:.2f} qty={qty:.4f} | "
-            f"SL={self._sl}t  TP={self._tp}t  TRAIL={self._toff}t  "
-            f"poll={int(self.POLL_INTERVAL*1000)}ms"
+            f"entry={entry:.2f} SL_fixo={sl_price:.2f} "
+            f"(trail via strategy.next) poll={int(self.POLL_INTERVAL*1000)}ms"
         )
 
         if self._thread is None or not self._thread.is_alive():
@@ -513,33 +514,6 @@ class RealTimeStopMonitor:
                 log.info("  🔕 StopMonitor desarmado")
             self._active = False
             self._side   = None
-
-    def sync_from_strategy(self) -> None:
-        """
-        Copia _highest/_lowest/_trail_active da strategy ao final de cada candle.
-
-        SUBSTITUI (não max/min) para garantir paridade exata com backtest:
-        - Backtest usa candle H/L real para calcular _highest/_lowest
-        - mark_price polado pode ultrapassar ligeiramente o candle HIGH
-          (mark price ≠ traded price), causando stop em nível errado
-        - Ao substituir, o monitor fica ancorado no mesmo valor que o backtest
-        - Durante o próximo candle, o monitor cresce a partir desse valor via poll
-        """
-        strat = self.trader.strategy
-        with self._lock:
-            if not self._active:
-                return
-            prev_trail = self._trail_on
-            # SUBSTITUI — não max/min — para paridade exata com backtest
-            self._highest = strat._highest
-            self._lowest  = strat._lowest
-            if strat._trail_active:
-                self._trail_on = True
-            if not prev_trail and self._trail_on:
-                log.info(
-                    f"  🔄 Monitor sync → TRAIL ATIVADO | "
-                    f"highest={self._highest:.2f} lowest={self._lowest:.2f}"
-                )
 
     def _fetch_price(self) -> float:
         try:
@@ -572,53 +546,27 @@ class RealTimeStopMonitor:
             if px <= 0:
                 continue
 
+            # ── Apenas SL fixo — NÃO há lógica de trail aqui ──────────────
+            # Trail é processado pelo strategy.next() no fechamento do candle
             triggered = False
             stop_px   = 0.0
-            reason    = ""
 
-            with self._lock:
-                if not self._active:
-                    continue
-
-                if side == 'long':
-                    self._highest = max(self._highest, px)
-                    profit_t = (self._highest - entry) / self._tick
-                    if profit_t >= self._tp:
-                        self._trail_on = True
-                    if self._trail_on:
-                        stop   = self._highest - self._toff * self._tick
-                        reason = "TRAIL"
-                    else:
-                        stop   = entry - self._sl * self._tick
-                        reason = "SL"
-                    if px <= stop:
-                        triggered = True
-                        stop_px   = stop
-
-                elif side == 'short':
-                    self._lowest = min(self._lowest, px)
-                    profit_t = (entry - self._lowest) / self._tick
-                    if profit_t >= self._tp:
-                        self._trail_on = True
-                    if self._trail_on:
-                        stop   = self._lowest + self._toff * self._tick
-                        reason = "TRAIL"
-                    else:
-                        stop   = entry + self._sl * self._tick
-                        reason = "SL"
-                    if px >= stop:
-                        triggered = True
-                        stop_px   = stop
+            if side == 'long':
+                stop_px = entry - self._sl * self._tick
+                triggered = px <= stop_px
+            elif side == 'short':
+                stop_px = entry + self._sl * self._tick
+                triggered = px >= stop_px
 
             if triggered:
                 log.info(
-                    f"  🛑 STOP ATINGIDO [{side.upper()}] "
-                    f"stop={stop_px:.2f} px={px:.2f} | {reason} | "
-                    f"trail={'ON' if self._trail_on else 'off'}"
+                    f"  🛑 SL FIXO ATINGIDO [{side.upper()}] "
+                    f"stop={stop_px:.2f} px={px:.2f}"
                 )
-                self._execute_exit(side, stop_px, qty, reason)
+                self._execute_exit(side, stop_px, qty)
 
-    def _execute_exit(self, side: str, price: float, qty: float, reason: str) -> None:
+    def _execute_exit(self, side: str, price: float, qty: float) -> None:
+        reason = "SL"
         ts     = brazil_iso()
         trader = self.trader
 
@@ -626,7 +574,7 @@ class RealTimeStopMonitor:
 
         with trader._pos_lock:
             if trader.strategy.position_size == 0.0:
-                log.debug("  monitor: posição já estava fechada — skip")
+                log.debug("  monitor: posição já fechada — skip")
                 return
             try:
                 if side == 'long':
@@ -650,13 +598,12 @@ class RealTimeStopMonitor:
                 trader.strategy.confirm_exit(strat_side, price, qty, ts, reason)
                 trader._cache_pos = None
                 trader._cache_bal = trader.strategy.balance
-
                 if trader._is_paper():
                     trader.paper.balance = trader.strategy.balance
 
                 log.info(
-                    f"  ✅ EXIT [{side.upper()}] pelo monitor | "
-                    f"px={price:.2f} {reason} | novo_bal={trader.strategy.balance:.2f}"
+                    f"  ✅ EXIT SL [{side.upper()}] "
+                    f"px={price:.2f} | novo_bal={trader.strategy.balance:.2f}"
                 )
             except Exception as e:
                 log.error(f"❌ StopMonitor _execute_exit: {e}\n{traceback.format_exc()}")
@@ -717,13 +664,11 @@ class LiveTrader:
         self._warming = True
         self._stop_monitor.disarm()
 
-        # ── Paridade par: strategy alterna BUY/SELL com _bar % 2 ─────────────
-        # Backtest usa N par de candles → _bar termina par → _buy_prev=True.
-        # Se fetcher retornar N ímpar (dedup), _bar termina ímpar → invertido.
-        # Descartamos 1 candle antigo para garantir N par.
+        # Garante contagem par de candles: a strategy alterna BUY/SELL por
+        # _bar % 2. N ímpar → trades invertidas vs backtest (que usa 500=par).
         if len(df) % 2 != 0:
             df = df.iloc[1:].reset_index(drop=True)
-            log.info(f"  📐 Paridade: descartado 1 candle antigo → {len(df)} candles (par)")
+            log.info(f"  📐 Paridade: 1 candle descartado → {len(df)} (par)")
 
         log.info(f"🔄 Warmup: {len(df)} candles...")
         for _, row in df.iterrows():
@@ -807,8 +752,16 @@ class LiveTrader:
         log.info(f"  📊 {len(actions)} ação(ões): "
                  f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}")
 
+        # ── _pending_arm: arm() só ocorre APÓS o loop completo ────────────────
+        # Motivo: strategy.next() pode retornar [BUY/SELL, EXIT] no mesmo candle
+        # (quando o stop dispara intra-candle). Se armássemos dentro do loop, o
+        # monitor thread acordaria via _stop_evt.set() e poderia disparar exit
+        # ANTES que o EXIT action fosse processado pela thread principal —
+        # race condition que causava fechamentos com preços errados.
+        _pending_arm: Optional[tuple] = None
+
         for act in actions:
-            kind = act.get('action', '')
+            kind    = act.get('action', '')
             act_px  = float(act.get('price') or 0)
             act_qty = float(act.get('qty')   or 0)
             _raw_ts = act.get('timestamp')
@@ -825,10 +778,7 @@ class LiveTrader:
             else:
                 act_ts = brazil_iso()
 
-            # ── EXIT LONG (gerado pelo _check_trail do candle) ────────────
-            # O strategy.next() chama _check_trail com o HIGH/LOW do candle
-            # e detecta o stop intra-candle — devemos processar imediatamente,
-            # replicando o comportamento do backtest.
+            # ── EXIT LONG ─────────────────────────────────────────────────
             if kind == 'EXIT_LONG':
                 exit_px     = float(act.get('price') or 0)
                 exit_qty    = float(act.get('qty')   or 0)
@@ -837,6 +787,7 @@ class LiveTrader:
                     log.debug("  ℹ️ EXIT_LONG ignorada — preço/qty inválido")
                     continue
                 log.info(f"  🔴 EXIT_LONG @ {exit_px:.2f} | motivo={exit_reason} | qty={exit_qty:.4f}")
+                _pending_arm = None   # cancela arm pendente — posição vai fechar
                 with self._pos_lock:
                     self._stop_monitor.disarm()
                     if self._is_paper():
@@ -849,12 +800,11 @@ class LiveTrader:
                         self.bitget.close_long(exit_qty, exit_px, exit_reason)
                         self._cache_pos = None
                         self._add_log("EXIT_LONG", exit_px, exit_qty, exit_reason)
-                    # Confirma saída na estratégia
                     self.strategy.confirm_exit('LONG', exit_px, exit_qty, act_ts, exit_reason)
                     self._cache_bal = self.strategy.balance
                 continue
 
-            # ── EXIT SHORT (gerado pelo _check_trail do candle) ───────────
+            # ── EXIT SHORT ────────────────────────────────────────────────
             elif kind == 'EXIT_SHORT':
                 exit_px     = float(act.get('price') or 0)
                 exit_qty    = float(act.get('qty')   or 0)
@@ -863,6 +813,7 @@ class LiveTrader:
                     log.debug("  ℹ️ EXIT_SHORT ignorada — preço/qty inválido")
                     continue
                 log.info(f"  🟢 EXIT_SHORT @ {exit_px:.2f} | motivo={exit_reason} | qty={exit_qty:.4f}")
+                _pending_arm = None   # cancela arm pendente — posição vai fechar
                 with self._pos_lock:
                     self._stop_monitor.disarm()
                     if self._is_paper():
@@ -875,7 +826,6 @@ class LiveTrader:
                         self.bitget.close_short(exit_qty, exit_px, exit_reason)
                         self._cache_pos = None
                         self._add_log("EXIT_SHORT", exit_px, exit_qty, exit_reason)
-                    # Confirma saída na estratégia
                     self.strategy.confirm_exit('SHORT', exit_px, exit_qty, act_ts, exit_reason)
                     self._cache_bal = self.strategy.balance
                 continue
@@ -906,15 +856,11 @@ class LiveTrader:
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                         self.strategy.confirm_fill('BUY', px, qty_f, act_ts)
                         self._cache_bal = self.strategy.balance
-                        self._stop_monitor.arm('long', px, qty_f)
+                        _pending_arm = ('long', px, qty_f)
                     else:
                         log.error(f"  ❌ paper.open_long falhou")
 
                 else:  # LIVE
-                    # Ordem enviada ao mark_price atual (único preço possível ao vivo).
-                    # confirm_fill e arm usam open_px — idêntico ao backtest (_exec_open
-                    # executa ao open do candle). Isso garante que o SL/trail do monitor
-                    # seja calculado da mesma base que o backtest: open_px ± sl*tick.
                     mark_px = self._mark_price() or close_px
                     pos = self.bitget.position()
                     if pos and pos['side'] == 'long':
@@ -926,16 +872,16 @@ class LiveTrader:
                         self.bitget.close_short(pos['size'], mark_px, "REVERSAL")
                         self.strategy.confirm_exit('SHORT', open_px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
-                    log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ {mark_px:.2f} (ref open={open_px:.2f})")
+                    log.info(f"  🟢 LIVE ENTER LONG {qty:.6f} ETH @ open={open_px:.2f}")
                     r, qty_f = self.bitget.open_long(qty, self._cache_bal, mark_px)
                     if r.get("code") == "00000":
-                        # confirm_fill com open_px → strategy e monitor alinhados ao backtest
+                        # confirm_fill usa open_px (= candle open = mesmo do backtest)
                         self.strategy.confirm_fill('BUY', open_px, qty_f, act_ts)
                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': open_px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_LONG", open_px, qty_f)
                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} fill={mark_px:.2f} ref={open_px:.2f}")
-                        self._stop_monitor.arm('long', open_px, qty_f)
+                        _pending_arm = ('long', open_px, qty_f)
                     elif r.get("code") == "SKIP":
                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
                     else:
@@ -967,7 +913,7 @@ class LiveTrader:
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                         self.strategy.confirm_fill('SELL', px, qty_f, act_ts)
                         self._cache_bal = self.strategy.balance
-                        self._stop_monitor.arm('short', px, qty_f)
+                        _pending_arm = ('short', px, qty_f)
                     else:
                         log.error(f"  ❌ paper.open_short falhou")
 
@@ -983,20 +929,30 @@ class LiveTrader:
                         self.bitget.close_long(pos['size'], mark_px, "REVERSAL")
                         self.strategy.confirm_exit('LONG', open_px, pos['size'], act_ts, "REVERSAL")
                         self._cache_pos = None
-                    log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ {mark_px:.2f} (ref open={open_px:.2f})")
+                    log.info(f"  🔴 LIVE ENTER SHORT {qty:.6f} ETH @ open={open_px:.2f}")
                     r, qty_f = self.bitget.open_short(qty, self._cache_bal, mark_px)
                     if r.get("code") == "00000":
-                        # confirm_fill com open_px → strategy e monitor alinhados ao backtest
+                        # confirm_fill usa open_px (= candle open = mesmo do backtest)
                         self.strategy.confirm_fill('SELL', open_px, qty_f, act_ts)
                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': open_px}
                         self._cache_bal = self.strategy.balance
                         self._add_log("ENTER_SHORT", open_px, qty_f)
                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} fill={mark_px:.2f} ref={open_px:.2f}")
-                        self._stop_monitor.arm('short', open_px, qty_f)
+                        _pending_arm = ('short', open_px, qty_f)
                     elif r.get("code") == "SKIP":
                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
                     else:
                         log.error(f"  ❌ bitget.open_short falhou")
+
+        # ── Arma o monitor DEPOIS que todos os actions foram processados ──────
+        # Se o candle gerou [BUY/SELL + EXIT] (stop no mesmo candle que abriu),
+        # _pending_arm foi cancelado pelo EXIT — monitor não é armado. Correto.
+        # Se o candle gerou só [BUY/SELL] (posição continua aberta), arma agora.
+        if _pending_arm is not None and self.strategy.position_size != 0.0:
+            self._stop_monitor.arm(*_pending_arm)
+            log.debug(f"  🔔 arm pós-loop | {_pending_arm[0]} entry={_pending_arm[1]:.2f}")
+        elif _pending_arm is not None:
+            log.debug("  ℹ️ _pending_arm descartado — posição fechada no mesmo candle")
 
         # Sincroniza saldo e posição com a estratégia (apenas paper)
         if self._is_paper():
@@ -1004,7 +960,8 @@ class LiveTrader:
             self._cache_bal    = self.strategy.balance
             self._cache_pos    = self.paper.get_position()
 
-        # ── Sincroniza _highest/_lowest/_trail com H/L real do candle ────────
+        # Sincroniza _highest/_lowest/_trail com o H/L real do candle
+        # Garante paridade com o backtest para o próximo candle
         self._stop_monitor.sync_from_strategy()
 
     def _wait(self, tf: int = 30):
