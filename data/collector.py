@@ -1,8 +1,18 @@
 # data/collector.py
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# OKX COLLECTOR — Histórico completo via history-candles + candles
-# Suporta tanto spot (ETH-USDT) quanto futuros (ETH-USDT-SWAP)
+# BITGET COLLECTOR — Histórico completo via Bitget Futures API
+#
+# MOTIVO DA MUDANÇA (OKX → Bitget):
+#   O trader ao vivo busca candles da Bitget. O backtest e o warmup
+#   precisam usar A MESMA FONTE DE DADOS para que o trailing stop
+#   produza preços idênticos (LOW/HIGH idênticos → _lowest/_highest
+#   idênticos → stop_price idêntico).
+#
+#   OKX e Bitget têm H/L DIFERENTES para o mesmo período:
+#     Ex.: OKX LOW = 2024.00, Bitget LOW = 2055.73 → stop 2024.15 vs 2055.88
+#
+#   Usando Bitget para tudo: backtest = warmup = live → 100% paridade.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import pandas as pd
@@ -14,83 +24,104 @@ from typing import Optional
 
 class DataCollector:
     """
-    Coleta candles históricos da OKX usando ambos os endpoints:
-    - /market/history-candles → dados históricos antigos
-    - /market/candles         → dados recentes (últimas horas/dias)
+    Coleta candles históricos da Bitget Futures usando:
+    - /api/v2/mix/market/history-candles → dados históricos antigos
+    - /api/v2/mix/market/candles         → dados recentes
 
-    Suporta qualquer instId OKX: spot (ETH-USDT), swap (ETH-USDT-SWAP), etc.
+    Usa a MESMA fonte que o trader ao vivo → trailing stop idêntico.
     """
 
-    BASE = "https://www.okx.com"
-    MAX_PER_REQ = 300
+    BASE         = "https://api.bitget.com"
+    SYMBOL       = "ETHUSDT"
+    PRODUCT_TYPE = "usdt-futures"
+    MAX_RECENT   = 1000   # Bitget /candles: máx 1000 por req
+    MAX_HISTORY  = 200    # Bitget /history-candles: máx 200 por req
 
     _TF_MAP = {
-        '1m':'1m',  '3m':'3m',   '5m':'5m',   '15m':'15m', '30m':'30m',
-        '1h':'1H',  '2h':'2H',   '4h':'4H',   '6h':'6H',   '12h':'12H',
-        '1d':'1D',  '1w':'1W',   '1M':'1M',
+        '1m':  '1m',  '3m':  '3m',  '5m':  '5m',
+        '15m': '15m', '30m': '30m',
+        '1h':  '1H',  '2h':  '2H',  '4h':  '4H',
+        '6h':  '6H',  '12h': '12H',
+        '1d':  '1D',  '1w':  '1W',
     }
 
     def __init__(
         self,
-        symbol:    str = "ETH-USDT-SWAP",
+        symbol:    str = "ETH-USDT-SWAP",   # aceita qualquer formato, ignora (usa ETHUSDT fixo)
         timeframe: str = "30m",
         limit:     int = 5500,
-        exchange:  str = "okx",
+        exchange:  str = "bitget",           # mantido por compatibilidade
     ):
-        # Normaliza símbolo para formato OKX
-        # Aceita: ETH-USDT, ETH-USDT-SWAP, ETHUSDT, ETH/USDT etc.
-        s = symbol.strip().upper().replace('/', '-').replace('_', '-')
-        # Só faz substituição simples se NÃO tiver sufixo como -SWAP, -FUTURES etc.
-        if '-' not in s and s.endswith('USDT'):
-            s = s[:-4] + '-USDT'
-        self.symbol    = s
         self.timeframe = self._TF_MAP.get(timeframe.lower(), '30m')
         self.limit     = limit
-
-        # Detecta o tipo de instrumento para usar o endpoint correto
-        # SWAP e FUTURES têm endpoint diferente para history-candles
-        self._inst_type = self._detect_inst_type(s)
-
-    def _detect_inst_type(self, symbol: str) -> str:
-        """Detecta se é SPOT, SWAP ou FUTURES baseado no símbolo."""
-        if symbol.endswith('-SWAP'):
-            return 'SWAP'
-        elif 'FUTURES' in symbol or symbol.count('-') >= 2:
-            return 'FUTURES'
-        return 'SPOT'
+        self._session  = requests.Session()
+        # Symbol ignorado: sempre usa ETHUSDT usdt-futures (mesmo do live trader)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Busca HISTÓRICA — /api/v5/market/history-candles
+    # Busca RECENTE — /api/v2/mix/market/candles
     # ─────────────────────────────────────────────────────────────────────────
-    def _fetch_history(self, limit: int, before_ts_ms: Optional[int] = None) -> list:
+    def _fetch_recent(self, limit: int = 200) -> list:
         """
-        Busca candles históricos. Retorna lista em ordem CRESCENTE.
+        Busca até `limit` candles recentes.
+        Retorna lista em ordem CRESCENTE (mais antigo primeiro).
+        """
+        params = {
+            'symbol':      self.SYMBOL,
+            'productType': self.PRODUCT_TYPE,
+            'granularity': self.timeframe,
+            'limit':       str(min(limit, self.MAX_RECENT)),
+        }
+        try:
+            r = self._session.get(
+                self.BASE + "/api/v2/mix/market/candles",
+                params=params, timeout=15
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"  ⚠️ Bitget candles erro: {e}")
+            return []
+
+        if data.get('code') != '00000':
+            print(f"  ⚠️ Bitget candles: {data.get('msg')}")
+            return []
+
+        page = data.get('data', [])
+        page.reverse()   # Bitget retorna decrescente → inverte para crescente
+        return page
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Busca HISTÓRICA — /api/v2/mix/market/history-candles
+    # ─────────────────────────────────────────────────────────────────────────
+    def _fetch_history(self, limit: int, end_time_ms: int) -> list:
+        """
+        Busca candles históricos anteriores a `end_time_ms`.
+        Retorna lista em ordem CRESCENTE.
         """
         collected = []
-        after_ts  = str(before_ts_ms) if before_ts_ms else None
+        end_time  = str(end_time_ms)
 
         while len(collected) < limit:
             params = {
-                'instId': self.symbol,
-                'bar':    self.timeframe,
-                'limit':  self.MAX_PER_REQ,
+                'symbol':      self.SYMBOL,
+                'productType': self.PRODUCT_TYPE,
+                'granularity': self.timeframe,
+                'endTime':     end_time,
+                'limit':       str(self.MAX_HISTORY),
             }
-            if after_ts:
-                params['after'] = after_ts
-
             try:
-                resp = requests.get(
-                    self.BASE + "/api/v5/market/history-candles",
+                r = self._session.get(
+                    self.BASE + "/api/v2/mix/market/history-candles",
                     params=params, timeout=20
                 )
-                resp.raise_for_status()
-                data = resp.json()
+                r.raise_for_status()
+                data = r.json()
             except Exception as e:
-                print(f"  ⚠️ history-candles erro: {e}")
+                print(f"  ⚠️ Bitget history-candles erro: {e}")
                 break
 
-            if data.get('code') != '0':
-                print(f"  ⚠️ OKX history-candles: {data.get('msg')}")
+            if data.get('code') != '00000':
+                print(f"  ⚠️ Bitget history-candles: {data.get('msg')}")
                 break
 
             page = data.get('data', [])
@@ -98,58 +129,28 @@ class DataCollector:
                 break
 
             collected.extend(page)
-            oldest_ts = page[-1][0]
-            after_ts  = oldest_ts
+            # oldest entry = last element (Bitget retorna decrescente)
+            end_time = page[-1][0]
 
-            if len(page) < self.MAX_PER_REQ:
+            if len(page) < self.MAX_HISTORY:
                 break
 
-        collected.reverse()
+        collected.reverse()   # crescente
         return collected
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Busca RECENTE — /api/v5/market/candles
-    # ─────────────────────────────────────────────────────────────────────────
-    def _fetch_recent(self, limit: int = 300) -> list:
-        """
-        Busca candles recentes. Retorna lista em ordem CRESCENTE.
-        """
-        params = {
-            'instId': self.symbol,
-            'bar':    self.timeframe,
-            'limit':  min(limit, self.MAX_PER_REQ),
-        }
-        try:
-            resp = requests.get(
-                self.BASE + "/api/v5/market/candles",
-                params=params, timeout=15
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"  ⚠️ candles recentes erro: {e}")
-            return []
-
-        if data.get('code') != '0':
-            print(f"  ⚠️ OKX candles: {data.get('msg')}")
-            return []
-
-        page = data.get('data', [])
-        page.reverse()
-        return page
 
     # ─────────────────────────────────────────────────────────────────────────
     # FETCH PRINCIPAL
     # ─────────────────────────────────────────────────────────────────────────
     def fetch_ohlcv(self) -> pd.DataFrame:
         """
-        Busca candles da OKX.
-        - Se limit <= 300: uma única requisição rápida (/candles)
-        - Se limit > 300:  paginação via /history-candles + /candles
+        Busca candles da Bitget Futures.
+        - limit ≤ 1000 : uma única requisição rápida (/candles)
+        - limit > 1000 : /candles + paginação via /history-candles
         """
-        print(f"🔍 OKX: {self.symbol} ({self._inst_type}) {self.timeframe} | {self.limit} candles...")
+        print(f"🔍 Bitget Futures: {self.SYMBOL} {self.PRODUCT_TYPE} "
+              f"{self.timeframe} | {self.limit} candles...")
 
-        if self.limit <= 300:
+        if self.limit <= self.MAX_RECENT:
             recent = self._fetch_recent(limit=self.limit)
             if not recent:
                 print("  ⚠️ Sem dados — usando mock")
@@ -159,15 +160,17 @@ class DataCollector:
 
         else:
             print(f"   [1/2] Candles recentes...")
-            recent = self._fetch_recent(limit=300)
+            recent = self._fetch_recent(limit=self.MAX_RECENT)
             if not recent:
                 print("  ⚠️ Sem dados recentes — usando mock")
                 return self._mock()
+            # oldest timestamp do bloco recente (para paginar para trás)
             oldest_recent_ts = int(recent[0][0])
             print(f"   ✓ {len(recent)} recentes")
+
             needed = self.limit - len(recent) + 50
             print(f"   [2/2] Histórico ({needed} candles)...")
-            historical = self._fetch_history(limit=needed, before_ts_ms=oldest_recent_ts)
+            historical = self._fetch_history(limit=needed, end_time_ms=oldest_recent_ts)
             print(f"   ✓ {len(historical)} históricos")
             all_raw = historical + recent
 
@@ -189,7 +192,7 @@ class DataCollector:
             except (IndexError, ValueError):
                 continue
 
-        df = pd.DataFrame(rows, columns=['timestamp','open','high','low','close','volume'])
+        df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df = df.assign(timestamp=pd.to_datetime(df['timestamp'], unit='ms'))
         df = (df.sort_values('timestamp')
                 .drop_duplicates('timestamp')
@@ -203,7 +206,8 @@ class DataCollector:
         first = df['timestamp'].iloc[0]
         last  = df['timestamp'].iloc[-1]
         days  = (last - first).total_seconds() / 86400
-        print(f"\n✅ {len(df)} candles | {first.strftime('%Y-%m-%d')} → {last.strftime('%Y-%m-%d')} ({days:.1f} dias)")
+        print(f"\n✅ {len(df)} candles | {first.strftime('%Y-%m-%d')} → "
+              f"{last.strftime('%Y-%m-%d')} ({days:.1f} dias)")
 
         if len(df) < self.limit * 0.8:
             print(f"  ⚠️ ATENÇÃO: recebeu apenas {len(df)}/{self.limit} candles esperados")
@@ -226,9 +230,9 @@ class DataCollector:
             lo = p * (1 - random.uniform(0, 0.004))
             cl = p * (1 + random.uniform(-0.002, 0.002))
             ts = end - dt * (self.limit - i)
-            rows.append([ts, round(p,2), round(hi,2), round(lo,2),
-                         round(cl,2), round(random.uniform(5000,15000),2)])
-        df = pd.DataFrame(rows, columns=['timestamp','open','high','low','close','volume'])
+            rows.append([ts, round(p, 2), round(hi, 2), round(lo, 2),
+                         round(cl, 2), round(random.uniform(5000, 15000), 2)])
+        df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df['index']     = df.index
         return df
