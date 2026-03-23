@@ -771,3 +771,49 @@ class AdaptiveZeroLagEMA:
         self._lowest         = float('inf')
         self._trail_active   = False
         self._monitored      = False
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # NOVO MÉTODO PARA LIVE: atualização intra-barra do trailing stop
+    # ═══════════════════════════════════════════════════════════════════════
+    def update_trailing_live(self, high: float, low: float, ts) -> Optional[Dict]:
+        """
+        Versão LIVE do trailing stop — só atualiza _highest/_lowest e verifica saída.
+        NÃO avança _bar, NÃO recalcula IFM/ZLEMA, NÃO força sinal.
+        Chame isso a cada 10-30 segundos com o candle ATUAL (incompleto).
+        """
+        if self.position_size == 0.0 or not self._monitored:
+            return None
+
+        if self.position_size > 0.0:   # LONG
+            self._highest = max(self._highest, high)
+            profit_ticks = (self._highest - self.position_price) / self.tick
+            if profit_ticks >= self.tp:
+                self._trail_active = True
+
+            if self._trail_active:
+                stop = self._highest - self.toff * self.tick
+                rsn = "TRAIL"
+            else:
+                stop = self.position_price - self.sl * self.tick
+                rsn = "SL"
+
+            if low <= stop:   # mesmo teste do backtest
+                return self._exit_at(stop, "long", rsn, ts)
+
+        else:  # SHORT
+            self._lowest = min(self._lowest, low)
+            profit_ticks = (self.position_price - self._lowest) / self.tick
+            if profit_ticks >= self.tp:
+                self._trail_active = True
+
+            if self._trail_active:
+                stop = self._lowest + self.toff * self.tick
+                rsn = "TRAIL"
+            else:
+                stop = self.position_price + self.sl * self.tick
+                rsn = "SL"
+
+            if high >= stop:
+                return self._exit_at(stop, "short", rsn, ts)
+
+        return None
