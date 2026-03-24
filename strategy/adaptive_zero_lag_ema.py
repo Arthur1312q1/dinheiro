@@ -139,6 +139,9 @@ class AdaptiveZeroLagEMA:
         self._lowest         = float('inf')
         self._trail_active   = False
         self._monitored      = False   # True quando exit está ativo
+        # Stop prices calculados (acessíveis externamente para live trading)
+        self.long_stop       = 0.0    # stop price ativo para posição LONG
+        self.short_stop      = 0.0    # stop price ativo para posição SHORT
 
         # ── Contador de barras ───────────────────────────────────────────
         self._bar            = 0
@@ -351,6 +354,7 @@ class AdaptiveZeroLagEMA:
             else:
                 stop = self.position_price - self.sl * self.tick
                 rsn  = "SL"
+            self.long_stop = stop   # atualiza stop price visível
             if l <= stop:
                 return self._exit_at(stop, "long", rsn, ts)
 
@@ -365,6 +369,7 @@ class AdaptiveZeroLagEMA:
             else:
                 stop = self.position_price + self.sl * self.tick
                 rsn  = "SL"
+            self.short_stop = stop  # atualiza stop price visível
             if h >= stop:
                 return self._exit_at(stop, "short", rsn, ts)
 
@@ -779,41 +784,52 @@ class AdaptiveZeroLagEMA:
         """
         Versão LIVE do trailing stop — só atualiza _highest/_lowest e verifica saída.
         NÃO avança _bar, NÃO recalcula IFM/ZLEMA, NÃO força sinal.
-        Chame isso a cada 10-30 segundos com o candle ATUAL (incompleto).
+        Chame a cada ~5-30 s com o candle ATUAL (incompleto).
+
+        O preço de saída retornado (chave 'price') é o stop_price EXATO,
+        garantindo paridade com o backtest (Pine slippage=0).
+        Os atributos `long_stop` e `short_stop` são atualizados a cada chamada
+        e podem ser consultados externamente para exibição/log.
         """
         if self.position_size == 0.0 or not self._monitored:
             return None
 
-        if self.position_size > 0.0:   # LONG
+        if self.position_size > 0.0:   # ── LONG ──────────────────────
             self._highest = max(self._highest, high)
-            profit_ticks = (self._highest - self.position_price) / self.tick
+            profit_ticks  = (self._highest - self.position_price) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
 
             if self._trail_active:
                 stop = self._highest - self.toff * self.tick
-                rsn = "TRAIL"
+                rsn  = "TRAIL"
             else:
                 stop = self.position_price - self.sl * self.tick
-                rsn = "SL"
+                rsn  = "SL"
 
-            if low <= stop:   # mesmo teste do backtest
+            # Mantém long_stop visível externamente (para log / dashboard)
+            self.long_stop = stop
+
+            if low <= stop:   # mesmo gatilho do backtest: LOW toca o stop
                 return self._exit_at(stop, "long", rsn, ts)
 
-        else:  # SHORT
-            self._lowest = min(self._lowest, low)
-            profit_ticks = (self.position_price - self._lowest) / self.tick
+        else:  # ── SHORT ──────────────────────────────────────────────
+            self._lowest  = min(self._lowest, low)
+            profit_ticks  = (self.position_price - self._lowest) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
 
             if self._trail_active:
                 stop = self._lowest + self.toff * self.tick
-                rsn = "TRAIL"
+                rsn  = "TRAIL"
             else:
                 stop = self.position_price + self.sl * self.tick
-                rsn = "SL"
+                rsn  = "SL"
 
-            if high >= stop:
+            # Mantém short_stop visível externamente
+            self.short_stop = stop
+
+            if high >= stop:  # mesmo gatilho do backtest: HIGH toca o stop
                 return self._exit_at(stop, "short", rsn, ts)
 
         return None
