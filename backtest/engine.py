@@ -1,8 +1,9 @@
 # backtest/engine.py
+import time
 import pandas as pd
 import numpy as np
 from datetime import timezone, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 
 BRT = timezone(timedelta(hours=-3))
@@ -40,6 +41,10 @@ class BacktestEngine:
         data: pd.DataFrame,
         open_fee_pct: float = 0.0,
         close_fee_pct: float = 0.0,
+        # Parâmetros exclusivos para modo LIVE
+        symbol: str = "ETH/USDT",
+        interval: str = "45m",
+        collector=None,           # objeto com método get_ohlcv(symbol, interval, limit)
     ):
         self.strategy      = strategy
         self.data          = data.reset_index(drop=True)
@@ -49,6 +54,12 @@ class BacktestEngine:
         self.equity_curve: List[float] = []
         self.timestamp_list: List = []
         self.total_fees_paid: float = 0.0
+
+        # Live
+        self.symbol     = symbol
+        self.interval   = interval
+        self.collector  = collector
+        self.is_running = False
 
     def _fee(self, price: float, qty: float, pct: float) -> float:
         """Taxa = valor_nocional × pct / 100"""
@@ -134,6 +145,149 @@ class BacktestEngine:
             self.timestamp_list.append(_to_brt_str(candle['timestamp']))
 
         return self._generate_report()
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # LIVE TRADING
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def run_live(self):
+        """
+        Loop principal de live trading.
+
+        Separa duas responsabilidades:
+          • INTRABAR  : verifica stop/trail a cada ~5 s com o candle em formação.
+                        Executa saída imediata ao preço EXATO do stop (sem slippage).
+          • FECHAMENTO: só chama strategy.next() uma vez por candle fechado.
+                        Registra entradas pendentes para o próximo open.
+
+        Requer que o engine tenha sido construído com `symbol`, `interval` e
+        `collector` (objeto com método get_ohlcv(symbol, interval, limit) → list[dict]).
+        """
+        if self.collector is None:
+            raise RuntimeError(
+                "run_live requer um `collector` com método get_ohlcv(). "
+                "Passe collector=<seu_objeto> no construtor do BacktestEngine."
+            )
+
+        print(f"Iniciando modo LIVE: {self.symbol} ({self.interval})")
+        self.is_running = True
+        last_processed_ts = None
+
+        while self.is_running:
+            try:
+                # 1. Busca os últimos candles
+                #    bars[-2] = candle que acabou de fechar
+                #    bars[-1] = candle em formação (intrabar)
+                bars = self.collector.get_ohlcv(self.symbol, self.interval, limit=5)
+                if not bars or len(bars) < 2:
+                    time.sleep(5)
+                    continue
+
+                closed_bar  = bars[-2]   # candle fechado
+                current_bar = bars[-1]   # candle aberto (intrabar)
+
+                # ── LÓGICA INTRABAR ──────────────────────────────────────────
+                # Verifica se high/low do candle em formação tocou no stop.
+                # O preço de saída é o stop_price EXATO (igual ao backtest).
+                exit_action = self.strategy.update_trailing_live(
+                    high=float(current_bar['high']),
+                    low=float(current_bar['low']),
+                    ts=current_bar['timestamp'],
+                )
+
+                if exit_action:
+                    exit_price = exit_action.get('price', exit_action.get('exit_price', 0.0))
+                    print(
+                        f"!!! STOP HIT INTRABAR: "
+                        f"{exit_action.get('exit_reason', '?')} "
+                        f"em {exit_price} !!!"
+                    )
+                    self.execute_live_exit(exit_action)
+                    time.sleep(2)
+                    continue   # reavalia o loop após a saída
+
+                # ── LÓGICA DE FECHAMENTO DE CANDLE ───────────────────────────
+                # Roda strategy.next() apenas uma vez por candle fechado
+                # (quando o timestamp muda).
+                if last_processed_ts != closed_bar['timestamp']:
+                    print(f"Processando fechamento do candle: {closed_bar['timestamp']}")
+
+                    actions = self.strategy.next(closed_bar)
+
+                    # Saídas técnicas geradas pelo next() (ex: reversão no close)
+                    for action in actions:
+                        act = action.get('action', '')
+                        if act in ('EXIT_LONG', 'EXIT_SHORT'):
+                            self.execute_live_exit(action)
+
+                    # Entradas pendentes para o próximo open
+                    pending_orders = self.strategy.get_pending_orders()
+                    for order in pending_orders:
+                        self.execute_live_entry(order)
+
+                    last_processed_ts = closed_bar['timestamp']
+
+                # Polling intrabar a cada 5 segundos
+                time.sleep(5)
+
+            except KeyboardInterrupt:
+                print("Loop LIVE interrompido pelo usuário.")
+                self.is_running = False
+            except Exception as e:
+                print(f"Erro no loop Live: {e}")
+                time.sleep(10)
+
+    def execute_live_exit(self, action: Dict) -> None:
+        """
+        Executa uma saída de posição na exchange.
+
+        Implemente este método para enviar a ordem de fechamento à exchange.
+        O `action` contém os campos retornados por `_exit_at` / `update_trailing_live`:
+            'action'      : 'EXIT_LONG' | 'EXIT_SHORT'
+            'price'       : preço exato do stop (usar como limit ou market)
+            'qty'         : quantidade
+            'pnl'         : PnL bruto (simulado)
+            'exit_reason' : 'TRAIL' | 'SL' | 'REVERSAL' | ...
+            'timestamp'   : timestamp do candle que gerou o sinal
+
+        Exemplo de integração (Bitget / ccxt):
+            order = exchange.create_market_order(
+                symbol=self.symbol,
+                side='sell' if action['action'] == 'EXIT_LONG' else 'buy',
+                amount=action['qty'],
+            )
+        """
+        raise NotImplementedError(
+            "Implemente execute_live_exit() com a lógica de ordem da sua exchange."
+        )
+
+    def execute_live_entry(self, order: Dict) -> None:
+        """
+        Executa uma entrada de posição na exchange.
+
+        Implemente este método para enviar a ordem de abertura à exchange.
+        O `order` contém os campos retornados por `get_pending_orders()`:
+            'side'          : 'BUY' | 'SELL'
+            'qty'           : quantidade calculada pelo gerenciamento de risco
+            'sl_ticks'      : stop loss em ticks
+            'sl_price_dist' : distância do SL em USDT por unidade
+            'trail_points'  : ticks para ativar o trailing
+            'trail_offset'  : ticks de distância do peak
+            'tick_size'     : syminfo.mintick
+            'comment'       : label da ordem
+
+        Exemplo de integração (Bitget / ccxt):
+            order_resp = exchange.create_market_order(
+                symbol=self.symbol,
+                side=order['side'].lower(),
+                amount=order['qty'],
+            )
+            # Após confirmar o fill, chamar strategy.confirm_fill(...)
+        """
+        raise NotImplementedError(
+            "Implemente execute_live_entry() com a lógica de ordem da sua exchange."
+        )
 
     def _find_open_trade(self, exit_action: str) -> Dict | None:
         expected = 'BUY' if exit_action == 'EXIT_LONG' else 'SELL'
