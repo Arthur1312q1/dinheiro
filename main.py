@@ -463,6 +463,7 @@ class LiveTrader:
         self._last_candle_ts: str = ""
         self._last_candle_ts_ms: int = 0
         self.live_pnl = 0.0
+        self._pos_lock = threading.Lock()   # <--- ADICIONADO para evitar o erro
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -1061,14 +1062,14 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-            8<table>
-            <thead>…
+            8#
+            <thead>
             8<th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th>
             </thead>
-            <tbody id="lv-trades">…
-            <td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td>
+            <tbody id="lv-trades">8#
+            <td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...8#
             </tbody>
-            8</table>
+            8#
         </div>
       </div>
       <div class="card">
@@ -1102,15 +1103,15 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-            8<table>
-            <thead>…
+          8#
+            <thead>
             8<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
                        <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th>
             </thead>
-            <tbody id="hist-tbl">…
-            <td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td>
+            <tbody id="hist-tbl">8#
+            <td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...8#
             </tbody>
-            8</table>
+          8#
         </div>
       </div>
     </div>
@@ -1135,26 +1136,26 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card">
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
-            8<table>
-              <thead>…
+            <table>
+              <thead>
                 8<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th>
               </thead>
               <tbody id="bt-tbl"></tbody>
-            8</table>
+            </table>
           </div>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
-          8<table>
-            <thead>…
+          <table>
+            <thead>
               8<th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th>
             </thead>
-            <tbody id="bt-hist-tbl">…
-              <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td>
+            <tbody id="bt-hist-tbl">8#
+              <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico8#
             </tbody>
-          8</table>
+          </table>
         </div>
       </div>
     </div>
@@ -1233,7 +1234,13 @@ async function poll() {
         const ac = t.action || ''; let cl = 'dir', lb = ac;
         if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
         if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
-        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
+        return `8#
+        <td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}8#
+        <td><span class="${cl}">${lb}</span>8#
+        <td>${t.price?.toFixed(2)||'—'}8#
+        <td>${t.qty?.toFixed(6)||'—'}8#
+        <td style="color:var(--muted)">${t.reason||'—'}8#
+        8#`;
       }).join('');
     }
     const lb = document.getElementById('lv-log');
@@ -1280,13 +1287,27 @@ async function loadHistory() {
     document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
     const tb = document.getElementById('hist-tbl');
     const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
-    if (!trades.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
+    if (!trades.length) { tb.innerHTML = '8#
+      <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado8#
+      8#'; return; }
     tb.innerHTML = trades.map((t, i) => {
       const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
       const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
       const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
       const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
-      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
+      return `8#
+      <td>${i+1}8#
+      <td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}8#
+      <td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}8#
+      <td><span class="${dc}">${dir}</span>8#
+      <td>${(t.qty||0).toFixed(4)}8#
+      <td>${(t.entry_price||0).toFixed(2)}8#
+      <td>${ep}8#
+      <td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}8#
+      <td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%8#
+      <td style="color:var(--muted)">${t.exit_reason||'—'}8#
+      <td>${mode}8#
+      8#`;
     }).join('');
   } catch(e) { console.error(e); }
 }
@@ -1335,9 +1356,23 @@ function renderBacktestResult(d) {
     const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
     const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
     const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
-    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
-    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
-  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}8#
+    <td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}8#` : '';
+    return `8#
+    <td>${i+1}8#
+    <td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}8#
+    <td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}8#
+    <td><span class="${dc}">${dir}</span>8#
+    <td>${(t.qty||0).toFixed(4)}8#
+    <td>${(t.entry_price||0).toFixed(2)}8#
+    <td>${t.exit_price?t.exit_price.toFixed(2):'—'}8#
+    <td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}8#
+    ${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%8#
+    <td style="color:var(--muted)">${t.exit_comment||'—'}8#
+    8#`;
+  }).join('') : '8#
+    <td colspan="10" style="text-align:center;color:var(--muted)">Sem trades8#
+    8#';
   document.getElementById('bt-result').style.display = 'block';
 }
 async function loadBtHistory() {
@@ -1345,11 +1380,24 @@ async function loadBtHistory() {
     const d = await (await fetch('/backtest/history')).json();
     const sessions = (d.sessions || []).slice().reverse();
     const tb = document.getElementById('bt-hist-tbl');
-    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
+    if (!sessions.length) { tb.innerHTML = '8#
+      <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico8#
+      8#'; return; }
     tb.innerHTML = sessions.map(s => {
       const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
       const pc = s.total_pnl >= 0 ? 'g' : 'r';
-      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
+      return `8#
+      <td>${(s.id||'—').replace('T',' ').slice(0,19)}8#
+      <td>${s.symbol||'—'}8#
+      <td>${s.timeframe||'—'}8#
+      <td>${s.candles||0}8#
+      <td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}8#
+      <td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%8#
+      <td>${s.total_trades||0}8#
+      <td class="${s.profit_factor>1?'g':'r'}">${pf}8#
+      <td class="r">${(s.max_drawdown||0).toFixed(2)}%8#
+      <td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}8#
+      8#`;
     }).join('');
   } catch(e) { console.error(e); }
 }
