@@ -440,7 +440,247 @@ class Bitget:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LIVE TRADER (versão corrigida com trailing intra-barra via update_trailing_live)
+# REAL-TIME STOP MONITOR
+# ═══════════════════════════════════════════════════════════════════════════════
+class RealTimeStopMonitor:
+    """
+    Monitora o trailing stop em tempo real usando H/L do candle em progresso.
+
+    DESIGN FUNDAMENTAL — por que armar DEPOIS das actions:
+    ─────────────────────────────────────────────────────
+    strategy.next(candle) retorna [SELL, EXIT_SHORT(2024.15)] usando o H/L
+    FINAL do candle fechado.  Se o monitor for armado DURANTE o loop de actions
+    (entre o SELL e o EXIT_SHORT), ele acorda imediatamente (_stop_evt.set()),
+    poleia o candle ainda em FORMAÇÃO (L ainda está próximo do open, ex.: 2055.73)
+    e fecha a trade em 2055.88 — ANTES que o EXIT_SHORT(2024.15) seja processado.
+
+    Solução: arm() é chamado SOMENTE DEPOIS que todos os actions forem
+    processados em process().  Se a trade já foi fechada no mesmo candle pelo
+    EXIT_SHORT do strategy.next(), position_size==0 e o monitor não é armado.
+    O monitor só entra em ação para candles SUBSEQUENTES (caso raro ~0.3%).
+
+    ESTADO INICIAL CORRETO (multi-candle):
+    Ao rearmar no fim do candle N, o monitor recebe:
+      SHORT: _lowest  = min(entry, candle_N.low)   ← já inclui o LOW real do candle
+      LONG:  _highest = max(entry, candle_N.high)
+    Isso garante que o stop level do monitor para candle N+1 seja acumulativo,
+    idêntico ao backtest (_check_trail usa _lowest cumulativo entre barras).
+
+    PRÉ-SYNC antes de strategy.next():
+    Para trades que sobrevivem múltiplos candles, sincroniza strategy._lowest/
+    _highest/_trail_active com o estado atual do monitor (que acompanhou o
+    candle anterior em tempo real) antes de _check_trail rodar.
+    """
+
+    POLL_INTERVAL = 0.5   # 500ms — H/L do candle é monotônico
+
+    def __init__(self, trader: 'LiveTrader'):
+        self.trader    = trader
+        self._lock     = threading.Lock()
+        self._thread   = None
+        self._active   = False
+        self._stop_evt = threading.Event()
+        self._session  = requests.Session()   # TCP keep-alive
+
+        self._side     : Optional[str] = None
+        self._entry    : float = 0.0
+        self._qty      : float = 0.0
+        self._highest  : float = 0.0
+        self._lowest   : float = float('inf')
+        self._trail_on : bool  = False
+
+    @property
+    def _sl(self):   return self.trader.strategy.sl
+    @property
+    def _tp(self):   return self.trader.strategy.tp
+    @property
+    def _toff(self): return self.trader.strategy.toff
+    @property
+    def _tick(self): return self.trader.strategy.tick
+
+    def arm_with_state(self, side: str, entry: float, qty: float,
+                       lowest: float, highest: float, trail_on: bool) -> None:
+        """
+        Arma o monitor com estado explícito.
+        Chamado DEPOIS que todos os actions de strategy.next() foram processados.
+
+        side:     'long' | 'short'
+        entry:    preço de entrada
+        lowest:   _lowest inicial = min(entry, candle.low)  — para shorts
+        highest:  _highest inicial = max(entry, candle.high) — para longs
+        trail_on: True se o trailing já foi ativado neste candle
+        """
+        with self._lock:
+            self._side     = side
+            self._entry    = entry
+            self._qty      = qty
+            self._lowest   = lowest
+            self._highest  = highest
+            self._trail_on = trail_on
+            self._active   = True
+            self._stop_evt.set()   # acorda thread imediatamente
+
+        log.info(
+            f"  🔔 StopMonitor ARMADO | {side.upper()} entry={entry:.2f} "
+            f"qty={qty:.4f} | "
+            f"{'lowest=' + str(round(lowest,2)) if side=='short' else 'highest=' + str(round(highest,2))} | "
+            f"trail={'ON' if trail_on else 'off'} | "
+            f"SL={self._sl}t TP={self._tp}t TRAIL={self._toff}t "
+            f"poll={int(self.POLL_INTERVAL*1000)}ms"
+        )
+
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._loop, daemon=True, name="stop-monitor"
+            )
+            self._thread.start()
+
+    def disarm(self) -> None:
+        with self._lock:
+            if self._active:
+                log.info("  🔕 StopMonitor desarmado")
+            self._active = False
+            self._side   = None
+
+    def _fetch_candle_hl(self) -> tuple:
+        """
+        Retorna (high, low) do candle EM PROGRESSO (limit=1 = candle atual).
+        H/L são o HIGH e LOW acumulados — mesma fonte do backtest.
+        """
+        try:
+            r = self._session.get(
+                "https://api.bitget.com/api/v2/mix/market/candles",
+                params={
+                    "symbol":      "ETHUSDT",
+                    "productType": "usdt-futures",
+                    "granularity": "30m",
+                    "limit":       "1",
+                },
+                timeout=3,
+            )
+            data = r.json().get("data", [])
+            if data:
+                c = data[0]
+                return float(c[2]), float(c[3])   # high, low
+        except Exception as e:
+            log.debug(f"  monitor _fetch_candle_hl: {e}")
+        return 0.0, float('inf')
+
+    def _loop(self) -> None:
+        log.info(f"  ▶️  StopMonitor thread iniciada ({int(self.POLL_INTERVAL*1000)}ms / candle H/L)")
+
+        while True:
+            self._stop_evt.wait(self.POLL_INTERVAL)
+            self._stop_evt.clear()
+
+            with self._lock:
+                if not self._active or self._side is None:
+                    self._stop_evt.wait(2.0)
+                    continue
+                side  = self._side
+                entry = self._entry
+                qty   = self._qty
+
+            h, l = self._fetch_candle_hl()
+            if h <= 0 or l >= float('inf'):
+                continue
+
+            triggered = False
+            stop_px   = 0.0
+            reason    = ""
+
+            with self._lock:
+                if not self._active:
+                    continue
+
+                # ── Lógica IDÊNTICA a strategy._check_trail(h, l) ─────────
+                if side == 'long':
+                    self._highest = max(self._highest, h)
+                    profit_t = (self._highest - entry) / self._tick
+                    if profit_t >= self._tp:
+                        self._trail_on = True
+                    if self._trail_on:
+                        stop   = self._highest - self._toff * self._tick
+                        reason = "TRAIL"
+                    else:
+                        stop   = entry - self._sl * self._tick
+                        reason = "SL"
+                    if l <= stop:
+                        triggered = True
+                        stop_px   = stop
+
+                elif side == 'short':
+                    self._lowest = min(self._lowest, l)
+                    profit_t = (entry - self._lowest) / self._tick
+                    if profit_t >= self._tp:
+                        self._trail_on = True
+                    if self._trail_on:
+                        stop   = self._lowest + self._toff * self._tick
+                        reason = "TRAIL"
+                    else:
+                        stop   = entry + self._sl * self._tick
+                        reason = "SL"
+                    if h >= stop:
+                        triggered = True
+                        stop_px   = stop
+
+                if triggered:
+                    log.info(
+                        f"  🛑 STOP [{side.upper()}] stop={stop_px:.2f} | {reason} | "
+                        f"candle H={h:.2f} L={l:.2f} | "
+                        f"peak={'highest='+str(round(self._highest,2)) if side=='long' else 'lowest='+str(round(self._lowest,2))} | "
+                        f"trail={'ON' if self._trail_on else 'off'}"
+                    )
+
+            if triggered:
+                self._execute_exit(side, stop_px, qty, reason)
+
+    def _execute_exit(self, side: str, price: float, qty: float, reason: str) -> None:
+        ts     = brazil_iso()
+        trader = self.trader
+
+        self.disarm()
+
+        with trader._pos_lock:
+            if trader.strategy.position_size == 0.0:
+                log.debug("  monitor: posição já fechada — skip")
+                return
+            try:
+                if side == 'long':
+                    if trader._is_paper():
+                        pos = trader.paper.get_position()
+                        if pos and pos['side'] == 'long':
+                            trader.paper.close_long(pos['size'], price, reason, ts=ts)
+                    else:
+                        trader.bitget.close_long(qty, price, reason)
+                    trader._add_log("EXIT_LONG", price, qty, reason)
+                else:
+                    if trader._is_paper():
+                        pos = trader.paper.get_position()
+                        if pos and pos['side'] == 'short':
+                            trader.paper.close_short(pos['size'], price, reason, ts=ts)
+                    else:
+                        trader.bitget.close_short(qty, price, reason)
+                    trader._add_log("EXIT_SHORT", price, qty, reason)
+
+                strat_side = 'LONG' if side == 'long' else 'SHORT'
+                trader.strategy.confirm_exit(strat_side, price, qty, ts, reason)
+                trader._cache_pos = None
+                trader._cache_bal = trader.strategy.balance
+
+                if trader._is_paper():
+                    trader.paper.balance = trader.strategy.balance
+
+                log.info(
+                    f"  ✅ EXIT [{side.upper()}] monitor | "
+                    f"px={price:.2f} {reason} | bal={trader.strategy.balance:.2f}"
+                )
+            except Exception as e:
+                log.error(f"❌ StopMonitor _execute_exit: {e}\n{traceback.format_exc()}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE TRADER
 # ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
     def __init__(self):
@@ -449,28 +689,28 @@ class LiveTrader:
             self.paper = PaperTrader(PAPER_BALANCE)
             self.bitget = None
         else:
-            self.paper = None
+            self.paper  = None
             self.bitget = Bitget()
 
         self.strategy = AdaptiveZeroLagEMA(**STRATEGY_CONFIG)
         self._running = False
-        self._warming = True
+        self._warming = False
         self.log: List[Dict] = []
-        self._pnl_baseline = 0.0
+        self._pnl_baseline   = 0.0
         self._cache_pos: Optional[Dict] = None
         self._cache_bal: float = PAPER_BALANCE if self._paper_mode else 0.0
-        self._cache_px: float = 0.0
-        self._last_candle_ts: str = ""
+        self._cache_px:  float = 0.0
+        self._last_candle_ts:    str = ""
         self._last_candle_ts_ms: int = 0
-        self.live_pnl = 0.0
-        self._pos_lock = threading.Lock()   # <--- ADICIONADO para evitar o erro
+        # Monitor removido – stops são processados via candle em strategy.next()
+
+        self._pos_lock     = threading.Lock()
+        self._stop_monitor = RealTimeStopMonitor(self)
 
     def _is_paper(self) -> bool:
         return self._paper_mode
 
     def _mark_price(self) -> float:
-        if self._paper_mode:
-            return self._cache_px
         try:
             r = requests.get(
                 "https://api.bitget.com/api/v2/mix/market/symbol-price",
@@ -490,15 +730,12 @@ class LiveTrader:
             "reason": reason,
         })
 
-    def _refresh_cache(self):
-        px = self._mark_price()
-        if px > 0:
-            self._cache_px = px
-
     def warmup(self, df: pd.DataFrame):
         self._warming = True
+        self._stop_monitor.disarm()
 
         # Paridade par: strategy alterna BUY/SELL com _bar % 2.
+        # N ímpar → direção invertida vs backtest.
         if len(df) % 2 != 0:
             df = df.iloc[1:].reset_index(drop=True)
             log.info(f"  📐 Paridade: descartado 1 candle → {len(df)} (par)")
@@ -514,28 +751,40 @@ class LiveTrader:
                 'index':     int(row.get('index', 0)),
             })
 
-        # Reset estado de posição (não afeta indicadores)
+        # ── Sincronização pós-warmup ──────────────────────────────────────
+        # Durante o warmup, a estratégia processa candles históricos e pode
+        # abrir/fechar posições INTERNAMENTE (bars > warmup_bars). Porém,
+        # NENHUMA dessas ordens foi executada no paper/live.
+        # Resetamos o estado de POSIÇÃO e ORDENS para flat, preservando
+        # apenas o estado dos INDICADORES (EMA, EC, Period, IFM) que é o
+        # objetivo do warmup. Os sinais _buy_prev/_sell_prev do último candle
+        # histórico são mantidos para que a primeira ordem ao vivo seja
+        # idêntica à do backtest.
         if self.strategy.position_size != 0:
             log.info(f"  ↩️ Posição virtual do warmup descartada: "
                      f"{self.strategy.position_size:+.6f} ETH "
                      f"@ {self.strategy.position_price:.2f} "
                      f"(nunca executada no {'paper' if self._is_paper() else 'live'})")
 
-        self.strategy.position_size = 0.0
+        # Reset estado de posição (não afeta indicadores)
+        self.strategy.position_size  = 0.0
         self.strategy.position_price = 0.0
-        self.strategy._highest = 0.0
-        self.strategy._lowest = float('inf')
-        self.strategy._trail_active = False
-        self.strategy._monitored = False
-        self.strategy._el = False
-        self.strategy._es = False
-        self.strategy._pBuy = False
-        self.strategy._pSell = False
-        self.strategy.net_profit = 0.0
-        self.strategy.balance = self.strategy.ic
+        self.strategy._highest       = 0.0
+        self.strategy._lowest        = float('inf')
+        self.strategy._trail_active  = False
+        self.strategy._monitored     = False
+        # Reset ordens pendentes (serão recriadas pelo primeiro candle ao vivo
+        # via _buy_prev/_sell_prev que foram mantidos do último candle histórico)
+        self.strategy._el            = False
+        self.strategy._es            = False
+        self.strategy._pBuy          = False
+        self.strategy._pSell         = False
+        # Reset PnL — paper/live começa do zero, não do PnL das trades virtuais
+        self.strategy.net_profit     = 0.0
+        self.strategy.balance        = self.strategy.ic
 
         self._pnl_baseline = 0.0
-        self._warming = False
+        self._warming      = False
 
         last_close = float(df['close'].iloc[-1])
         if last_close > 0:
@@ -547,6 +796,10 @@ class LiveTrader:
                  f"EC={self.strategy.EC:.2f} | EMA={self.strategy.EMA:.2f} | "
                  f"buy_prev={self.strategy._buy_prev} sell_prev={self.strategy._sell_prev} | "
                  f"px_cache={self._cache_px:.2f}")
+
+    @property
+    def live_pnl(self):
+        return self.strategy.net_profit - self._pnl_baseline
 
     def _candle_single(self) -> Optional[List[List]]:
         """Retorna os dois últimos candles (atual e anterior) da Bitget."""
@@ -593,9 +846,9 @@ class LiveTrader:
             if bal <= 0 and px <= 0:
                 log.error("❌ Falha ao conectar na Bitget"); return
             if bal > 0:
-                self.strategy.ic = bal
+                self.strategy.ic      = bal
                 self.strategy.balance = bal
-                self._cache_bal = bal
+                self._cache_bal       = bal
                 log.info(f"  💰 Saldo real injetado na estratégia: {bal:.4f} USDT")
             if px > 0:
                 self._cache_px = px
@@ -604,15 +857,19 @@ class LiveTrader:
         log.info(f"  ✅ Pronto para receber candles ao vivo da Bitget")
 
         self._running = True
+
+        # Identificador da barra atual (baseado no timestamp do candle de 30min)
         last_bar_id = None
 
         while self._running:
             try:
+                # 1. Buscar os dois últimos candles (atual e anterior)
                 candles = self._candle_single()
                 if candles is None:
                     time.sleep(15)
                     continue
 
+                # 2. Candle atual (incompleto)
                 current = candles[0]
                 current_candle = {
                     'open':      float(current[1]),
@@ -623,7 +880,7 @@ class LiveTrader:
                     'index':     self.strategy._bar + 1,
                 }
 
-                # Atualizar trailing stop intra-barra
+                # 3. Atualizar trailing stop intra-barra
                 exit_act = self.strategy.update_trailing_live(
                     high=current_candle['high'],
                     low=current_candle['low'],
@@ -631,6 +888,7 @@ class LiveTrader:
                 )
 
                 if exit_act:
+                    # Fechar posição via exchange (paper ou live)
                     side = "long" if exit_act['action'] == 'EXIT_LONG' else "short"
                     qty = abs(self.strategy.position_size)
                     with self._pos_lock:
@@ -658,7 +916,7 @@ class LiveTrader:
                         self._cache_bal = self.strategy.balance
                     log.info(f"  ✅ EXIT via trailing monitor | {exit_act['action']} @ {current_candle['close']:.2f} | motivo={exit_act['exit_reason']}")
 
-                # Verificar se um novo candle fechou
+                # 4. Verificar se um novo candle fechou (comparar identificador de barra)
                 current_bar_id = int(current[0]) // (30 * 60 * 1000)  # 30 minutos em milissegundos
                 if last_bar_id is None:
                     last_bar_id = current_bar_id
@@ -692,6 +950,7 @@ class LiveTrader:
                                     px = closed_candle['open']
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'short':
+                                        self._stop_monitor.disarm()
                                         self.paper.close_short(pos['size'], px, "REVERSAL", ts=closed_candle['timestamp'])
                                         self.strategy.confirm_exit('SHORT', px, pos['size'], closed_candle['timestamp'], "REVERSAL")
                                         self._cache_pos = None
@@ -710,6 +969,7 @@ class LiveTrader:
                                     px = self._mark_price() or closed_candle['close']
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'short':
+                                        self._stop_monitor.disarm()
                                         log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {px:.2f}")
                                         self.bitget.close_short(pos['size'], px, "REVERSAL")
                                         self.strategy.confirm_exit('SHORT', px, pos['size'], closed_candle['timestamp'], "REVERSAL")
@@ -737,6 +997,7 @@ class LiveTrader:
                                     px = closed_candle['open']
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'long':
+                                        self._stop_monitor.disarm()
                                         self.paper.close_long(pos['size'], px, "REVERSAL", ts=closed_candle['timestamp'])
                                         self.strategy.confirm_exit('LONG', px, pos['size'], closed_candle['timestamp'], "REVERSAL")
                                         self._cache_pos = None
@@ -755,6 +1016,7 @@ class LiveTrader:
                                     px = self._mark_price() or closed_candle['close']
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'long':
+                                        self._stop_monitor.disarm()
                                         log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {px:.2f}")
                                         self.bitget.close_long(pos['size'], px, "REVERSAL")
                                         self.strategy.confirm_exit('LONG', px, pos['size'], closed_candle['timestamp'], "REVERSAL")
@@ -774,6 +1036,12 @@ class LiveTrader:
                                     else:
                                         log.error(f"  ❌ bitget.open_short falhou")
 
+                        # Após processar o candle fechado, atualizar cache de saldo e posição
+                        if self._is_paper():
+                            self.paper.balance = self.strategy.balance
+                            self._cache_bal    = self.strategy.balance
+                            self._cache_pos    = self.paper.get_position()
+
                     last_bar_id = current_bar_id
                     self._refresh_cache()
 
@@ -784,8 +1052,14 @@ class LiveTrader:
                 time.sleep(60)
         log.info("🔴 Trader encerrado")
 
+    def _refresh_cache(self):
+        px = self._mark_price()
+        if px > 0:
+            self._cache_px = px
+
     def stop(self):
         self._running = False
+        self._stop_monitor.disarm()
         log.info("🛑 Trader parado")
 
 
@@ -1062,14 +1336,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-            8#
-            <thead>
-            8<th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th>
-            </thead>
-            <tbody id="lv-trades">8#
-            <td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...8#
-            </tbody>
-            8#
+            <table>
+            <thead><tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr></thead>
+            <tbody id="lv-trades"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr></tbody>
+            </table>
         </div>
       </div>
       <div class="card">
@@ -1103,15 +1373,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-          8#
-            <thead>
-            8<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th>
-            </thead>
-            <tbody id="hist-tbl">8#
-            <td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...8#
-            </tbody>
-          8#
+            <table>
+            <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr></thead>
+            <tbody id="hist-tbl"><tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr></tbody>
+            </table>
         </div>
       </div>
     </div>
@@ -1137,9 +1403,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
             <table>
-              <thead>
-                8<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th>
-              </thead>
+              <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr></thead>
               <tbody id="bt-tbl"></tbody>
             </table>
           </div>
@@ -1149,12 +1413,8 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
           <table>
-            <thead>
-              8<th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th>
-            </thead>
-            <tbody id="bt-hist-tbl">8#
-              <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico8#
-            </tbody>
+            <thead><tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr></thead>
+            <tbody id="bt-hist-tbl"><tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -1234,13 +1494,7 @@ async function poll() {
         const ac = t.action || ''; let cl = 'dir', lb = ac;
         if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
         if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
-        return `8#
-        <td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}8#
-        <td><span class="${cl}">${lb}</span>8#
-        <td>${t.price?.toFixed(2)||'—'}8#
-        <td>${t.qty?.toFixed(6)||'—'}8#
-        <td style="color:var(--muted)">${t.reason||'—'}8#
-        8#`;
+        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
       }).join('');
     }
     const lb = document.getElementById('lv-log');
@@ -1287,27 +1541,13 @@ async function loadHistory() {
     document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
     const tb = document.getElementById('hist-tbl');
     const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
-    if (!trades.length) { tb.innerHTML = '8#
-      <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado8#
-      8#'; return; }
+    if (!trades.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
     tb.innerHTML = trades.map((t, i) => {
       const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
       const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
       const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
       const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
-      return `8#
-      <td>${i+1}8#
-      <td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}8#
-      <td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}8#
-      <td><span class="${dc}">${dir}</span>8#
-      <td>${(t.qty||0).toFixed(4)}8#
-      <td>${(t.entry_price||0).toFixed(2)}8#
-      <td>${ep}8#
-      <td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}8#
-      <td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%8#
-      <td style="color:var(--muted)">${t.exit_reason||'—'}8#
-      <td>${mode}8#
-      8#`;
+      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
@@ -1356,23 +1596,9 @@ function renderBacktestResult(d) {
     const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
     const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
     const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
-    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}8#
-    <td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}8#` : '';
-    return `8#
-    <td>${i+1}8#
-    <td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}8#
-    <td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}8#
-    <td><span class="${dc}">${dir}</span>8#
-    <td>${(t.qty||0).toFixed(4)}8#
-    <td>${(t.entry_price||0).toFixed(2)}8#
-    <td>${t.exit_price?t.exit_price.toFixed(2):'—'}8#
-    <td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}8#
-    ${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%8#
-    <td style="color:var(--muted)">${t.exit_comment||'—'}8#
-    8#`;
-  }).join('') : '8#
-    <td colspan="10" style="text-align:center;color:var(--muted)">Sem trades8#
-    8#';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
+    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
   document.getElementById('bt-result').style.display = 'block';
 }
 async function loadBtHistory() {
@@ -1380,24 +1606,11 @@ async function loadBtHistory() {
     const d = await (await fetch('/backtest/history')).json();
     const sessions = (d.sessions || []).slice().reverse();
     const tb = document.getElementById('bt-hist-tbl');
-    if (!sessions.length) { tb.innerHTML = '8#
-      <td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico8#
-      8#'; return; }
+    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
     tb.innerHTML = sessions.map(s => {
       const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
       const pc = s.total_pnl >= 0 ? 'g' : 'r';
-      return `8#
-      <td>${(s.id||'—').replace('T',' ').slice(0,19)}8#
-      <td>${s.symbol||'—'}8#
-      <td>${s.timeframe||'—'}8#
-      <td>${s.candles||0}8#
-      <td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}8#
-      <td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%8#
-      <td>${s.total_trades||0}8#
-      <td class="${s.profit_factor>1?'g':'r'}">${pf}8#
-      <td class="r">${(s.max_drawdown||0).toFixed(2)}%8#
-      <td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}8#
-      8#`;
+      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
