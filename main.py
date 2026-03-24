@@ -1338,8 +1338,8 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
               <table>
-            <thead> <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
-            <tbody id="lv-trades"> <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
+            <thead>  <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
+            <tbody id="lv-trades">  <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
               </table>
         </div>
       </div>
@@ -1375,9 +1375,9 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
               <table>
-            <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+            <thead>  <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
                        <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr> </thead>
-            <tbody id="hist-tbl"> <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
+            <tbody id="hist-tbl">  <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
               </table>
         </div>
       </div>
@@ -1404,7 +1404,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
               <table>
-              <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
+              <thead>  <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
               <tbody id="bt-tbl"></tbody>
               </table>
           </div>
@@ -1414,8 +1414,8 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
             <table>
-            <thead> <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
-            <tbody id="bt-hist-tbl"> <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
+            <thead>  <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
+            <tbody id="bt-hist-tbl">  <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
             </table>
         </div>
       </div>
