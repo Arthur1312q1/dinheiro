@@ -7,6 +7,17 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
+FIX v25 — Paridade total Backtest ↔ Paper/Live (3 correções)
+══════════════════════════════════════════════════════════════════════
+Fix 1 — Preço de saída Paper usa stop_price exato (exit_act['price'])
+         Em vez do ticker 'last', garantindo mesma execução do backtest.
+Fix 2 — _reset_pos já zera _monitored=False (paridade confirmada,
+         nenhuma alteração necessária em adaptive_zero_lag_ema.py).
+Fix 3 — Gap do primeiro candle: após BUY/SELL, chama imediatamente
+         update_trailing_live com H/L do candle em formação.
+         Evita que o stop seja ignorado nos ~15s entre o open e o
+         próximo polling — comportamento idêntico ao backtest.
+══════════════════════════════════════════════════════════════════════
 FIX v24 — Fechamento de trades corrigido (4 bugs corrigidos)
 ══════════════════════════════════════════════════════════════════════
 Bug 1: update_trailing_live usava qty = abs(strategy.position_size)
@@ -60,7 +71,7 @@ STRATEGY_CONFIG = {
 _PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 PAPER_BALANCE  = float(os.environ.get("PAPER_BALANCE", "1000.0"))
 LIVE_PCT       = 0.95
-HISTORY_FILE         = "trades_history.json"
+HISTORY_FILE          = "trades_history.json"
 BACKTEST_HISTORY_FILE = "backtest_history.json"
 
 def get_paper_mode() -> bool:  return _PAPER_TRADING
@@ -451,8 +462,7 @@ class Bitget:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# REAL-TIME STOP MONITOR  (mantido para compatibilidade, mas stops são
-# primariamente processados via update_trailing_live + strategy.next())
+# REAL-TIME STOP MONITOR  (mantido para compatibilidade)
 # ═══════════════════════════════════════════════════════════════════════════════
 class RealTimeStopMonitor:
     def __init__(self, trader: 'LiveTrader'):
@@ -479,12 +489,18 @@ class LiveTrader:
     Fluxo por candle:
       1. A cada 15 s: busca o candle em formação e chama
          strategy.update_trailing_live() para trailing stop intra-barra.
+         → O preço de saída é SEMPRE exit_act['price'] (stop_price exato),
+           garantindo paridade total com o backtest (Pine slippage=0).
       2. Quando um novo candle fecha: chama strategy.next(closed_candle),
-         que retorna uma lista de ações já executadas internamente:
+         que retorna ações já executadas internamente:
            BUY / SELL          → abrir posição na exchange / paper
            EXIT_LONG / EXIT_SHORT → fechar posição na exchange / paper
-         (reversões retornam [EXIT_*, BUY|SELL]; ordens processadas em sequência)
-      3. Para live: após abrir posição, atualiza strategy.position_price com
+      3. FIX v25 — Gap do primeiro candle: após confirmar BUY/SELL, chama
+         update_trailing_live() imediatamente com o H/L do candle em formação.
+         Isso garante que o stop seja verificado nos ~15s que antecedem o
+         próximo polling, exatamente como o backtest faz ao checar H/L do
+         candle de entrada no mesmo bar.
+      4. Para live: após abrir posição, atualiza strategy.position_price com
          o preço real de fill (essencial para trailing stop correto).
     """
 
@@ -633,6 +649,67 @@ class LiveTrader:
             self.paper.close_short(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
 
+    # ─── FIX v25: verifica stop imediatamente após entry ──────────────────────
+    def _check_immediate_stop(self, current_candle: Dict, current_ts) -> None:
+        """
+        FIX v25 — Gap do primeiro candle.
+
+        No backtest (engine.py), a entrada ocorre no open do candle e o
+        H/L do MESMO candle já pode acionar o stop (_check_trail usa h/l
+        do bar atual). No live, após a entrada o próximo polling acontece
+        só ~15s depois, criando uma janela cega.
+
+        Solução: chamar update_trailing_live imediatamente após confirmar
+        BUY/SELL, usando o H/L do candle em formação (current_candle).
+
+        O preço de saída é SEMPRE exit_act['price'] (stop_price exato),
+        nunca o ticker 'last' — garantindo paridade com o backtest.
+        """
+        imm_exit = self.strategy.update_trailing_live(
+            high=current_candle['high'],
+            low=current_candle['low'],
+            ts=current_ts,
+        )
+        if not imm_exit:
+            return
+
+        # FIX v25 Fix 1: usar stop_price exato (exit_act['price']),
+        # NÃO o ticker 'last' — mantém paridade com backtest (Pine slippage=0)
+        imm_px  = imm_exit['price']
+        imm_qty = imm_exit['qty']
+        imm_rsn = imm_exit.get('exit_reason', 'STOP')
+        imm_act = imm_exit['action']
+
+        log.warning(
+            f"  ⚡ [GAP-FIX] Stop atingido no candle de entrada | "
+            f"{imm_act} @ {imm_px:.2f} | motivo={imm_rsn}"
+        )
+
+        if self._is_paper():
+            if imm_act == 'EXIT_LONG':
+                self._paper_close_long(imm_px, imm_rsn, current_ts)
+            else:
+                self._paper_close_short(imm_px, imm_rsn, current_ts)
+        else:
+            try:
+                if imm_act == 'EXIT_LONG':
+                    self.bitget.close_long(imm_qty, imm_px, imm_rsn)
+                else:
+                    self.bitget.close_short(imm_qty, imm_px, imm_rsn)
+            except Exception as _e:
+                log.error(f"  ❌ gap-fix exit live: {_e}")
+
+        self._cache_pos = None
+        self._cache_bal = self.strategy.balance
+        if self._is_paper():
+            self.paper.balance = self.strategy.balance
+
+        self._add_log(imm_act, imm_px, imm_qty, imm_rsn)
+        log.info(
+            f"  ✅ [GAP-FIX] {imm_act} @ {imm_px:.2f} "
+            f"| {imm_rsn} | bal={self.strategy.balance:.2f}"
+        )
+
     # ─── Loop principal ───────────────────────────────────────────────────────
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
@@ -695,23 +772,24 @@ class LiveTrader:
                     continue
 
                 # ── 1. Trailing stop intra-barra ───────────────────────────
-                # update_trailing_live usa _exit_at internamente: já atualiza
-                # position_size=0, net_profit e balance da strategy.
-                # CORREÇÃO BUG 1: usar exit_act['qty'] (position_size já é 0).
-                # CORREÇÃO BUG 2: NÃO chamar confirm_exit (já feito por _exit_at).
+                # FIX v25 Fix 1: px_exit = exit_act['price'] = stop_price exato
+                # (não ticker 'last') → paridade com backtest (Pine slippage=0)
+                # FIX v24 Bug 1: qty vem de exit_act['qty'] (position_size já é 0)
+                # FIX v24 Bug 2: NÃO chamar confirm_exit (_exit_at já atualizou tudo)
                 exit_act = self.strategy.update_trailing_live(
                     high=current_candle['high'],
                     low=current_candle['low'],
                     ts=current_ts,
                 )
                 if exit_act:
-                    side_exit = exit_act['action']          # 'EXIT_LONG' ou 'EXIT_SHORT'
-                    qty_exit  = exit_act['qty']             # ← CORREÇÃO BUG 1
-                    px_exit   = exit_act['price']
+                    side_exit = exit_act['action']           # 'EXIT_LONG' ou 'EXIT_SHORT'
+                    qty_exit  = exit_act['qty']              # ← FIX Bug 1
+                    px_exit   = exit_act['price']            # ← stop_price exato (FIX Fix 1)
                     rsn_exit  = exit_act.get('exit_reason', 'STOP')
 
                     with self._pos_lock:
                         if self._is_paper():
+                            # Usa stop_price exato — nunca ticker 'last'
                             if side_exit == 'EXIT_LONG':
                                 self._paper_close_long(px_exit, rsn_exit, current_ts)
                             else:
@@ -726,7 +804,6 @@ class LiveTrader:
                                 log.error(f"  ❌ close via trailing live: {_e}")
 
                         # strategy já atualizou net_profit/balance via _exit_at
-                        # Só sincronizamos o cache
                         self._cache_pos = None
                         self._cache_bal = self.strategy.balance
                         if self._is_paper():
@@ -790,9 +867,7 @@ class LiveTrader:
                             a_ts    = act.get('timestamp', prev_ts)
 
                             # ── EXIT_LONG ──────────────────────────────────
-                            # CORREÇÃO BUG 3: tratar explicitamente EXIT_LONG/EXIT_SHORT.
-                            # Gerado por: reversão (_exec_open) ou trailing no fechamento
-                            # (_check_trail). strategy já atualizou tudo internamente.
+                            # FIX v24 Bug 3: tratar explicitamente EXIT_LONG/EXIT_SHORT.
                             if kind == 'EXIT_LONG':
                                 if self._is_paper():
                                     self._paper_close_long(a_price, a_rsn, a_ts)
@@ -827,22 +902,21 @@ class LiveTrader:
                                          f"| bal={self.strategy.balance:.2f}")
 
                             # ── BUY (enter long) ───────────────────────────
-                            # CORREÇÃO BUG 4: NÃO chamar confirm_fill para paper
+                            # FIX v24 Bug 4: NÃO chamar confirm_fill em paper
                             # (strategy já abriu a posição internamente em next()).
                             # Para live: atualizar position_price com preço real.
+                            # FIX v25 Fix 3: após confirmação, verificar stop
+                            # imediatamente no candle atual (gap do 1º candle).
                             elif kind == 'BUY':
                                 if a_qty <= 0:
                                     continue
 
                                 if self._is_paper():
-                                    # Preço da strategy = candle.open (consistente com backtest)
                                     px = a_price
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'long':
-                                        # Já está long — não deveria acontecer, mas seguro
                                         log.debug("  BUY ignorado: paper já está long")
                                         continue
-                                    # Garante que o short foi fechado (EXIT_SHORT já deveria ter feito)
                                     if pos and pos['side'] == 'short':
                                         log.warning("  ⚠️ BUY: short residual fechado forçado")
                                         self._paper_close_short(px, 'REVERSAL', a_ts)
@@ -854,11 +928,17 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
+
+                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
+                                        # Backtest: entry no open, stop checa H/L do mesmo bar.
+                                        # Live: sem esta chamada, stop só seria verificado
+                                        # no próximo polling (~15s depois).
+                                        # Preço de saída = stop_price exato (Fix 1).
+                                        self._check_immediate_stop(current_candle, current_ts)
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
 
                                 else:  # LIVE
-                                    # Executa ao preço de mercado atual (não ao candle.open de 30min atrás)
                                     px = self._mark_price() or a_price
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'long':
@@ -875,19 +955,22 @@ class LiveTrader:
                                     r, qty_f = self.bitget.open_long(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
                                         # Atualizar position_price com preço REAL do fill
-                                        # (important: trailing stop usa este valor)
                                         self.strategy.position_price = px
                                         self.strategy._highest       = px
                                         self._add_log("ENTER_LONG", px, qty_f)
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
+
+                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
+                                        self._check_immediate_stop(current_candle, current_ts)
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
                                     else:
                                         log.error("  ❌ bitget.open_long falhou")
 
                             # ── SELL (enter short) ─────────────────────────
+                            # FIX v25 Fix 3: idem BUY — gap do primeiro candle.
                             elif kind == 'SELL':
                                 if a_qty <= 0:
                                     continue
@@ -909,6 +992,9 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
+
+                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
+                                        self._check_immediate_stop(current_candle, current_ts)
                                     else:
                                         log.error("  ❌ paper.open_short falhou")
 
@@ -935,6 +1021,9 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
+
+                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
+                                        self._check_immediate_stop(current_candle, current_ts)
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
                                     else:
@@ -1400,7 +1489,7 @@ async function poll() {
       lb.innerHTML = d.log.slice(-80).map(l => {
         let cls = '';
         if (/✅|LONG|BUY/.test(l)) cls = 'lg'; else if (/❌|EXIT|SHORT/.test(l)) cls = 'lr';
-        else if (/⚠️|WARN/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
+        else if (/⚠️|WARN|GAP/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
         return `<div class="${cls}">${l}</div>`;
       }).join('');
       lb.scrollTop = lb.scrollHeight;
