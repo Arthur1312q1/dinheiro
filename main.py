@@ -304,15 +304,18 @@ class Bitget:
         try:
             r = self._get("/api/v2/mix/market/symbol-price",
                           {"symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE})
-            return float(r["data"][0]["markPrice"])
-        except:
+            if r.get("data") and len(r["data"]) > 0:
+                return float(r["data"][0]["markPrice"])
+        except Exception:
             pass
         try:
             r = self._get("/api/v2/mix/market/ticker",
                           {"symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE})
-            return float(r["data"][0]["lastPr"])
-        except:
-            return 0.0
+            if r.get("data") and len(r["data"]) > 0:
+                return float(r["data"][0]["lastPr"])
+        except Exception:
+            pass
+        return 0.0
 
     def balance(self):
         try:
@@ -534,9 +537,11 @@ class LiveTrader:
                 params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
                 timeout=10
             ).json()
-            return float(r["data"][0]["markPrice"])
-        except:
-            return self._cache_px
+            if r.get("data") and len(r["data"]) > 0:
+                return float(r["data"][0]["markPrice"])
+        except Exception as e:
+            log.debug(f"  mark_price error: {e}")
+        return self._cache_px
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
@@ -629,6 +634,11 @@ class LiveTrader:
             if len(data) < 2:
                 log.debug("  ℹ️ Apenas 1 candle disponível")
                 return None
+            # Validação extra: cada candle deve ter pelo menos 5 elementos
+            for d in data:
+                if len(d) < 5:
+                    log.warning("  ⚠️ Candle mal formatado, ignorando")
+                    return None
             return data   # [atual(index 0), anterior(index 1)] — mais recente primeiro
         except Exception as e:
             log.error(f"  ❌ _candle_single erro: {e}")
@@ -1034,8 +1044,12 @@ class LiveTrader:
 
                 time.sleep(15)
 
+            except KeyboardInterrupt:
+                log.info("🛑 Interrupção por teclado detectada. Encerrando trader.")
+                self._running = False
             except Exception as e:
                 log.error(f"❌ Erro no loop live: {e}\n{traceback.format_exc()}")
+                # Aguarda antes de tentar novamente para não saturar o log
                 time.sleep(60)
 
         log.info("🔴 Trader encerrado")
@@ -1323,10 +1337,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr></thead>
-            <tbody id="lv-trades"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr></tbody>
-          </table>
+           ..
+            <thead>   ..<th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th> </thead>
+            <tbody id="lv-trades">   ..<td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando... </tbody>
+           ..
         </div>
       </div>
       <div class="card">
@@ -1360,11 +1374,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr></thead>
-            <tbody id="hist-tbl"><tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr></tbody>
-          </table>
+           ..
+            <thead>   ..<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th> </thead>
+            <tbody id="hist-tbl">   ..<td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando... </tbody>
+           ..
         </div>
       </div>
     </div>
@@ -1389,20 +1403,20 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card">
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
-            <table>
-              <thead><tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr></thead>
+             ..
+              <thead>   ..<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th> </thead>
               <tbody id="bt-tbl"></tbody>
-            </table>
+             ..
           </div>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr></thead>
-            <tbody id="bt-hist-tbl"><tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr></tbody>
-          </table>
+           ..
+            <thead>   ..<th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th> </thead>
+            <tbody id="bt-hist-tbl">   ..<td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico </tbody>
+           ..
         </div>
       </div>
     </div>
@@ -1481,7 +1495,7 @@ async function poll() {
         const ac = t.action || ''; let cl = 'dir', lb = ac;
         if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
         if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
-        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
+        return `   ..<td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}   ..<td><span class="${cl}">${lb}</span>   ..<td>${t.price?.toFixed(2)||'—'}   ..<td>${t.qty?.toFixed(6)||'—'}   ..<td style="color:var(--muted)">${t.reason||'—'}   ..`;
       }).join('');
     }
     const lb = document.getElementById('lv-log');
@@ -1528,13 +1542,13 @@ async function loadHistory() {
     document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
     const tb = document.getElementById('hist-tbl');
     const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
-    if (!trades.length) { tb.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
+    if (!trades.length) { tb.innerHTML = '   ..<td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado   ..'; return; }
     tb.innerHTML = trades.map((t, i) => {
       const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
       const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
       const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
       const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
-      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
+      return `   ..<td>${i+1}   ..<td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}   ..<td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}   ..<td><span class="${dc}">${dir}</span>   ..<td>${(t.qty||0).toFixed(4)}   ..<td>${(t.entry_price||0).toFixed(2)}   ..<td>${ep}   ..<td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}   ..<td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%   ..<td style="color:var(--muted)">${t.exit_reason||'—'}   ..<td>${mode}   ..`;
     }).join('');
   } catch(e) { console.error(e); }
 }
@@ -1583,9 +1597,9 @@ function renderBacktestResult(d) {
     const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
     const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
     const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
-    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
-    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
-  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}   ..<td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}   ..` : '';
+    return `   ..<td>${i+1}   ..<td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}   ..<td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}   ..<td><span class="${dc}">${dir}</span>   ..<td>${(t.qty||0).toFixed(4)}   ..<td>${(t.entry_price||0).toFixed(2)}   ..<td>${t.exit_price?t.exit_price.toFixed(2):'—'}   ..<td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}   ..${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%   ..<td style="color:var(--muted)">${t.exit_comment||'—'}   ..`;
+  }).join('') : '   ..<td colspan="10" style="text-align:center;color:var(--muted)">Sem trades   ..';
   document.getElementById('bt-result').style.display = 'block';
 }
 async function loadBtHistory() {
@@ -1593,11 +1607,11 @@ async function loadBtHistory() {
     const d = await (await fetch('/backtest/history')).json();
     const sessions = (d.sessions || []).slice().reverse();
     const tb = document.getElementById('bt-hist-tbl');
-    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
+    if (!sessions.length) { tb.innerHTML = '   ..<td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico   ..'; return; }
     tb.innerHTML = sessions.map(s => {
       const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
       const pc = s.total_pnl >= 0 ? 'g' : 'r';
-      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
+      return `   ..<td>${(s.id||'—').replace('T',' ').slice(0,19)}   ..<td>${s.symbol||'—'}   ..<td>${s.timeframe||'—'}   ..<td>${s.candles||0}   ..<td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}   ..<td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%   ..<td>${s.total_trades||0}   ..<td class="${s.profit_factor>1?'g':'r'}">${pf}   ..<td class="r">${(s.max_drawdown||0).toFixed(2)}%   ..<td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}   ..`;
     }).join('');
   } catch(e) { console.error(e); }
 }
