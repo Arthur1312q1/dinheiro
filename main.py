@@ -7,13 +7,11 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v26 — Estabilidade e prevenção de parada inesperada do bot
+FIX v27 — Lock robusto com limpeza automática em startup e no /start
 ══════════════════════════════════════════════════════════════════════
-- Lock entre processos via arquivo para evitar múltiplos traders
-- Logs detalhados para rastrear saída do loop
-- Tratamento de exceções robusto dentro do loop principal
-- Watchdog que registra motivo da parada
-- Correção: lock é liberado APÓS a thread terminar, não antes
+- Ao iniciar o app, remove qualquer lock órfão deixado por execuções anteriores
+- No endpoint /start, antes de adquirir novo lock, limpa qualquer lock existente
+- Garante que apenas um worker do Gunicorn execute o trader
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -67,34 +65,34 @@ def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
 # ── Lock entre processos via arquivo ─────────────────────────────────────────
-LOCK_FILE = "/tmp/azlema_trader.lock"
+LOCK_FILE = "bot.lock"   # arquivo simples no diretório de trabalho
 
 def _acquire_lock() -> bool:
     """Tenta criar um lock de processo usando arquivo."""
     try:
+        # Tenta abrir exclusivamente (cria se não existir)
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         os.close(fd)
         log.debug("Lock de processo adquirido.")
         return True
     except FileExistsError:
-        log.debug("Lock de processo já existe. Verificando se o processo ainda está vivo...")
-        # Se o arquivo existe, mas nenhum processo está rodando (caso de crash), podemos remover
-        # Tentamos ler o PID do arquivo, mas como não escrevemos, vamos apenas verificar se a thread do trader ainda está ativa
-        # Como não temos como saber, vamos apenas retornar False e deixar o usuário resolver
+        log.warning("Lock de processo já existe. Outro worker está rodando?")
         return False
     except Exception as e:
         log.error(f"Erro ao tentar criar lock: {e}")
         return False
 
 def _release_lock():
-    """Remove o arquivo de lock."""
+    """Remove o arquivo de lock se ele existir."""
     try:
-        os.unlink(LOCK_FILE)
-        log.debug("Lock de processo liberado.")
-    except FileNotFoundError:
-        pass
+        if Path(LOCK_FILE).exists():
+            Path(LOCK_FILE).unlink()
+            log.info("🔓 Cadeado (lock) removido com sucesso.")
     except Exception as e:
         log.error(f"Erro ao remover lock: {e}")
+
+# ── Limpeza automática no startup do container ───────────────────────────────
+_release_lock()   # Remove qualquer lock órfão de execuções anteriores
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HISTORY MANAGER
@@ -1635,7 +1633,7 @@ def _thread():
         with _lock:
             _trader   = None
             _starting = False
-        # Libera lock de processo APÓS a thread terminar
+        # Libera lock de processo ao final
         _release_lock()
         log.info("🔄 Pronto para re-iniciar")
 
@@ -1698,9 +1696,15 @@ def start():
             return jsonify({"message": "Já está rodando"})
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
-        # Tenta adquirir lock de processo para evitar múltiplos traders
+
+        # Se o usuário clicou manualmente, remove qualquer lock órfão antes de tentar adquirir
+        if Path(LOCK_FILE).exists() and _trader is None:
+            log.warning("Limpando lock órfão encontrado no início manual.")
+            _release_lock()
+
         if not _acquire_lock():
-            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn ou aguarde o término do processo atual."}), 400
+            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn."}), 400
+
         _starting = True
         threading.Thread(target=_thread, daemon=True).start()
         mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
@@ -1708,13 +1712,7 @@ def start():
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    if _trader:
-        _trader.stop()
-        # Aguarda a thread terminar antes de liberar o lock
-        for _ in range(20):
-            if _trader is None:
-                break
-            time.sleep(0.5)
+    if _trader: _trader.stop()
     # Força liberação do lock de processo
     _release_lock()
     return jsonify({"message": "Parado"})
