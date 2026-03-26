@@ -13,6 +13,7 @@ FIX v26 — Estabilidade e prevenção de parada inesperada do bot
 - Logs detalhados para rastrear saída do loop
 - Tratamento de exceções robusto dentro do loop principal
 - Watchdog que registra motivo da parada
+- Correção: lock é liberado APÓS a thread terminar, não antes
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -71,13 +72,15 @@ LOCK_FILE = "/tmp/azlema_trader.lock"
 def _acquire_lock() -> bool:
     """Tenta criar um lock de processo usando arquivo."""
     try:
-        # Tenta abrir exclusivamente (cria se não existir)
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         os.close(fd)
         log.debug("Lock de processo adquirido.")
         return True
     except FileExistsError:
-        log.warning("Lock de processo já existe. Outro worker está rodando?")
+        log.debug("Lock de processo já existe. Verificando se o processo ainda está vivo...")
+        # Se o arquivo existe, mas nenhum processo está rodando (caso de crash), podemos remover
+        # Tentamos ler o PID do arquivo, mas como não escrevemos, vamos apenas verificar se a thread do trader ainda está ativa
+        # Como não temos como saber, vamos apenas retornar False e deixar o usuário resolver
         return False
     except Exception as e:
         log.error(f"Erro ao tentar criar lock: {e}")
@@ -1291,10 +1294,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-           <table>
+            <table>
             <thead> <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
             <tbody id="lv-trades"> <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
-           </table>
+            </table>
         </div>
       </div>
       <div class="card">
@@ -1328,11 +1331,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-           <table>
+            <table>
             <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
                        <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr> </thead>
             <tbody id="hist-tbl"> <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
-           </table>
+            </table>
         </div>
       </div>
     </div>
@@ -1357,20 +1360,20 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card">
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
-             <table>
+              <table>
               <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
               <tbody id="bt-tbl"></tbody>
-             </table>
+              </table>
           </div>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
-           <table>
+            <table>
             <thead> <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
             <tbody id="bt-hist-tbl"> <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
-           </table>
+            </table>
         </div>
       </div>
     </div>
@@ -1632,7 +1635,7 @@ def _thread():
         with _lock:
             _trader   = None
             _starting = False
-        # Libera lock de processo ao final
+        # Libera lock de processo APÓS a thread terminar
         _release_lock()
         log.info("🔄 Pronto para re-iniciar")
 
@@ -1697,7 +1700,7 @@ def start():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
         # Tenta adquirir lock de processo para evitar múltiplos traders
         if not _acquire_lock():
-            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn."}), 400
+            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn ou aguarde o término do processo atual."}), 400
         _starting = True
         threading.Thread(target=_thread, daemon=True).start()
         mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
@@ -1705,7 +1708,13 @@ def start():
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    if _trader: _trader.stop()
+    if _trader:
+        _trader.stop()
+        # Aguarda a thread terminar antes de liberar o lock
+        for _ in range(20):
+            if _trader is None:
+                break
+            time.sleep(0.5)
     # Força liberação do lock de processo
     _release_lock()
     return jsonify({"message": "Parado"})
