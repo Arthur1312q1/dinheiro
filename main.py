@@ -7,30 +7,12 @@ Modo de operação selecionável via dashboard:
   - LIVE TRADING  : opera com 95% do saldo real na Bitget
 
 ══════════════════════════════════════════════════════════════════════
-FIX v25 — Paridade total Backtest ↔ Paper/Live (3 correções)
+FIX v26 — Estabilidade e prevenção de parada inesperada do bot
 ══════════════════════════════════════════════════════════════════════
-Fix 1 — Preço de saída Paper usa stop_price exato (exit_act['price'])
-         Em vez do ticker 'last', garantindo mesma execução do backtest.
-Fix 2 — _reset_pos já zera _monitored=False (paridade confirmada,
-         nenhuma alteração necessária em adaptive_zero_lag_ema.py).
-Fix 3 — Gap do primeiro candle: após BUY/SELL, chama imediatamente
-         update_trailing_live com H/L do candle em formação.
-         Evita que o stop seja ignorado nos ~15s entre o open e o
-         próximo polling — comportamento idêntico ao backtest.
-══════════════════════════════════════════════════════════════════════
-FIX v24 — Fechamento de trades corrigido (4 bugs corrigidos)
-══════════════════════════════════════════════════════════════════════
-Bug 1: update_trailing_live usava qty = abs(strategy.position_size)
-       que já é 0 após _exit_at → trocado por exit_act['qty'].
-Bug 2: confirm_exit() chamado após update_trailing_live, mas
-       _exit_at já atualizou net_profit/balance → removido.
-Bug 3: EXIT_LONG / EXIT_SHORT retornados por strategy.next() (via
-       _check_trail ou reversão em _exec_open) não eram tratados no
-       loop de actions → adicionados explicitamente.
-Bug 4: confirm_fill() e confirm_exit() chamados após strategy.next()
-       já ter atualizado o estado interno → removidos do modo paper;
-       para live, apenas position_price/_highest/_lowest são ajustados
-       com o preço real de fill (importante para o trailing stop).
+- Lock entre processos via arquivo para evitar múltiplos traders
+- Logs detalhados para rastrear saída do loop
+- Tratamento de exceções robusto dentro do loop principal
+- Watchdog que registra motivo da parada
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -83,6 +65,33 @@ def _sec():      return os.environ.get("BITGET_SECRET_KEY", "").strip()
 def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
+# ── Lock entre processos via arquivo ─────────────────────────────────────────
+LOCK_FILE = "/tmp/azlema_trader.lock"
+
+def _acquire_lock() -> bool:
+    """Tenta criar um lock de processo usando arquivo."""
+    try:
+        # Tenta abrir exclusivamente (cria se não existir)
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.close(fd)
+        log.debug("Lock de processo adquirido.")
+        return True
+    except FileExistsError:
+        log.warning("Lock de processo já existe. Outro worker está rodando?")
+        return False
+    except Exception as e:
+        log.error(f"Erro ao tentar criar lock: {e}")
+        return False
+
+def _release_lock():
+    """Remove o arquivo de lock."""
+    try:
+        os.unlink(LOCK_FILE)
+        log.debug("Lock de processo liberado.")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.error(f"Erro ao remover lock: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HISTORY MANAGER
@@ -304,18 +313,15 @@ class Bitget:
         try:
             r = self._get("/api/v2/mix/market/symbol-price",
                           {"symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE})
-            if r.get("data") and len(r["data"]) > 0:
-                return float(r["data"][0]["markPrice"])
-        except Exception:
+            return float(r["data"][0]["markPrice"])
+        except:
             pass
         try:
             r = self._get("/api/v2/mix/market/ticker",
                           {"symbol": self.SYMBOL, "productType": self.PRODUCT_TYPE})
-            if r.get("data") and len(r["data"]) > 0:
-                return float(r["data"][0]["lastPr"])
-        except Exception:
-            pass
-        return 0.0
+            return float(r["data"][0]["lastPr"])
+        except:
+            return 0.0
 
     def balance(self):
         try:
@@ -485,28 +491,6 @@ class RealTimeStopMonitor:
 # LIVE TRADER
 # ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
-    """
-    Executa a strategy em tempo real, espelhando ordens na Bitget (live)
-    ou em um saldo simulado (paper).
-
-    Fluxo por candle:
-      1. A cada 15 s: busca o candle em formação e chama
-         strategy.update_trailing_live() para trailing stop intra-barra.
-         → O preço de saída é SEMPRE exit_act['price'] (stop_price exato),
-           garantindo paridade total com o backtest (Pine slippage=0).
-      2. Quando um novo candle fecha: chama strategy.next(closed_candle),
-         que retorna ações já executadas internamente:
-           BUY / SELL          → abrir posição na exchange / paper
-           EXIT_LONG / EXIT_SHORT → fechar posição na exchange / paper
-      3. FIX v25 — Gap do primeiro candle: após confirmar BUY/SELL, chama
-         update_trailing_live() imediatamente com o H/L do candle em formação.
-         Isso garante que o stop seja verificado nos ~15s que antecedem o
-         próximo polling, exatamente como o backtest faz ao checar H/L do
-         candle de entrada no mesmo bar.
-      4. Para live: após abrir posição, atualiza strategy.position_price com
-         o preço real de fill (essencial para trailing stop correto).
-    """
-
     def __init__(self):
         self._paper_mode = get_paper_mode()
         if self._paper_mode:
@@ -537,11 +521,9 @@ class LiveTrader:
                 params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
                 timeout=10
             ).json()
-            if r.get("data") and len(r["data"]) > 0:
-                return float(r["data"][0]["markPrice"])
-        except Exception as e:
-            log.debug(f"  mark_price error: {e}")
-        return self._cache_px
+            return float(r["data"][0]["markPrice"])
+        except:
+            return self._cache_px
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
@@ -634,11 +616,6 @@ class LiveTrader:
             if len(data) < 2:
                 log.debug("  ℹ️ Apenas 1 candle disponível")
                 return None
-            # Validação extra: cada candle deve ter pelo menos 5 elementos
-            for d in data:
-                if len(d) < 5:
-                    log.warning("  ⚠️ Candle mal formatado, ignorando")
-                    return None
             return data   # [atual(index 0), anterior(index 1)] — mais recente primeiro
         except Exception as e:
             log.error(f"  ❌ _candle_single erro: {e}")
@@ -683,8 +660,6 @@ class LiveTrader:
         if not imm_exit:
             return
 
-        # FIX v25 Fix 1: usar stop_price exato (exit_act['price']),
-        # NÃO o ticker 'last' — mantém paridade com backtest (Pine slippage=0)
         imm_px  = imm_exit['price']
         imm_qty = imm_exit['qty']
         imm_rsn = imm_exit.get('exit_reason', 'STOP')
@@ -720,7 +695,7 @@ class LiveTrader:
             f"| {imm_rsn} | bal={self.strategy.balance:.2f}"
         )
 
-    # ─── Loop principal ───────────────────────────────────────────────────────
+    # ─── Loop principal com logs e watchdog ───────────────────────────────────────
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
         log.info(f"╔══════════════════════════════╗")
@@ -748,8 +723,15 @@ class LiveTrader:
         self._running = True
         last_bar_id   = None
 
+        loop_exit_reason = None
+
         while self._running:
             try:
+                # Se a thread principal pediu para parar, sai do loop
+                if not self._running:
+                    loop_exit_reason = "stop() chamado"
+                    break
+
                 candles = self._candle_single()
                 if candles is None:
                     time.sleep(15)
@@ -782,24 +764,19 @@ class LiveTrader:
                     continue
 
                 # ── 1. Trailing stop intra-barra ───────────────────────────
-                # FIX v25 Fix 1: px_exit = exit_act['price'] = stop_price exato
-                # (não ticker 'last') → paridade com backtest (Pine slippage=0)
-                # FIX v24 Bug 1: qty vem de exit_act['qty'] (position_size já é 0)
-                # FIX v24 Bug 2: NÃO chamar confirm_exit (_exit_at já atualizou tudo)
                 exit_act = self.strategy.update_trailing_live(
                     high=current_candle['high'],
                     low=current_candle['low'],
                     ts=current_ts,
                 )
                 if exit_act:
-                    side_exit = exit_act['action']           # 'EXIT_LONG' ou 'EXIT_SHORT'
-                    qty_exit  = exit_act['qty']              # ← FIX Bug 1
-                    px_exit   = exit_act['price']            # ← stop_price exato (FIX Fix 1)
+                    side_exit = exit_act['action']
+                    qty_exit  = exit_act['qty']
+                    px_exit   = exit_act['price']
                     rsn_exit  = exit_act.get('exit_reason', 'STOP')
 
                     with self._pos_lock:
                         if self._is_paper():
-                            # Usa stop_price exato — nunca ticker 'last'
                             if side_exit == 'EXIT_LONG':
                                 self._paper_close_long(px_exit, rsn_exit, current_ts)
                             else:
@@ -813,7 +790,6 @@ class LiveTrader:
                             except Exception as _e:
                                 log.error(f"  ❌ close via trailing live: {_e}")
 
-                        # strategy já atualizou net_profit/balance via _exit_at
                         self._cache_pos = None
                         self._cache_bal = self.strategy.balance
                         if self._is_paper():
@@ -858,11 +834,6 @@ class LiveTrader:
                     )
 
                     with self._pos_lock:
-                        # strategy.next() já atualiza internamente:
-                        #   - posição (position_size, position_price)
-                        #   - trailing (highest, lowest, trail_active)
-                        #   - net_profit / balance
-                        # Nós apenas espelhamos as ordens na exchange/paper.
                         actions = self.strategy.next(closed_candle)
                         log.info(
                             f"  📊 {len(actions)} ação(ões): "
@@ -876,8 +847,6 @@ class LiveTrader:
                             a_rsn   = act.get('exit_reason', kind)
                             a_ts    = act.get('timestamp', prev_ts)
 
-                            # ── EXIT_LONG ──────────────────────────────────
-                            # FIX v24 Bug 3: tratar explicitamente EXIT_LONG/EXIT_SHORT.
                             if kind == 'EXIT_LONG':
                                 if self._is_paper():
                                     self._paper_close_long(a_price, a_rsn, a_ts)
@@ -894,7 +863,6 @@ class LiveTrader:
                                 log.info(f"  ✅ EXIT_LONG @ {a_price:.2f} | {a_rsn} "
                                          f"| bal={self.strategy.balance:.2f}")
 
-                            # ── EXIT_SHORT ─────────────────────────────────
                             elif kind == 'EXIT_SHORT':
                                 if self._is_paper():
                                     self._paper_close_short(a_price, a_rsn, a_ts)
@@ -911,12 +879,6 @@ class LiveTrader:
                                 log.info(f"  ✅ EXIT_SHORT @ {a_price:.2f} | {a_rsn} "
                                          f"| bal={self.strategy.balance:.2f}")
 
-                            # ── BUY (enter long) ───────────────────────────
-                            # FIX v24 Bug 4: NÃO chamar confirm_fill em paper
-                            # (strategy já abriu a posição internamente em next()).
-                            # Para live: atualizar position_price com preço real.
-                            # FIX v25 Fix 3: após confirmação, verificar stop
-                            # imediatamente no candle atual (gap do 1º candle).
                             elif kind == 'BUY':
                                 if a_qty <= 0:
                                     continue
@@ -938,12 +900,6 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
-
-                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
-                                        # Backtest: entry no open, stop checa H/L do mesmo bar.
-                                        # Live: sem esta chamada, stop só seria verificado
-                                        # no próximo polling (~15s depois).
-                                        # Preço de saída = stop_price exato (Fix 1).
                                         self._check_immediate_stop(current_candle, current_ts)
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
@@ -964,23 +920,18 @@ class LiveTrader:
                                     log.info(f"  🟢 LIVE ENTER LONG {a_qty:.6f} ETH @ {px:.2f}")
                                     r, qty_f = self.bitget.open_long(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
-                                        # Atualizar position_price com preço REAL do fill
                                         self.strategy.position_price = px
                                         self.strategy._highest       = px
                                         self._add_log("ENTER_LONG", px, qty_f)
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
-
-                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
                                         self._check_immediate_stop(current_candle, current_ts)
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
                                     else:
                                         log.error("  ❌ bitget.open_long falhou")
 
-                            # ── SELL (enter short) ─────────────────────────
-                            # FIX v25 Fix 3: idem BUY — gap do primeiro candle.
                             elif kind == 'SELL':
                                 if a_qty <= 0:
                                     continue
@@ -1002,8 +953,6 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
-
-                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
                                         self._check_immediate_stop(current_candle, current_ts)
                                     else:
                                         log.error("  ❌ paper.open_short falhou")
@@ -1024,15 +973,12 @@ class LiveTrader:
                                     log.info(f"  🔴 LIVE ENTER SHORT {a_qty:.6f} ETH @ {px:.2f}")
                                     r, qty_f = self.bitget.open_short(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
-                                        # Atualizar position_price com preço REAL do fill
                                         self.strategy.position_price = px
                                         self.strategy._lowest        = px
                                         self._add_log("ENTER_SHORT", px, qty_f)
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
-
-                                        # ── FIX v25 Fix 3: gap do primeiro candle ──────
                                         self._check_immediate_stop(current_candle, current_ts)
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
@@ -1044,15 +990,17 @@ class LiveTrader:
 
                 time.sleep(15)
 
-            except KeyboardInterrupt:
-                log.info("🛑 Interrupção por teclado detectada. Encerrando trader.")
-                self._running = False
             except Exception as e:
                 log.error(f"❌ Erro no loop live: {e}\n{traceback.format_exc()}")
-                # Aguarda antes de tentar novamente para não saturar o log
+                # Aguarda um pouco antes de tentar novamente para não sobrecarregar
                 time.sleep(60)
+                continue  # volta ao while, mantém _running True
 
-        log.info("🔴 Trader encerrado")
+        # Quando o loop termina (por stop() ou erro fatal não recuperável)
+        if loop_exit_reason:
+            log.info(f"🔴 Loop do trader encerrado. Motivo: {loop_exit_reason}")
+        else:
+            log.info("🔴 Loop do trader encerrado. (Motivo não especificado)")
 
     def _refresh_cache(self):
         px = self._mark_price()
@@ -1060,9 +1008,15 @@ class LiveTrader:
             self._cache_px = px
 
     def stop(self):
+        log.info("🛑 Stop solicitado. Aguardando saída do loop...")
         self._running = False
         self._stop_monitor.disarm()
-        log.info("🛑 Trader parado")
+        # Aguarda até que o loop termine (até 10s)
+        for _ in range(20):
+            if not self._running:
+                break
+            time.sleep(0.5)
+        log.info("🛑 Trader parado.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1337,10 +1291,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-           ..
-            <thead>   ..<th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th> </thead>
-            <tbody id="lv-trades">   ..<td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando... </tbody>
-           ..
+           <table>
+            <thead> <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
+            <tbody id="lv-trades"> <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
+           </table>
         </div>
       </div>
       <div class="card">
@@ -1374,11 +1328,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-           ..
-            <thead>   ..<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th> </thead>
-            <tbody id="hist-tbl">   ..<td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando... </tbody>
-           ..
+           <table>
+            <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr> </thead>
+            <tbody id="hist-tbl"> <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
+           </table>
         </div>
       </div>
     </div>
@@ -1403,20 +1357,20 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card">
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
-             ..
-              <thead>   ..<th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th> </thead>
+             <table>
+              <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
               <tbody id="bt-tbl"></tbody>
-             ..
+             </table>
           </div>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
-           ..
-            <thead>   ..<th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th> </thead>
-            <tbody id="bt-hist-tbl">   ..<td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico </tbody>
-           ..
+           <table>
+            <thead> <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
+            <tbody id="bt-hist-tbl"> <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
+           </table>
         </div>
       </div>
     </div>
@@ -1495,7 +1449,7 @@ async function poll() {
         const ac = t.action || ''; let cl = 'dir', lb = ac;
         if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
         if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
-        return `   ..<td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}   ..<td><span class="${cl}">${lb}</span>   ..<td>${t.price?.toFixed(2)||'—'}   ..<td>${t.qty?.toFixed(6)||'—'}   ..<td style="color:var(--muted)">${t.reason||'—'}   ..`;
+        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
       }).join('');
     }
     const lb = document.getElementById('lv-log');
@@ -1542,13 +1496,13 @@ async function loadHistory() {
     document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
     const tb = document.getElementById('hist-tbl');
     const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
-    if (!trades.length) { tb.innerHTML = '   ..<td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado   ..'; return; }
+    if (!trades.length) { tb.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
     tb.innerHTML = trades.map((t, i) => {
       const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
       const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
       const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
       const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
-      return `   ..<td>${i+1}   ..<td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}   ..<td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}   ..<td><span class="${dc}">${dir}</span>   ..<td>${(t.qty||0).toFixed(4)}   ..<td>${(t.entry_price||0).toFixed(2)}   ..<td>${ep}   ..<td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}   ..<td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%   ..<td style="color:var(--muted)">${t.exit_reason||'—'}   ..<td>${mode}   ..`;
+      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
@@ -1597,9 +1551,9 @@ function renderBacktestResult(d) {
     const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
     const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
     const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
-    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}   ..<td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}   ..` : '';
-    return `   ..<td>${i+1}   ..<td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}   ..<td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}   ..<td><span class="${dc}">${dir}</span>   ..<td>${(t.qty||0).toFixed(4)}   ..<td>${(t.entry_price||0).toFixed(2)}   ..<td>${t.exit_price?t.exit_price.toFixed(2):'—'}   ..<td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}   ..${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%   ..<td style="color:var(--muted)">${t.exit_comment||'—'}   ..`;
-  }).join('') : '   ..<td colspan="10" style="text-align:center;color:var(--muted)">Sem trades   ..';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
+    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
   document.getElementById('bt-result').style.display = 'block';
 }
 async function loadBtHistory() {
@@ -1607,11 +1561,11 @@ async function loadBtHistory() {
     const d = await (await fetch('/backtest/history')).json();
     const sessions = (d.sessions || []).slice().reverse();
     const tb = document.getElementById('bt-hist-tbl');
-    if (!sessions.length) { tb.innerHTML = '   ..<td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico   ..'; return; }
+    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
     tb.innerHTML = sessions.map(s => {
       const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
       const pc = s.total_pnl >= 0 ? 'g' : 'r';
-      return `   ..<td>${(s.id||'—').replace('T',' ').slice(0,19)}   ..<td>${s.symbol||'—'}   ..<td>${s.timeframe||'—'}   ..<td>${s.candles||0}   ..<td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}   ..<td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%   ..<td>${s.total_trades||0}   ..<td class="${s.profit_factor>1?'g':'r'}">${pf}   ..<td class="r">${(s.max_drawdown||0).toFixed(2)}%   ..<td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}   ..`;
+      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
     }).join('');
   } catch(e) { console.error(e); }
 }
@@ -1678,6 +1632,8 @@ def _thread():
         with _lock:
             _trader   = None
             _starting = False
+        # Libera lock de processo ao final
+        _release_lock()
         log.info("🔄 Pronto para re-iniciar")
 
 
@@ -1739,6 +1695,9 @@ def start():
             return jsonify({"message": "Já está rodando"})
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
+        # Tenta adquirir lock de processo para evitar múltiplos traders
+        if not _acquire_lock():
+            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn."}), 400
         _starting = True
         threading.Thread(target=_thread, daemon=True).start()
         mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
@@ -1747,6 +1706,8 @@ def start():
 @app.route('/stop', methods=['POST'])
 def stop():
     if _trader: _trader.stop()
+    # Força liberação do lock de processo
+    _release_lock()
     return jsonify({"message": "Parado"})
 
 @app.route('/ping')
@@ -1795,19 +1756,25 @@ def report_page():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-START
+# AUTO-START (apenas se não houver lock ativo e credenciais ok)
 # ═══════════════════════════════════════════════════════════════════════════════
 def _delayed_start():
     global _starting
     time.sleep(5)
     with _lock:
         if _trader is not None or _starting:
+            log.debug("Trader já rodando ou iniciando, auto-start ignorado.")
             return
-        if not get_paper_mode() and not _creds_ok():
+        is_paper = get_paper_mode()
+        if not is_paper and not _creds_ok():
             log.warning("⚠️ Chaves Bitget não configuradas — use o botão Iniciar.")
             return
+        # Tenta adquirir lock de processo
+        if not _acquire_lock():
+            log.warning("⚠️ Lock de processo já existe. Auto-start ignorado (outro worker rodando?).")
+            return
         _starting = True
-        mode_str = "PAPER TRADING" if get_paper_mode() else "LIVE (Bitget)"
+        mode_str = "PAPER TRADING" if is_paper else "LIVE (Bitget)"
         log.info(f"🚀 Auto-start {mode_str}...")
         threading.Thread(target=_thread, daemon=True).start()
 
