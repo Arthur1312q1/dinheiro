@@ -28,6 +28,14 @@ FIX-4  Execution Refactoring
   - BUY e EXIT_LONG nunca ocorrem no mesmo ciclo do loop principal.
   - _pending_entry_check garante que o trailing só começa a monitorar
     a partir do poll imediatamente após a confirmação do fill.
+
+FIX-5  Entry Price Parity (Open Price)
+  - Ordens de entrada (BUY/SELL) agora usam o preço de ABERTURA do
+    candle atual (current_candle['open']) em vez do ticker em tempo real.
+  - Garante paridade exata com o backtest, que também entra no Open.
+  - Aplica-se a ambos os modos: Paper Trading e Live (Bitget).
+  - strategy.position_price e _highest/_lowest são sincronizados com
+    este preço de abertura após confirmação da ordem.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -684,15 +692,9 @@ class LiveTrader:
         self._running = True
 
         # ── FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms) ───────
-        # Usa o timestamp do candle fechado (candles[1][0]), não um bar_id
-        # derivado de divisão por duração. Previne reprocessamento do mesmo
-        # candle em polls diferentes.
         last_processed_closed_ts: Optional[int] = None
 
         # ── FIX-3/4: flag de candle de entrada ───────────────────────────────
-        # Setado como True após BUY/SELL confirmado.
-        # No PRÓXIMO poll, chama update_trailing_live com is_entry_candle=True
-        # e current_price=ticker → verifica stop contra preço real, não H/L.
         _pending_entry_check: bool = False
 
         loop_exit_reason = None
@@ -735,13 +737,8 @@ class LiveTrader:
                     continue
 
                 # ── 1. Trailing stop intra-barra ──────────────────────────
-                # FIX-3/4: se acabamos de entrar (_pending_entry_check=True),
-                # usa is_entry_candle=True com current_price=ticker.
-                # Isso impede saída falsa por H/L histórico anterior ao fill.
-                # Nas iterações seguintes, usa H/L normalmente.
                 with self._pos_lock:
                     if _pending_entry_check:
-                        # Obtém ticker para verificação do stop no candle de entrada
                         ticker_px = self._mark_price()
                         log.debug(
                             f"  🔍 [ENTRY-CHECK] ticker={ticker_px:.2f} "
@@ -755,7 +752,7 @@ class LiveTrader:
                             is_entry_candle=True,
                             current_price=ticker_px,
                         )
-                        _pending_entry_check = False  # consumida, independente de saída
+                        _pending_entry_check = False
                     else:
                         exit_act = self.strategy.update_trailing_live(
                             high=current_candle['high'],
@@ -793,9 +790,6 @@ class LiveTrader:
                                  f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}")
 
                 # ── 2. Detectar novo candle fechado (FIX-1) ───────────────
-                # Usa o timestamp REAL do candle fechado (candles[1][0]).
-                # Só processa se prev_ts_raw > last_processed_closed_ts
-                # → elimina processamento duplicado causado por polls repetidos.
                 prev = candles[1]
                 if len(prev) < 5:
                     log.warning("  ⚠️ Candle anterior mal formatado")
@@ -809,7 +803,6 @@ class LiveTrader:
                     time.sleep(15)
                     continue
 
-                # FIX-1: condição estrita — somente timestamps novos são processados
                 if last_processed_closed_ts is None or prev_ts_raw > last_processed_closed_ts:
 
                     try:
@@ -831,16 +824,10 @@ class LiveTrader:
                         f"  🕯️ Novo candle fechado [{prev_ts_raw}]: "
                         f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
                         f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f} "
-                        f"@ {prev_ts}"
+                        f"@ {prev_ts} | "
+                        f"Próximo Open (entrada)={current_candle['open']:.2f}"  # FIX-5: log do Open de entrada
                     )
 
-                    # FIX-4: fluxo estrito — BUY e EXIT_LONG nunca no mesmo ciclo.
-                    # strategy.next() pode retornar EXIT de uma posição aberta
-                    # (trail/SL do candle fechado) OU um novo BUY/SELL.
-                    # A separação é natural: o trailing stop do candle fechado
-                    # é tratado DENTRO de strategy.next() (via _check_trail),
-                    # e o BUY/SELL resultante executa no OPEN via _exec_open.
-                    # Nenhuma chamada adicional é feita no mesmo ciclo.
                     with self._pos_lock:
                         actions = self.strategy.next(closed_candle)
                         log.info(
@@ -892,7 +879,10 @@ class LiveTrader:
                                     continue
 
                                 if self._is_paper():
-                                    px = a_price
+                                    # ── FIX-5: entrada no Open do candle atual ──────────────
+                                    # O backtest abre posição no Open da barra seguinte ao sinal.
+                                    # current_candle['open'] é exatamente esse preço.
+                                    px = current_candle['open']
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'long':
                                         log.debug("  BUY ignorado: paper já está long")
@@ -901,23 +891,30 @@ class LiveTrader:
                                         log.warning("  ⚠️ BUY: short residual fechado forçado")
                                         self._paper_close_short(px, 'REVERSAL', a_ts)
 
-                                    log.info(f"  🟢 [PAPER] ENTER LONG {a_qty:.6f} ETH @ {px:.2f}")
+                                    log.info(f"  🟢 [PAPER] ENTER LONG {a_qty:.6f} ETH @ {px:.2f} "
+                                             f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.paper.open_long(a_qty, self._cache_bal, px, ts=a_ts)
                                     if r.get("code") == "0":
+                                        # FIX-5: sincroniza position_price e _highest da estratégia
+                                        # com o Open real usado na entrada, sobrepondo o Open do
+                                        # candle fechado que foi usado internamente em _exec_open.
+                                        self.strategy.position_price = px
+                                        self.strategy._highest       = px
                                         self._add_log("ENTER_LONG", px, qty_f)
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
-                                        # FIX-4: NÃO verifica stop aqui.
-                                        # O monitoramento começa no próximo poll
-                                        # com is_entry_candle=True (FIX-3).
+                                        # FIX-4: monitoramento começa no próximo poll
                                         _pending_entry_check = True
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
 
                                 else:  # LIVE
-                                    px = self._mark_price() or a_price
+                                    # ── FIX-5: entrada no Open do candle atual ──────────────
+                                    # Usa current_candle['open'] em vez do ticker para paridade
+                                    # exata com o backtest.
+                                    px = current_candle['open']
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'long':
                                         log.debug("  BUY ignorado: bitget já está long")
@@ -929,9 +926,11 @@ class LiveTrader:
                                         except Exception as _e:
                                             log.error(f"  ❌ reversal close_short: {_e}")
 
-                                    log.info(f"  🟢 LIVE ENTER LONG {a_qty:.6f} ETH @ {px:.2f}")
+                                    log.info(f"  🟢 LIVE ENTER LONG {a_qty:.6f} ETH @ {px:.2f} "
+                                             f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.bitget.open_long(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
+                                        # FIX-5: position_price e _highest já corretos (px = Open)
                                         self.strategy.position_price = px
                                         self.strategy._highest       = px
                                         self._add_log("ENTER_LONG", px, qty_f)
@@ -951,7 +950,8 @@ class LiveTrader:
                                     continue
 
                                 if self._is_paper():
-                                    px = a_price
+                                    # ── FIX-5: entrada no Open do candle atual ──────────────
+                                    px = current_candle['open']
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'short':
                                         log.debug("  SELL ignorado: paper já está short")
@@ -960,9 +960,14 @@ class LiveTrader:
                                         log.warning("  ⚠️ SELL: long residual fechado forçado")
                                         self._paper_close_long(px, 'REVERSAL', a_ts)
 
-                                    log.info(f"  🔴 [PAPER] ENTER SHORT {a_qty:.6f} ETH @ {px:.2f}")
+                                    log.info(f"  🔴 [PAPER] ENTER SHORT {a_qty:.6f} ETH @ {px:.2f} "
+                                             f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.paper.open_short(a_qty, self._cache_bal, px, ts=a_ts)
                                     if r.get("code") == "0":
+                                        # FIX-5: sincroniza position_price e _lowest da estratégia
+                                        # com o Open real usado na entrada.
+                                        self.strategy.position_price = px
+                                        self.strategy._lowest        = px
                                         self._add_log("ENTER_SHORT", px, qty_f)
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
@@ -974,7 +979,8 @@ class LiveTrader:
                                         log.error("  ❌ paper.open_short falhou")
 
                                 else:  # LIVE
-                                    px = self._mark_price() or a_price
+                                    # ── FIX-5: entrada no Open do candle atual ──────────────
+                                    px = current_candle['open']
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'short':
                                         log.debug("  SELL ignorado: bitget já está short")
@@ -986,9 +992,11 @@ class LiveTrader:
                                         except Exception as _e:
                                             log.error(f"  ❌ reversal close_long: {_e}")
 
-                                    log.info(f"  🔴 LIVE ENTER SHORT {a_qty:.6f} ETH @ {px:.2f}")
+                                    log.info(f"  🔴 LIVE ENTER SHORT {a_qty:.6f} ETH @ {px:.2f} "
+                                             f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.bitget.open_short(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
+                                        # FIX-5: position_price e _lowest já corretos (px = Open)
                                         self.strategy.position_price = px
                                         self.strategy._lowest        = px
                                         self._add_log("ENTER_SHORT", px, qty_f)
@@ -1003,7 +1011,7 @@ class LiveTrader:
                                     else:
                                         log.error("  ❌ bitget.open_short falhou")
 
-                    # FIX-1: marca candle como processado após processamento bem-sucedido
+                    # FIX-1: marca candle como processado
                     last_processed_closed_ts = prev_ts_raw
                     log.debug(f"  ✔ Candle {prev_ts_raw} marcado como processado")
                     self._refresh_cache()
