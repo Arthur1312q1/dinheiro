@@ -4,27 +4,23 @@
 # ADAPTIVE ZERO LAG EMA v2 — TRADUÇÃO EXATA DO PINE SCRIPT v3
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# MODELO DE EXECUÇÃO PINE (calc_on_every_tick=false, slippage=0):
-# ──────────────────────────────────────────────────────────────
-#  OPEN  : entry orders executam ao open_price (ordens do close anterior)
-#  CLOSE :
-#    1. IFM (Cos/IQ) → Period  (Period=0 permitido, como Pine)
-#    2. ZLEMA → EMA, EC  (EC loop usa EC[1] = barra anterior)
-#    3. buy_signal  = EC[1] <=  EMA[1] AND EC >  EMA   ← Pine v3: usa <=
-#       sell_signal = EC[1] >=  EMA[1] AND EC <  EMA   ← Pine v3: usa >=
-#    4. strategy.exit avalia HIGH/LOW → se acionado: EXIT AO STOP_PRICE
-#       (intra-barra, Pine slippage=0, fill exato no stop_price, pos=0 imediatamente)
-#    5. Agenda entries com pos atualizado pós-exit
-#       • pendingBuy  := nz(pendingBuy[1])  → se buy_signal[1]:  pendingBuy=True
-#       • pendingSell := nz(pendingSell[1]) → se sell_signal[1]: pendingSell=True
-#       • if pendingBuy  and pos<=0: el=True, pendingBuy=False
-#       • if pendingSell and pos>=0: es=True, pendingSell=False
-#         (Pine last-wins: SELL cancela BUY quando pos=0)
-#    6. Salva sinais → _buy_prev, _sell_prev
+# CORREÇÕES APLICADAS:
+# ────────────────────────────────────────────────────────────────────────────
+#  FIX-2 (State Desync / Inversão de Sinais):
+#    • Substituído `_bar % 2` por `_live_bar_count`, contador dedicado que
+#      começa em 0 após o warmup → primeira barra live SEMPRE gera BUY.
+#    • `_live_bar_count` é resetado no warmup (via main.py) garantindo
+#      determinismo independente do horário de início.
 #
-# ═══════════════════════════════════════════════════════════════════════════════
-# MODIFICAÇÃO SOLICITADA: Forçar trade em todos os candles (alternando compra/venda)
-# sem alterar parâmetros e mantendo o delay de uma barra.
+#  FIX-3 (Falha no Fechamento Intrabar / High-Low Parity):
+#    • `update_trailing_live` aceita `is_entry_candle=True` e
+#      `current_price` (ticker/last price).
+#    • Quando `is_entry_candle=True`:
+#        - _highest/_lowest NÃO são atualizados pelo H/L histórico do candle.
+#        - O stop é verificado contra `current_price` (preço real no momento
+#          do poll), eliminando saídas falsas por preços anteriores ao fill.
+#    • Início de `_highest`/`_lowest` a partir do preço de fill real
+#      (já garantido por `_open_long`/`_open_short`).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -146,16 +142,15 @@ class AdaptiveZeroLagEMA:
         # ── Contador de barras ───────────────────────────────────────────
         self._bar            = 0
 
+        # ── FIX-2: Contador dedicado de barras live ───────────────────────
+        # Separado de `_bar` para que o sinal alternado (BUY/SELL) seja
+        # determinístico e independente do número de barras de warmup.
+        # Sempre resetado para 0 antes do início live (via main.py warmup).
+        # Regra: _live_bar_count ímpar → BUY, par (exceto 0) → SELL.
+        self._live_bar_count = 0
+
     # ═══════════════════════════════════════════════════════════════════════
     # IFM COSINE — exato Pine v3
-    # v1 := src - src[7]
-    # s2 := 0.2*(v1[1]+v1)^2 + 0.8*nz(s2[1])
-    # s3 := 0.2*(v1[1]-v1)^2 + 0.8*nz(s3[1])
-    # if s2!=0: v2 := sqrt(s3/s2)
-    # if s3!=0: deltaC := 2*atan(v2)
-    # for i=0 to range: v4+=deltaC[i]; if v4>2*PI and instC==0: instC:=i-1
-    # if instC==0: instC := instC[1]
-    # lenC := 0.25*instC + 0.75*nz(lenC[1])
     # ═══════════════════════════════════════════════════════════════════════
     def _cosine_ifm(self, src: float) -> None:
         self._src7c.append(src)
@@ -175,18 +170,16 @@ class AdaptiveZeroLagEMA:
         dC = 2.0*math.atan(v2) if self._s3 != 0.0 else 0.0
         self._dC.append(dC)
 
-        # for i=0 to range: acumula deltaC[i] e busca instC
         dl   = list(self._dC)
         v4   = 0.0
         inst = 0.0
-        for i in range(_RNG+1):          # i = 0..50 (51 iter)
+        for i in range(_RNG+1):
             j = -(i+1)
             if abs(j) <= len(dl):
                 v4 += dl[j]
                 if v4 > 2.0*_PI and inst == 0.0:
-                    inst = float(i-1)    # Pine: instC := i - 1
+                    inst = float(i-1)
 
-        # if instC==0: instC := instC[1]
         if inst == 0.0:
             inst = self._instC
         self._instC = inst
@@ -194,35 +187,22 @@ class AdaptiveZeroLagEMA:
 
     # ═══════════════════════════════════════════════════════════════════════
     # IFM I-Q — exato Pine v3
-    # P = src - src[7]
-    # inphase := 1.25*(P[4] - 0.635*P[2]) + 0.635*nz(inphase[3])
-    # quadrature := P[2] - 0.338*P + 0.338*nz(quadrature[2])
-    # re := 0.2*(inphase*inphase[1] + quadrature*quadrature[1]) + 0.8*nz(re[1])
-    # im := 0.2*(inphase*quadrature[1] - inphase[1]*quadrature) + 0.8*nz(im[1])
-    # if re!=0: deltaIQ := atan(im/re)
-    # for i=0 to range: V+=deltaIQ[i]; if V>2*PI and instIQ==0: instIQ:=i
-    # if instIQ==0: instIQ := nz(instIQ[1])
-    # lenIQ := 0.25*instIQ + 0.75*nz(lenIQ[1])
     # ═══════════════════════════════════════════════════════════════════════
     def _iq_ifm(self, src: float) -> None:
         imult, qmult = 0.635, 0.338
         self._src7q.append(src)
-        P = src - self._src7q[0]          # src - src[7]
+        P = src - self._src7q[0]
         self._Pbuf.append(P)
-        pl = list(self._Pbuf)             # [P-4, P-3, P-2, P-1, P]
+        pl = list(self._Pbuf)
 
-        ib = list(self._ipbuf)            # antes do append: [..., ip-3, ..., ip_prev]
+        ib = list(self._ipbuf)
         qb = list(self._qbuf)
 
-        # Pine: inphase := 1.25*(P[4] - imult*P[2]) + imult*nz(inphase[3])
-        # pl[0]=P[4], pl[2]=P[2]; ib[0]=inphase[3]
         inph = 1.25*(pl[0] - imult*pl[2]) + imult*ib[0]
-        # Pine: quadrature := P[2] - qmult*P + qmult*nz(quadrature[2])
-        # pl[4]=P (atual), pl[2]=P[2]; qb[0]=quadrature[2]
         quad = pl[2] - qmult*pl[4] + qmult*qb[0]
 
-        inph_1 = ib[2]    # inphase[1]
-        quad_1 = qb[1]    # quadrature[1]
+        inph_1 = ib[2]
+        quad_1 = qb[1]
 
         self._ipbuf.append(inph)
         self._qbuf.append(quad)
@@ -241,7 +221,7 @@ class AdaptiveZeroLagEMA:
             if abs(j) <= len(dl):
                 V += dl[j]
                 if V > 2.0*_PI and inst == 0.0:
-                    inst = float(i)      # Pine: instIQ := i (sem -1)
+                    inst = float(i)
 
         if inst == 0.0:
             inst = self._instIQ
@@ -250,21 +230,14 @@ class AdaptiveZeroLagEMA:
 
     # ═══════════════════════════════════════════════════════════════════════
     # ZLEMA — exato Pine v3
-    # alpha = 2/(Period+1)   [Period=0 → alpha=2, como Pine]
-    # EMA := alpha*src + (1-alpha)*nz(EMA[1])
-    # for i=-GL to GL: Gain=i/10; EC_trial=alpha*(EMA+Gain*(src-EC[1]))+(1-alpha)*EC[1]
-    # EC := alpha*(EMA + BestGain*(src - nz(EC[1]))) + (1-alpha)*nz(EC[1])
     # ═══════════════════════════════════════════════════════════════════════
     def _zlema(self, src: float, period: int):
-        # Pine: alpha = 2/(Period+1) — sem clamping, period=0 é válido
         alpha    = 2.0 / (period + 1)
         ema_prev = self._EMA
         ec_prev  = self._EC
 
         ema = alpha*src + (1.0-alpha)*ema_prev
 
-        # Loop 1801 iterações: busca BestGain que minimiza |src - EC|
-        # EC usa SEMPRE ec_prev (EC[1] da barra anterior, não do loop)
         le = 1_000_000.0
         bg = 0.0
         for i in range(-_GL, _GL+1):
@@ -277,12 +250,10 @@ class AdaptiveZeroLagEMA:
 
         ec = alpha*(ema + bg*(src - ec_prev)) + (1.0-alpha)*ec_prev
 
-        # Atualiza state para próxima barra
         self._EMA = ema
         self._EC  = ec
         self.LeastError = le
 
-        # Valores públicos (barra atual)
         self.EMA = ema
         self.EC  = ec
 
@@ -290,13 +261,11 @@ class AdaptiveZeroLagEMA:
 
     # ═══════════════════════════════════════════════════════════════════════
     # OPEN: executa entry orders agendados
-    # Pine pyramiding=1: entry contrário = reversão (fecha + abre)
     # ═══════════════════════════════════════════════════════════════════════
     def _exec_open(self, open_p: float, ts) -> List[Dict]:
         acts = []
         el, es = self._el, self._es
 
-        # ── Prioridade 1: reversão ─────────────────────────────────────
         if el and self.position_size < 0.0:
             acts.append(self._close(open_p, ts, "REVERSAL"))
             a = self._open_long(open_p, ts)
@@ -309,7 +278,6 @@ class AdaptiveZeroLagEMA:
             if a: acts.append(a)
             self._es = False
 
-        # ── Prioridade 2: entry flat ───────────────────────────────────
         if el and self.position_size == 0.0:
             a = self._open_long(open_p, ts)
             if a: acts.append(a)
@@ -324,26 +292,12 @@ class AdaptiveZeroLagEMA:
 
     # ═══════════════════════════════════════════════════════════════════════
     # CLOSE: avalia trailing stop/SL usando HIGH e LOW
-    #
-    # PINE (calc_on_every_tick=false, slippage=0):
-    # "The exit fills at the trail_price / stop_price."
-    # → fill EXATO no stop_price (não no next open!)
-    # → pos=0 IMEDIATAMENTE (intra-barra)
-    # → pendingBuy/pendingSell vê pos=0 no MESMO close
-    # → nova entrada agendada → executa no OPEN da próxima barra
-    #
-    # Para LONG: Pine assume HIGH vem antes de LOW (worst case para trail)
-    #   1. highest = max(highest, HIGH)
-    #   2. se profit >= trail_points: trailing ativa
-    #   3. stop = highest - trail_offset*tick  [se trail]
-    #             entry - fixedSL*tick          [se sem trail]
-    #   4. se LOW <= stop: exit ao stop_price
     # ═══════════════════════════════════════════════════════════════════════
     def _check_trail(self, h: float, l: float, ts) -> Optional[Dict]:
         if self.position_size == 0.0 or not self._monitored:
             return None
 
-        if self.position_size > 0.0:   # ── LONG ──────────────────────
+        if self.position_size > 0.0:
             self._highest = max(self._highest, h)
             profit_ticks  = (self._highest - self.position_price) / self.tick
             if profit_ticks >= self.tp:
@@ -354,11 +308,11 @@ class AdaptiveZeroLagEMA:
             else:
                 stop = self.position_price - self.sl * self.tick
                 rsn  = "SL"
-            self.long_stop = stop   # atualiza stop price visível
+            self.long_stop = stop
             if l <= stop:
                 return self._exit_at(stop, "long", rsn, ts)
 
-        elif self.position_size < 0.0:  # ── SHORT ─────────────────────
+        elif self.position_size < 0.0:
             self._lowest = min(self._lowest, l)
             profit_ticks = (self.position_price - self._lowest) / self.tick
             if profit_ticks >= self.tp:
@@ -369,7 +323,7 @@ class AdaptiveZeroLagEMA:
             else:
                 stop = self.position_price + self.sl * self.tick
                 rsn  = "SL"
-            self.short_stop = stop  # atualiza stop price visível
+            self.short_stop = stop
             if h >= stop:
                 return self._exit_at(stop, "short", rsn, ts)
 
@@ -377,51 +331,30 @@ class AdaptiveZeroLagEMA:
 
     # ═══════════════════════════════════════════════════════════════════════
     # CLOSE: agenda entries — exato Pine v3
-    # pendingBuy  := nz(pendingBuy[1])
-    # pendingSell := nz(pendingSell[1])
-    # if buy_signal[1]:  pendingBuy  := true
-    # if sell_signal[1]: pendingSell := true
-    # if pendingBuy  and pos<=0: entry LONG,  pendingBuy=false
-    # if pendingSell and pos>=0: entry SHORT, pendingSell=false
-    #   [Pine last-wins: SELL cancela BUY quando pos=0]
     # ═══════════════════════════════════════════════════════════════════════
     def _sched_entries(self) -> None:
-        # Propaga sinais da barra anterior para pending (Pine: nz(pBuy[1]))
         if self._buy_prev:  self._pBuy  = True
         if self._sell_prev: self._pSell = True
 
-        # Pine if #1: pendingBuy and position_size <= 0
         if self._pBuy and self.position_size <= 0.0:
             self._el    = True
             self._pBuy  = False
 
-        # Pine if #2: pendingSell and position_size >= 0 (INDEPENDENTE do #1)
         if self._pSell and self.position_size >= 0.0:
             self._es    = True
             self._pSell = False
-            # Pine last-wins: quando pos=0 e ambos, SELL cancela BUY
             if self._el and self.position_size == 0.0:
                 self._el = False
 
     # ═══════════════════════════════════════════════════════════════════════
     # MAIN: processa um candle
-    # Chamado pelo engine a cada barra fechada (backtest ou live).
-    # Retorna lista de ações para o engine registrar.
     # ═══════════════════════════════════════════════════════════════════════
     def next(self, candle: Dict) -> List[Dict]:
         """
         Processa um candle (barra fechada).
 
-        Args:
-            candle: dict com 'open', 'high', 'low', 'close',
-                    'timestamp', 'index'
-
         Returns:
-            Lista de dicts com ações executadas nesta barra:
-            {'action': 'BUY'|'SELL'|'EXIT_LONG'|'EXIT_SHORT',
-             'price': float, 'qty': float, 'pnl': float (exits),
-             'timestamp': ..., 'exit_reason': str (exits),
-             'comment': str}
+            Lista de dicts com ações executadas nesta barra.
         """
         self._bar += 1
         wu = (self._bar <= self.warmup_bars)
@@ -439,34 +372,28 @@ class AdaptiveZeroLagEMA:
         if not wu:
             actions.extend(self._exec_open(op, ts))
         else:
-            self._el = self._es = False   # descarta durante warmup
+            self._el = self._es = False
 
         # ── CLOSE: IFM ────────────────────────────────────────────────────
         if self.force_period is not None:
-            self.Period = self.force_period   # forçado (testes)
+            self.Period = self.force_period
         else:
             if self.method in ("Cos IFM", "Average"):
                 self._cosine_ifm(src)
             if self.method in ("I-Q IFM", "Average"):
                 self._iq_ifm(src)
 
-            # Pine: Period := round(lenX) — sem clamping (Period=0 é válido)
             if   self.method == "Cos IFM":  self.Period = int(round(self._lenC))
             elif self.method == "I-Q IFM":  self.Period = int(round(self._lenIQ))
             elif self.method == "Average":  self.Period = int(round((self._lenC + self._lenIQ)/2))
-            elif self.method == "Off":      pass   # usa default_period fixo
-            # Se Period ainda é 0 nas primeiras barras: alpha=2/(0+1)=2 (exato Pine)
 
         # ── CLOSE: ZLEMA ──────────────────────────────────────────────────
         ema_p, ec_p, ema, ec = self._zlema(src, self.Period)
 
-        # ── CLOSE: Sinais ─────────────────────────────────────────────────
-        # Pine v3: crossover(EC,EMA)  = EC[1] <= EMA[1] AND EC > EMA
-        #          crossunder(EC,EMA) = EC[1] >= EMA[1] AND EC < EMA
+        # ── CLOSE: Sinais reais de crossover ─────────────────────────────
         buy_sig  = (ec_p <= ema_p) and (ec > ema)
         sell_sig = (ec_p >= ema_p) and (ec < ema)
 
-        # Pine: 100*LeastError/src > Threshold (threshold=0 → sempre True)
         if self.threshold > 0.0 and src != 0.0:
             err = 100.0 * self.LeastError / src
             buy_sig  = buy_sig  and (err > self.threshold)
@@ -479,22 +406,24 @@ class AdaptiveZeroLagEMA:
                 actions.append(exit_act)
 
         # ── CLOSE: Agenda entries ─────────────────────────────────────────
-        # (usa pos atualizada após possível exit acima)
         if not wu:
             self._sched_entries()
 
         # ── Salva sinais para próxima barra ───────────────────────────────
-        # MODIFICAÇÃO: Forçar trade em todos os candles após warmup
-        if self._bar <= self.warmup_bars:
+        if wu:
+            # Durante warmup: usa sinais reais do crossover
             self._buy_prev  = buy_sig
             self._sell_prev = sell_sig
         else:
-            # Alternar compra e venda a cada candle (mantendo delay de 1 barra)
-            if self._bar % 2 == 0:
-                self._buy_prev = True
+            # ── FIX-2: Usa _live_bar_count em vez de _bar % 2 ─────────────
+            # _live_bar_count começa em 0 e é incrementado aqui.
+            # Sempre resetado para 0 no warmup (main.py) → 1ª barra live = BUY.
+            self._live_bar_count += 1
+            if self._live_bar_count % 2 == 1:   # ímpar → BUY
+                self._buy_prev  = True
                 self._sell_prev = False
-            else:
-                self._buy_prev = False
+            else:                                # par   → SELL
+                self._buy_prev  = False
                 self._sell_prev = True
 
         # ── Log periódico ─────────────────────────────────────────────────
@@ -508,6 +437,7 @@ class AdaptiveZeroLagEMA:
                 f"trail={'ON' if self._trail_active else 'off'} "
                 f"el={self._el} es={self._es} "
                 f"pB={self._pBuy} pS={self._pSell} "
+                f"liveBar={self._live_bar_count} "
                 f"bal={self.balance:.2f}"
             )
 
@@ -521,22 +451,6 @@ class AdaptiveZeroLagEMA:
         """
         Retorna orders pendentes para executar no próximo OPEN.
         Chamar após next() para saber o que executar ao abrir a próxima barra.
-
-        Uso live:
-            actions = strategy.next(closed_candle)
-            orders  = strategy.get_pending_orders()
-            for order in orders:
-                exchange.submit_order(order)
-
-        Returns:
-            Lista de dicts:
-            {'side': 'BUY'|'SELL',
-             'qty': float,
-             'sl_ticks': int,     # stop loss em ticks (para configurar na exchange)
-             'trail_points': int, # ticks para ativar trailing
-             'trail_offset': int, # ticks de distância do peak
-             'tick_size': float,  # syminfo.mintick
-             'comment': str}
         """
         orders = []
         bal    = self.ic + self.net_profit
@@ -545,49 +459,37 @@ class AdaptiveZeroLagEMA:
         qty = self._lots()
         if self._el:
             orders.append({
-                'side':         'BUY',
-                'qty':          qty,
-                'sl_ticks':     self.sl,
-                'sl_price_dist': self.sl * self.tick,  # SL em USDT por unidade
-                'trail_points': self.tp,
-                'trail_offset': self.toff,
-                'tick_size':    self.tick,
-                'comment':      'ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7',
+                'side':          'BUY',
+                'qty':           qty,
+                'sl_ticks':      self.sl,
+                'sl_price_dist': self.sl * self.tick,
+                'trail_points':  self.tp,
+                'trail_offset':  self.toff,
+                'tick_size':     self.tick,
+                'comment':       'ENTER-LONG_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7',
             })
         if self._es:
             orders.append({
-                'side':         'SELL',
-                'qty':          qty,
-                'sl_ticks':     self.sl,
+                'side':          'SELL',
+                'qty':           qty,
+                'sl_ticks':      self.sl,
                 'sl_price_dist': self.sl * self.tick,
-                'trail_points': self.tp,
-                'trail_offset': self.toff,
-                'tick_size':    self.tick,
-                'comment':      'ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7',
+                'trail_points':  self.tp,
+                'trail_offset':  self.toff,
+                'tick_size':     self.tick,
+                'comment':       'ENTER-SHORT_BingX_ETH-USDT_trade_45M_9640193738b8e54a44f2e5c7',
             })
         return orders
 
     def confirm_fill(self, side: str, price: float, qty: float, ts) -> Optional[Dict]:
         """
         Confirma fill de uma order na exchange (para live trading).
-        Atualiza posição sem simular trailing stop (exchange gerencia o stop).
-
-        Args:
-            side:  'BUY' ou 'SELL'
-            price: preço de execução
-            qty:   quantidade executada
-            ts:    timestamp do fill
-
-        Returns:
-            Dict da ação se gerou reversão (fechou posição anterior), senão None.
         """
         close_act = None
 
         if side == 'BUY':
             if self.position_size < 0.0:
-                # Fecha SHORT (reversão)
                 close_act = self._close(price, ts, "REVERSAL")
-            # Abre LONG
             self.position_size  =  qty
             self.position_price =  price
             self._highest       =  price
@@ -599,9 +501,7 @@ class AdaptiveZeroLagEMA:
 
         elif side == 'SELL':
             if self.position_size > 0.0:
-                # Fecha LONG (reversão)
                 close_act = self._close(price, ts, "REVERSAL")
-            # Abre SHORT
             self.position_size  = -qty
             self.position_price =  price
             self._lowest        =  price
@@ -614,16 +514,7 @@ class AdaptiveZeroLagEMA:
         return close_act
 
     def confirm_exit(self, side: str, price: float, qty: float, ts, reason: str = "EXCHANGE") -> Dict:
-        """
-        Confirma saída de posição (stop/trail executado pela exchange).
-
-        Args:
-            side:   'LONG' ou 'SHORT' (lado que foi fechado)
-            price:  preço de execução
-            qty:    quantidade
-            ts:     timestamp
-            reason: motivo ('TRAIL', 'SL', 'TP', etc.)
-        """
+        """Confirma saída de posição (stop/trail executado pela exchange)."""
         if side == 'LONG' and self.position_size > 0.0:
             pnl = (price - self.position_price) * qty
             self.net_profit += pnl
@@ -645,39 +536,31 @@ class AdaptiveZeroLagEMA:
         return {}
 
     def get_state(self) -> Dict[str, Any]:
-        """
-        Serializa estado completo (para salvar/restaurar entre sessões live).
-        """
+        """Serializa estado completo (para salvar/restaurar entre sessões live)."""
         return {
-            # Posição
             'position_size':    self.position_size,
             'position_price':   self.position_price,
             'net_profit':       self.net_profit,
             'balance':          self.balance,
-            # Pending
-            '_pBuy':  self._pBuy,
-            '_pSell': self._pSell,
-            '_el':    self._el,
-            '_es':    self._es,
-            # Sinais
-            '_buy_prev':  self._buy_prev,
-            '_sell_prev': self._sell_prev,
-            # Trailing
-            '_highest':      self._highest,
-            '_lowest':       self._lowest,
-            '_trail_active': self._trail_active,
-            '_monitored':    self._monitored,
-            # IFM
-            'Period':  self.Period,
-            '_lenC':   self._lenC,
-            '_lenIQ':  self._lenIQ,
-            '_instC':  self._instC,
-            '_instIQ': self._instIQ,
-            # ZLEMA
-            '_EMA': self._EMA,
-            '_EC':  self._EC,
-            # Counters
-            '_bar': self._bar,
+            '_pBuy':            self._pBuy,
+            '_pSell':           self._pSell,
+            '_el':              self._el,
+            '_es':              self._es,
+            '_buy_prev':        self._buy_prev,
+            '_sell_prev':       self._sell_prev,
+            '_highest':         self._highest,
+            '_lowest':          self._lowest,
+            '_trail_active':    self._trail_active,
+            '_monitored':       self._monitored,
+            'Period':           self.Period,
+            '_lenC':            self._lenC,
+            '_lenIQ':           self._lenIQ,
+            '_instC':           self._instC,
+            '_instIQ':          self._instIQ,
+            '_EMA':             self._EMA,
+            '_EC':              self._EC,
+            '_bar':             self._bar,
+            '_live_bar_count':  self._live_bar_count,   # FIX-2: salva contador live
         }
 
     def load_state(self, state: Dict[str, Any]) -> None:
@@ -704,6 +587,7 @@ class AdaptiveZeroLagEMA:
             return None
         self.position_size   =  qty
         self.position_price  =  price
+        # FIX-3: _highest parte exatamente do preço de fill real
         self._highest        =  price
         self._lowest         =  float('inf')
         self._trail_active   =  False
@@ -719,6 +603,7 @@ class AdaptiveZeroLagEMA:
             return None
         self.position_size   = -qty
         self.position_price  =  price
+        # FIX-3: _lowest parte exatamente do preço de fill real
         self._lowest         =  price
         self._highest        =  float('inf')
         self._trail_active   =  False
@@ -749,7 +634,7 @@ class AdaptiveZeroLagEMA:
     def _exit_at(self, stop_price: float, side: str, reason: str, ts) -> Optional[Dict]:
         """
         Exit ao stop_price exato (Pine slippage=0).
-        Pos=0 imediatamente (intra-barra).
+        Pos=0 IMEDIATAMENTE (intra-barra).
         """
         if side == "long" and self.position_size > 0.0:
             qty  = self.position_size
@@ -778,23 +663,66 @@ class AdaptiveZeroLagEMA:
         self._monitored      = False
 
     # ═══════════════════════════════════════════════════════════════════════
-    # NOVO MÉTODO PARA LIVE: atualização intra-barra do trailing stop
+    # FIX-3: update_trailing_live — com suporte a candle de entrada
     # ═══════════════════════════════════════════════════════════════════════
-    def update_trailing_live(self, high: float, low: float, ts) -> Optional[Dict]:
+    def update_trailing_live(
+        self,
+        high:             float,
+        low:              float,
+        ts,
+        is_entry_candle:  bool  = False,
+        current_price:    float = 0.0,
+    ) -> Optional[Dict]:
         """
-        Versão LIVE do trailing stop — só atualiza _highest/_lowest e verifica saída.
-        NÃO avança _bar, NÃO recalcula IFM/ZLEMA, NÃO força sinal.
-        Chame a cada ~5-30 s com o candle ATUAL (incompleto).
+        Versão LIVE do trailing stop — atualiza _highest/_lowest e verifica saída.
 
-        O preço de saída retornado (chave 'price') é o stop_price EXATO,
-        garantindo paridade com o backtest (Pine slippage=0).
-        Os atributos `long_stop` e `short_stop` são atualizados a cada chamada
-        e podem ser consultados externamente para exibição/log.
+        NÃO avança _bar, NÃO recalcula IFM/ZLEMA.
+        Chamar a cada ~15 s com o candle ATUAL (incompleto).
+
+        Args:
+            high, low       : H/L do candle em formação (polling contínuo).
+            ts              : timestamp do poll.
+            is_entry_candle : True apenas no primeiro poll APÓS confirmação
+                              de uma nova entrada (FIX-3 / FIX-4).
+                              Quando True, usa `current_price` (ticker/last)
+                              em vez do H/L histórico do candle para verificar
+                              o stop — elimina saídas falsas por preços
+                              ocorridos ANTES do fill da ordem.
+            current_price   : preço atual do mercado (ticker/last price).
+                              Obrigatório quando is_entry_candle=True.
+
+        Returns:
+            Dict de saída se stop foi atingido, None caso contrário.
         """
         if self.position_size == 0.0 or not self._monitored:
             return None
 
-        if self.position_size > 0.0:   # ── LONG ──────────────────────
+        if is_entry_candle:
+            # ── FIX-3: candle de entrada — usa ticker, não H/L histórico ──
+            # _highest/_lowest já foram inicializados ao preço de fill exato
+            # por _open_long/_open_short. Nenhuma atualização do pico aqui
+            # para não contaminar com movimento anterior ao nosso fill.
+            if current_price <= 0.0:
+                # Sem ticker disponível: não verifica (seguro — próximo poll fará)
+                return None
+
+            if self.position_size > 0.0:
+                # Trail ainda não ativado no candle de entrada (profit=0)
+                stop = self.position_price - self.sl * self.tick
+                self.long_stop = stop
+                if current_price <= stop:
+                    return self._exit_at(stop, "long", "SL", ts)
+
+            elif self.position_size < 0.0:
+                stop = self.position_price + self.sl * self.tick
+                self.short_stop = stop
+                if current_price >= stop:
+                    return self._exit_at(stop, "short", "SL", ts)
+
+            return None
+
+        # ── Poll normal (não-entry): usa H/L do candle em formação ────────
+        if self.position_size > 0.0:
             self._highest = max(self._highest, high)
             profit_ticks  = (self._highest - self.position_price) / self.tick
             if profit_ticks >= self.tp:
@@ -807,13 +735,11 @@ class AdaptiveZeroLagEMA:
                 stop = self.position_price - self.sl * self.tick
                 rsn  = "SL"
 
-            # Mantém long_stop visível externamente (para log / dashboard)
             self.long_stop = stop
-
-            if low <= stop:   # mesmo gatilho do backtest: LOW toca o stop
+            if low <= stop:
                 return self._exit_at(stop, "long", rsn, ts)
 
-        else:  # ── SHORT ──────────────────────────────────────────────
+        else:  # position_size < 0
             self._lowest  = min(self._lowest, low)
             profit_ticks  = (self.position_price - self._lowest) / self.tick
             if profit_ticks >= self.tp:
@@ -826,10 +752,8 @@ class AdaptiveZeroLagEMA:
                 stop = self.position_price + self.sl * self.tick
                 rsn  = "SL"
 
-            # Mantém short_stop visível externamente
             self.short_stop = stop
-
-            if high >= stop:  # mesmo gatilho do backtest: HIGH toca o stop
+            if high >= stop:
                 return self._exit_at(stop, "short", rsn, ts)
 
         return None
