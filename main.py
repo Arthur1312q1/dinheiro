@@ -2,16 +2,32 @@
 AZLEMA Live Trading — Bitget ETH-USDT-SWAP Futures 1x
 Render: configurar BITGET_API_KEY, BITGET_SECRET_KEY, BITGET_PASSPHRASE
 
-Modo de operação selecionável via dashboard:
-  - PAPER TRADING : simula trades com saldo falso (sem risco)
-  - LIVE TRADING  : opera com 95% do saldo real na Bitget
+CORREÇÕES APLICADAS:
+══════════════════════════════════════════════════════════════════════
+FIX-1  Duplicate Candle Processing
+  - last_processed_closed_ts rastreia o UNIX-ms do candle fechado.
+  - strategy.next() só é chamado se closed_ts > last_processed_closed_ts.
+  - Remove a lógica de bar_id baseada em divisão por 30 min (hardcoded).
 
-══════════════════════════════════════════════════════════════════════
-FIX v27 — Lock robusto com limpeza automática em startup e no /start
-══════════════════════════════════════════════════════════════════════
-- Ao iniciar o app, remove qualquer lock órfão deixado por execuções anteriores
-- No endpoint /start, antes de adquirir novo lock, limpa qualquer lock existente
-- Garante que apenas um worker do Gunicorn execute o trader
+FIX-2  Signal Inversion / State Desync
+  - warmup() reseta explicitamente _buy_prev, _sell_prev e
+    _live_bar_count=0 antes do início live.
+  - _live_bar_count (em adaptive_zero_lag_ema.py) garante que a 1ª
+    barra live sempre gera BUY, independentemente do horário de início.
+
+FIX-3  Intrabar Stop Parity (GAP-FIX)
+  - _check_immediate_stop() REMOVIDA do fluxo de execução.
+  - Após BUY/SELL: _pending_entry_check = True (flag, não execução).
+  - No PRÓXIMO poll do loop, update_trailing_live é chamado com
+    is_entry_candle=True e current_price=ticker, evitando saídas
+    falsas por H/L histórico do candle antes do fill.
+
+FIX-4  Execution Refactoring
+  - Fluxo estrito: Fechamento → Sinal → Ordem → Monitoramento no ticker
+    SEGUINTE.
+  - BUY e EXIT_LONG nunca ocorrem no mesmo ciclo do loop principal.
+  - _pending_entry_check garante que o trailing só começa a monitorar
+    a partir do poll imediatamente após a confirmação do fill.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -21,7 +37,7 @@ from typing import Optional, Dict, List
 from pathlib import Path
 from flask import Flask, jsonify, request as flask_request
 
-# ── Fuso horário Brasil (Brasília, UTC-3, sem horário de verão) ───────────────
+# ── Fuso horário Brasil (Brasília, UTC-3) ─────────────────────────────────────
 BRT = timezone(timedelta(hours=-3))
 
 def brazil_now() -> datetime:
@@ -65,12 +81,10 @@ def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
 # ── Lock entre processos via arquivo ─────────────────────────────────────────
-LOCK_FILE = "bot.lock"   # arquivo simples no diretório de trabalho
+LOCK_FILE = "bot.lock"
 
 def _acquire_lock() -> bool:
-    """Tenta criar um lock de processo usando arquivo."""
     try:
-        # Tenta abrir exclusivamente (cria se não existir)
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         os.close(fd)
         log.debug("Lock de processo adquirido.")
@@ -83,7 +97,6 @@ def _acquire_lock() -> bool:
         return False
 
 def _release_lock():
-    """Remove o arquivo de lock se ele existir."""
     try:
         if Path(LOCK_FILE).exists():
             Path(LOCK_FILE).unlink()
@@ -92,7 +105,7 @@ def _release_lock():
         log.error(f"Erro ao remover lock: {e}")
 
 # ── Limpeza automática no startup do container ───────────────────────────────
-_release_lock()   # Remove qualquer lock órfão de execuções anteriores
+_release_lock()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HISTORY MANAGER
@@ -472,7 +485,7 @@ class Bitget:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# REAL-TIME STOP MONITOR  (mantido para compatibilidade)
+# REAL-TIME STOP MONITOR (mantido para compatibilidade)
 # ═══════════════════════════════════════════════════════════════════════════════
 class RealTimeStopMonitor:
     def __init__(self, trader: 'LiveTrader'):
@@ -535,12 +548,11 @@ class LiveTrader:
             "reason": reason,
         })
 
-    # ─── Warmup ────────────────────────────────────────────────────────────────
+    # ─── Warmup ─────────────────────────────────────────────────────────────
     def warmup(self, df: pd.DataFrame):
         self._warming = True
         self._stop_monitor.disarm()
 
-        # Paridade par: strategy alterna BUY/SELL com _bar % 2.
         if len(df) % 2 != 0:
             df = df.iloc[1:].reset_index(drop=True)
             log.info(f"  📐 Paridade: descartado 1 candle → {len(df)} (par)")
@@ -556,22 +568,30 @@ class LiveTrader:
                 'index':     int(row.get('index', 0)),
             })
 
-        # Reset posição virtual do warmup
+        # Descarta posição virtual do warmup
         if self.strategy.position_size != 0:
             log.info(f"  ↩️ Posição virtual do warmup descartada: "
                      f"{self.strategy.position_size:+.6f} ETH "
                      f"@ {self.strategy.position_price:.2f}")
 
+        # ── Reset completo de estado pós-warmup ───────────────────────────
         self.strategy.position_size  = 0.0
         self.strategy.position_price = 0.0
         self.strategy._highest       = 0.0
         self.strategy._lowest        = float('inf')
         self.strategy._trail_active  = False
         self.strategy._monitored     = False
-        self.strategy._el            = False
-        self.strategy._es            = False
+
+        # FIX-2: reseta sinais pendentes E o contador live
+        # Garante que a 1ª barra live gere sempre BUY (live_bar_count=1 → ímpar)
         self.strategy._pBuy          = False
         self.strategy._pSell         = False
+        self.strategy._el            = False
+        self.strategy._es            = False
+        self.strategy._buy_prev      = False   # FIX-2: limpa sinal residual do warmup
+        self.strategy._sell_prev     = False   # FIX-2: limpa sinal residual do warmup
+        self.strategy._live_bar_count = 0      # FIX-2: reinicia contador (1ª live = BUY)
+
         self.strategy.net_profit     = 0.0
         self.strategy.balance        = self.strategy.ic
 
@@ -584,15 +604,16 @@ class LiveTrader:
         self._refresh_cache()
         log.info(f"  ✅ Warmup OK | Period={self.strategy.Period} | "
                  f"EC={self.strategy.EC:.2f} | EMA={self.strategy.EMA:.2f} | "
-                 f"buy_prev={self.strategy._buy_prev} sell_prev={self.strategy._sell_prev}")
+                 f"liveBarCount=0 (resetado) | "
+                 f"buy_prev=False sell_prev=False")
 
     @property
     def live_pnl(self):
         return self.strategy.net_profit - self._pnl_baseline
 
-    # ─── Busca candles da Bitget ───────────────────────────────────────────────
+    # ─── Busca candles da Bitget ─────────────────────────────────────────────
     def _candle_single(self) -> Optional[List[List]]:
-        """Retorna os dois últimos candles (atual em formação + anterior fechado)."""
+        """Retorna os dois últimos candles — [0]=em formação, [1]=fechado."""
         TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
               "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
         tf = TF.get(TIMEFRAME, "30m")
@@ -617,86 +638,25 @@ class LiveTrader:
             if len(data) < 2:
                 log.debug("  ℹ️ Apenas 1 candle disponível")
                 return None
-            return data   # [atual(index 0), anterior(index 1)] — mais recente primeiro
+            return data   # [mais recente (index 0), anterior (index 1)]
         except Exception as e:
             log.error(f"  ❌ _candle_single erro: {e}")
             return None
 
-    # ─── Helpers de execução ──────────────────────────────────────────────────
+    # ─── Helpers de execução ────────────────────────────────────────────────
     def _paper_close_long(self, price: float, reason: str, ts):
-        """Fecha posição long no paper trader. Seguro se já fechada."""
         pos = self.paper.get_position()
         if pos and pos['side'] == 'long':
             self.paper.close_long(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
 
     def _paper_close_short(self, price: float, reason: str, ts):
-        """Fecha posição short no paper trader. Seguro se já fechada."""
         pos = self.paper.get_position()
         if pos and pos['side'] == 'short':
             self.paper.close_short(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
 
-    # ─── FIX v25: verifica stop imediatamente após entry ──────────────────────
-    def _check_immediate_stop(self, current_candle: Dict, current_ts) -> None:
-        """
-        FIX v25 — Gap do primeiro candle.
-
-        No backtest (engine.py), a entrada ocorre no open do candle e o
-        H/L do MESMO candle já pode acionar o stop (_check_trail usa h/l
-        do bar atual). No live, após a entrada o próximo polling acontece
-        só ~15s depois, criando uma janela cega.
-
-        Solução: chamar update_trailing_live imediatamente após confirmar
-        BUY/SELL, usando o H/L do candle em formação (current_candle).
-
-        O preço de saída é SEMPRE exit_act['price'] (stop_price exato),
-        nunca o ticker 'last' — garantindo paridade com o backtest.
-        """
-        imm_exit = self.strategy.update_trailing_live(
-            high=current_candle['high'],
-            low=current_candle['low'],
-            ts=current_ts,
-        )
-        if not imm_exit:
-            return
-
-        imm_px  = imm_exit['price']
-        imm_qty = imm_exit['qty']
-        imm_rsn = imm_exit.get('exit_reason', 'STOP')
-        imm_act = imm_exit['action']
-
-        log.warning(
-            f"  ⚡ [GAP-FIX] Stop atingido no candle de entrada | "
-            f"{imm_act} @ {imm_px:.2f} | motivo={imm_rsn}"
-        )
-
-        if self._is_paper():
-            if imm_act == 'EXIT_LONG':
-                self._paper_close_long(imm_px, imm_rsn, current_ts)
-            else:
-                self._paper_close_short(imm_px, imm_rsn, current_ts)
-        else:
-            try:
-                if imm_act == 'EXIT_LONG':
-                    self.bitget.close_long(imm_qty, imm_px, imm_rsn)
-                else:
-                    self.bitget.close_short(imm_qty, imm_px, imm_rsn)
-            except Exception as _e:
-                log.error(f"  ❌ gap-fix exit live: {_e}")
-
-        self._cache_pos = None
-        self._cache_bal = self.strategy.balance
-        if self._is_paper():
-            self.paper.balance = self.strategy.balance
-
-        self._add_log(imm_act, imm_px, imm_qty, imm_rsn)
-        log.info(
-            f"  ✅ [GAP-FIX] {imm_act} @ {imm_px:.2f} "
-            f"| {imm_rsn} | bal={self.strategy.balance:.2f}"
-        )
-
-    # ─── Loop principal com logs e watchdog ───────────────────────────────────────
+    # ─── Loop principal ──────────────────────────────────────────────────────
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
         log.info(f"╔══════════════════════════════╗")
@@ -722,13 +682,23 @@ class LiveTrader:
         log.info("  ✅ Pronto. Aguardando candles ao vivo...")
 
         self._running = True
-        last_bar_id   = None
+
+        # ── FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms) ───────
+        # Usa o timestamp do candle fechado (candles[1][0]), não um bar_id
+        # derivado de divisão por duração. Previne reprocessamento do mesmo
+        # candle em polls diferentes.
+        last_processed_closed_ts: Optional[int] = None
+
+        # ── FIX-3/4: flag de candle de entrada ───────────────────────────────
+        # Setado como True após BUY/SELL confirmado.
+        # No PRÓXIMO poll, chama update_trailing_live com is_entry_candle=True
+        # e current_price=ticker → verifica stop contra preço real, não H/L.
+        _pending_entry_check: bool = False
 
         loop_exit_reason = None
 
         while self._running:
             try:
-                # Se a thread principal pediu para parar, sai do loop
                 if not self._running:
                     loop_exit_reason = "stop() chamado"
                     break
@@ -764,19 +734,41 @@ class LiveTrader:
                     time.sleep(15)
                     continue
 
-                # ── 1. Trailing stop intra-barra ───────────────────────────
-                exit_act = self.strategy.update_trailing_live(
-                    high=current_candle['high'],
-                    low=current_candle['low'],
-                    ts=current_ts,
-                )
-                if exit_act:
-                    side_exit = exit_act['action']
-                    qty_exit  = exit_act['qty']
-                    px_exit   = exit_act['price']
-                    rsn_exit  = exit_act.get('exit_reason', 'STOP')
+                # ── 1. Trailing stop intra-barra ──────────────────────────
+                # FIX-3/4: se acabamos de entrar (_pending_entry_check=True),
+                # usa is_entry_candle=True com current_price=ticker.
+                # Isso impede saída falsa por H/L histórico anterior ao fill.
+                # Nas iterações seguintes, usa H/L normalmente.
+                with self._pos_lock:
+                    if _pending_entry_check:
+                        # Obtém ticker para verificação do stop no candle de entrada
+                        ticker_px = self._mark_price()
+                        log.debug(
+                            f"  🔍 [ENTRY-CHECK] ticker={ticker_px:.2f} "
+                            f"stop_L={self.strategy.long_stop:.2f} "
+                            f"stop_S={self.strategy.short_stop:.2f}"
+                        )
+                        exit_act = self.strategy.update_trailing_live(
+                            high=current_candle['high'],
+                            low=current_candle['low'],
+                            ts=current_ts,
+                            is_entry_candle=True,
+                            current_price=ticker_px,
+                        )
+                        _pending_entry_check = False  # consumida, independente de saída
+                    else:
+                        exit_act = self.strategy.update_trailing_live(
+                            high=current_candle['high'],
+                            low=current_candle['low'],
+                            ts=current_ts,
+                        )
 
-                    with self._pos_lock:
+                    if exit_act:
+                        side_exit = exit_act['action']
+                        qty_exit  = exit_act['qty']
+                        px_exit   = exit_act['price']
+                        rsn_exit  = exit_act.get('exit_reason', 'STOP')
+
                         if self._is_paper():
                             if side_exit == 'EXIT_LONG':
                                 self._paper_close_long(px_exit, rsn_exit, current_ts)
@@ -800,20 +792,28 @@ class LiveTrader:
                         log.info(f"  ✅ EXIT intra-barra | {side_exit} @ {px_exit:.2f} "
                                  f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}")
 
-                # ── 2. Detectar novo candle fechado ────────────────────────
-                current_bar_id = int(current[0]) // (30 * 60 * 1000)
-                if last_bar_id is None:
-                    last_bar_id = current_bar_id
+                # ── 2. Detectar novo candle fechado (FIX-1) ───────────────
+                # Usa o timestamp REAL do candle fechado (candles[1][0]).
+                # Só processa se prev_ts_raw > last_processed_closed_ts
+                # → elimina processamento duplicado causado por polls repetidos.
+                prev = candles[1]
+                if len(prev) < 5:
+                    log.warning("  ⚠️ Candle anterior mal formatado")
+                    time.sleep(15)
+                    continue
 
-                if current_bar_id != last_bar_id:
-                    prev = candles[1]
-                    if len(prev) < 5:
-                        log.warning("  ⚠️ Candle anterior mal formatado")
-                        last_bar_id = current_bar_id
-                        continue
+                try:
+                    prev_ts_raw = int(prev[0])
+                except (ValueError, IndexError) as e:
+                    log.warning(f"  ⚠️ Erro ao extrair timestamp do candle fechado: {e}")
+                    time.sleep(15)
+                    continue
+
+                # FIX-1: condição estrita — somente timestamps novos são processados
+                if last_processed_closed_ts is None or prev_ts_raw > last_processed_closed_ts:
 
                     try:
-                        prev_ts      = datetime.fromtimestamp(int(prev[0]) / 1000, tz=timezone.utc)
+                        prev_ts      = datetime.fromtimestamp(prev_ts_raw / 1000, tz=timezone.utc)
                         closed_candle = {
                             'open':      float(prev[1]),
                             'high':      float(prev[2]),
@@ -824,16 +824,23 @@ class LiveTrader:
                         }
                     except (ValueError, IndexError) as e:
                         log.warning(f"  ⚠️ Erro extração candle fechado: {e}")
-                        last_bar_id = current_bar_id
+                        time.sleep(15)
                         continue
 
                     log.info(
-                        f"  🕯️ Candle fechado: "
+                        f"  🕯️ Novo candle fechado [{prev_ts_raw}]: "
                         f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
                         f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f} "
                         f"@ {prev_ts}"
                     )
 
+                    # FIX-4: fluxo estrito — BUY e EXIT_LONG nunca no mesmo ciclo.
+                    # strategy.next() pode retornar EXIT de uma posição aberta
+                    # (trail/SL do candle fechado) OU um novo BUY/SELL.
+                    # A separação é natural: o trailing stop do candle fechado
+                    # é tratado DENTRO de strategy.next() (via _check_trail),
+                    # e o BUY/SELL resultante executa no OPEN via _exec_open.
+                    # Nenhuma chamada adicional é feita no mesmo ciclo.
                     with self._pos_lock:
                         actions = self.strategy.next(closed_candle)
                         log.info(
@@ -901,7 +908,11 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
-                                        self._check_immediate_stop(current_candle, current_ts)
+                                        # FIX-4: NÃO verifica stop aqui.
+                                        # O monitoramento começa no próximo poll
+                                        # com is_entry_candle=True (FIX-3).
+                                        _pending_entry_check = True
+                                        log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
 
@@ -927,7 +938,9 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
-                                        self._check_immediate_stop(current_candle, current_ts)
+                                        # FIX-4: monitoramento começa no próximo poll
+                                        _pending_entry_check = True
+                                        log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
                                     else:
@@ -954,7 +967,9 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
-                                        self._check_immediate_stop(current_candle, current_ts)
+                                        # FIX-4: monitoramento começa no próximo poll
+                                        _pending_entry_check = True
+                                        log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_short falhou")
 
@@ -980,28 +995,30 @@ class LiveTrader:
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
                                         self._cache_bal = self.strategy.balance
                                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
-                                        self._check_immediate_stop(current_candle, current_ts)
+                                        # FIX-4: monitoramento começa no próximo poll
+                                        _pending_entry_check = True
+                                        log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
                                     else:
                                         log.error("  ❌ bitget.open_short falhou")
 
-                    last_bar_id = current_bar_id
+                    # FIX-1: marca candle como processado após processamento bem-sucedido
+                    last_processed_closed_ts = prev_ts_raw
+                    log.debug(f"  ✔ Candle {prev_ts_raw} marcado como processado")
                     self._refresh_cache()
 
                 time.sleep(15)
 
             except Exception as e:
                 log.error(f"❌ Erro no loop live: {e}\n{traceback.format_exc()}")
-                # Aguarda um pouco antes de tentar novamente para não sobrecarregar
                 time.sleep(60)
-                continue  # volta ao while, mantém _running True
+                continue
 
-        # Quando o loop termina (por stop() ou erro fatal não recuperável)
         if loop_exit_reason:
             log.info(f"🔴 Loop do trader encerrado. Motivo: {loop_exit_reason}")
         else:
-            log.info("🔴 Loop do trader encerrado. (Motivo não especificado)")
+            log.info("🔴 Loop do trader encerrado.")
 
     def _refresh_cache(self):
         px = self._mark_price()
@@ -1012,7 +1029,6 @@ class LiveTrader:
         log.info("🛑 Stop solicitado. Aguardando saída do loop...")
         self._running = False
         self._stop_monitor.disarm()
-        # Aguarda até que o loop termine (até 10s)
         for _ in range(20):
             if not self._running:
                 break
@@ -1458,7 +1474,7 @@ async function poll() {
       lb.innerHTML = d.log.slice(-80).map(l => {
         let cls = '';
         if (/✅|LONG|BUY/.test(l)) cls = 'lg'; else if (/❌|EXIT|SHORT/.test(l)) cls = 'lr';
-        else if (/⚠️|WARN|GAP/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
+        else if (/⚠️|WARN|ENTRY-CHECK/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
         return `<div class="${cls}">${l}</div>`;
       }).join('');
       lb.scrollTop = lb.scrollHeight;
@@ -1633,7 +1649,6 @@ def _thread():
         with _lock:
             _trader   = None
             _starting = False
-        # Libera lock de processo ao final
         _release_lock()
         log.info("🔄 Pronto para re-iniciar")
 
@@ -1697,7 +1712,6 @@ def start():
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
 
-        # Se o usuário clicou manualmente, remove qualquer lock órfão antes de tentar adquirir
         if Path(LOCK_FILE).exists() and _trader is None:
             log.warning("Limpando lock órfão encontrado no início manual.")
             _release_lock()
@@ -1713,7 +1727,6 @@ def start():
 @app.route('/stop', methods=['POST'])
 def stop():
     if _trader: _trader.stop()
-    # Força liberação do lock de processo
     _release_lock()
     return jsonify({"message": "Parado"})
 
@@ -1763,7 +1776,7 @@ def report_page():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-START (apenas se não houver lock ativo e credenciais ok)
+# AUTO-START
 # ═══════════════════════════════════════════════════════════════════════════════
 def _delayed_start():
     global _starting
@@ -1776,7 +1789,6 @@ def _delayed_start():
         if not is_paper and not _creds_ok():
             log.warning("⚠️ Chaves Bitget não configuradas — use o botão Iniciar.")
             return
-        # Tenta adquirir lock de processo
         if not _acquire_lock():
             log.warning("⚠️ Lock de processo já existe. Auto-start ignorado (outro worker rodando?).")
             return
