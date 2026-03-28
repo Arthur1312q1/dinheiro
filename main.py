@@ -34,8 +34,9 @@ FIX-5  Entry Price Parity (Open Price)
     candle atual (current_candle['open']) em vez do ticker em tempo real.
   - Garante paridade exata com o backtest, que também entra no Open.
   - Aplica-se a ambos os modos: Paper Trading e Live (Bitget).
-  - strategy.position_price e _highest/_lowest são sincronizados com
-    este preço de abertura após confirmação da ordem.
+  - strategy.position_price, _highest (long) e _lowest (short) são
+    sincronizados com este preço de abertura após confirmação da ordem,
+    sobrepondo o valor interno calculado por _exec_open no candle fechado.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -820,12 +821,18 @@ class LiveTrader:
                         time.sleep(15)
                         continue
 
+                    # ── FIX-5: preço de entrada = Open do candle ATUAL ────
+                    # current_candle['open'] é o Open da barra que acabou de
+                    # abrir, exatamente o mesmo preço que o backtest usa para
+                    # executar entradas (barra seguinte ao sinal).
+                    entry_open_price = current_candle['open']
+
                     log.info(
                         f"  🕯️ Novo candle fechado [{prev_ts_raw}]: "
                         f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
                         f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f} "
                         f"@ {prev_ts} | "
-                        f"Próximo Open (entrada)={current_candle['open']:.2f}"  # FIX-5: log do Open de entrada
+                        f"Próximo Open (entrada)={entry_open_price:.2f}"
                     )
 
                     with self._pos_lock:
@@ -878,11 +885,12 @@ class LiveTrader:
                                 if a_qty <= 0:
                                     continue
 
+                                # ── FIX-5: preço de entrada = Open do candle atual ──
+                                # Substitui qualquer uso de ticker/last price.
+                                # entry_open_price = current_candle['open'] (definido acima).
+                                px = entry_open_price
+
                                 if self._is_paper():
-                                    # ── FIX-5: entrada no Open do candle atual ──────────────
-                                    # O backtest abre posição no Open da barra seguinte ao sinal.
-                                    # current_candle['open'] é exatamente esse preço.
-                                    px = current_candle['open']
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'long':
                                         log.debug("  BUY ignorado: paper já está long")
@@ -895,9 +903,9 @@ class LiveTrader:
                                              f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.paper.open_long(a_qty, self._cache_bal, px, ts=a_ts)
                                     if r.get("code") == "0":
-                                        # FIX-5: sincroniza position_price e _highest da estratégia
-                                        # com o Open real usado na entrada, sobrepondo o Open do
-                                        # candle fechado que foi usado internamente em _exec_open.
+                                        # FIX-5: sincroniza strategy com o Open real de entrada.
+                                        # Sobrepõe o valor interno de _exec_open (que usou o
+                                        # Open do candle fechado) com o Open do candle atual.
                                         self.strategy.position_price = px
                                         self.strategy._highest       = px
                                         self._add_log("ENTER_LONG", px, qty_f)
@@ -910,11 +918,7 @@ class LiveTrader:
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
 
-                                else:  # LIVE
-                                    # ── FIX-5: entrada no Open do candle atual ──────────────
-                                    # Usa current_candle['open'] em vez do ticker para paridade
-                                    # exata com o backtest.
-                                    px = current_candle['open']
+                                else:  # LIVE (Bitget)
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'long':
                                         log.debug("  BUY ignorado: bitget já está long")
@@ -930,7 +934,7 @@ class LiveTrader:
                                              f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.bitget.open_long(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
-                                        # FIX-5: position_price e _highest já corretos (px = Open)
+                                        # FIX-5: sincroniza strategy com o Open real de entrada.
                                         self.strategy.position_price = px
                                         self.strategy._highest       = px
                                         self._add_log("ENTER_LONG", px, qty_f)
@@ -949,9 +953,10 @@ class LiveTrader:
                                 if a_qty <= 0:
                                     continue
 
+                                # ── FIX-5: preço de entrada = Open do candle atual ──
+                                px = entry_open_price
+
                                 if self._is_paper():
-                                    # ── FIX-5: entrada no Open do candle atual ──────────────
-                                    px = current_candle['open']
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'short':
                                         log.debug("  SELL ignorado: paper já está short")
@@ -964,8 +969,8 @@ class LiveTrader:
                                              f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.paper.open_short(a_qty, self._cache_bal, px, ts=a_ts)
                                     if r.get("code") == "0":
-                                        # FIX-5: sincroniza position_price e _lowest da estratégia
-                                        # com o Open real usado na entrada.
+                                        # FIX-5: sincroniza strategy com o Open real de entrada.
+                                        # Para SHORT: _lowest parte do preço de fill real.
                                         self.strategy.position_price = px
                                         self.strategy._lowest        = px
                                         self._add_log("ENTER_SHORT", px, qty_f)
@@ -978,9 +983,7 @@ class LiveTrader:
                                     else:
                                         log.error("  ❌ paper.open_short falhou")
 
-                                else:  # LIVE
-                                    # ── FIX-5: entrada no Open do candle atual ──────────────
-                                    px = current_candle['open']
+                                else:  # LIVE (Bitget)
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'short':
                                         log.debug("  SELL ignorado: bitget já está short")
@@ -996,7 +999,7 @@ class LiveTrader:
                                              f"(Open do candle atual — paridade backtest)")
                                     r, qty_f = self.bitget.open_short(a_qty, self._cache_bal, px)
                                     if r.get("code") == "00000":
-                                        # FIX-5: position_price e _lowest já corretos (px = Open)
+                                        # FIX-5: sincroniza strategy com o Open real de entrada.
                                         self.strategy.position_price = px
                                         self.strategy._lowest        = px
                                         self._add_log("ENTER_SHORT", px, qty_f)
