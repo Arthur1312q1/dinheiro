@@ -21,6 +21,15 @@
 #          do poll), eliminando saídas falsas por preços anteriores ao fill.
 #    • Início de `_highest`/`_lowest` a partir do preço de fill real
 #      (já garantido por `_open_long`/`_open_short`).
+#
+#  FIX-5 (Entry Price Parity):
+#    • `_open_long` e `_open_short` registram `position_price` com o `price`
+#      recebido. No backtest esse price = candle['open'] (correto).
+#    • No live trading, main.py sobrepõe `strategy.position_price` com
+#      `current_candle['open']` imediatamente após o fill, garantindo
+#      paridade total com o backtest.
+#    • `_highest` (long) e `_lowest` (short) são também atualizados em
+#      main.py para o mesmo preço de abertura.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -353,6 +362,11 @@ class AdaptiveZeroLagEMA:
         """
         Processa um candle (barra fechada).
 
+        No backtest: open_p = candle['open'] é o preço de abertura exato.
+        No live:     main.py sobrepõe position_price/_highest/_lowest com
+                     current_candle['open'] logo após o retorno desta função
+                     (FIX-5), garantindo paridade total.
+
         Returns:
             Lista de dicts com ações executadas nesta barra.
         """
@@ -587,7 +601,9 @@ class AdaptiveZeroLagEMA:
             return None
         self.position_size   =  qty
         self.position_price  =  price
-        # FIX-3: _highest parte exatamente do preço de fill real
+        # FIX-3 / FIX-5: _highest parte do preço de fill real.
+        # No backtest: price = open do candle (correto).
+        # No live: main.py sobrepõe position_price/_highest logo após o retorno.
         self._highest        =  price
         self._lowest         =  float('inf')
         self._trail_active   =  False
@@ -603,7 +619,9 @@ class AdaptiveZeroLagEMA:
             return None
         self.position_size   = -qty
         self.position_price  =  price
-        # FIX-3: _lowest parte exatamente do preço de fill real
+        # FIX-3 / FIX-5: _lowest parte do preço de fill real.
+        # No backtest: price = open do candle (correto).
+        # No live: main.py sobrepõe position_price/_lowest logo após o retorno.
         self._lowest         =  price
         self._highest        =  float('inf')
         self._trail_active   =  False
@@ -700,8 +718,9 @@ class AdaptiveZeroLagEMA:
         if is_entry_candle:
             # ── FIX-3: candle de entrada — usa ticker, não H/L histórico ──
             # _highest/_lowest já foram inicializados ao preço de fill exato
-            # por _open_long/_open_short. Nenhuma atualização do pico aqui
-            # para não contaminar com movimento anterior ao nosso fill.
+            # por _open_long/_open_short (e reconfirmados por main.py via FIX-5).
+            # Nenhuma atualização do pico aqui para não contaminar com
+            # movimento anterior ao nosso fill.
             if current_price <= 0.0:
                 # Sem ticker disponível: não verifica (seguro — próximo poll fará)
                 return None
