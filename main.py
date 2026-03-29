@@ -5,36 +5,15 @@ Render: configurar BITGET_API_KEY, BITGET_SECRET_KEY, BITGET_PASSPHRASE
 CORREÇÕES APLICADAS:
 ══════════════════════════════════════════════════════════════════════
 FIX-1  Duplicate Candle Processing
-  - last_processed_closed_ts rastreia o UNIX-ms do candle fechado.
-  - strategy.next() só é chamado se closed_ts > last_processed_closed_ts.
-  - Remove a lógica de bar_id baseada em divisão por 30 min (hardcoded).
-
 FIX-2  Signal Inversion / State Desync
-  - warmup() reseta explicitamente _buy_prev, _sell_prev e
-    _live_bar_count=0 antes do início live.
-  - _live_bar_count (em adaptive_zero_lag_ema.py) garante que a 1ª
-    barra live sempre gera BUY, independentemente do horário de início.
-
 FIX-3  Intrabar Stop Parity (GAP-FIX)
-  - _check_immediate_stop() REMOVIDA do fluxo de execução.
-  - Após BUY/SELL: _pending_entry_check = True (flag, não execução).
-  - No PRÓXIMO poll do loop, update_trailing_live é chamado com
-    is_entry_candle=True e current_price=ticker, evitando saídas
-    falsas por H/L histórico do candle antes do fill.
-
 FIX-4  Execution Refactoring
-  - Fluxo estrito: Fechamento → Sinal → Ordem → Monitoramento no ticker
-    SEGUINTE.
-  - BUY e EXIT_LONG nunca ocorrem no mesmo ciclo do loop principal.
-  - _pending_entry_check garante que o trailing só começa a monitorar
-    a partir do poll imediatamente após a confirmação do fill.
-
 FIX-5  Candle Open Price Parity
-  - Modo LIVE agora usa a_price (preço de abertura do candle) para
-    registrar a entrada — igual ao modo PAPER e ao backtest.
-  - Antes usava self._mark_price() (ticker atual), que criava divergência
-    entre o preço de entrada registrado na estratégia e o preço real do
-    sinal, afetando cálculo de PnL, trailing stop e stop loss.
+FIX-6  1-Candle Entry Delay (get_pending_orders + confirm_fill)
+  - BUY/SELL de strategy.next() são IGNORADOS no live.
+  - Entradas vêm de get_pending_orders() após processar o candle fechado.
+  - confirm_fill() sincroniza todo o estado da estratégia (elimina
+    overrides manuais de position_price/_highest/_lowest).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -44,7 +23,6 @@ from typing import Optional, Dict, List
 from pathlib import Path
 from flask import Flask, jsonify, request as flask_request
 
-# ── Fuso horário Brasil (Brasília, UTC-3) ─────────────────────────────────────
 BRT = timezone(timedelta(hours=-3))
 
 def brazil_now() -> datetime:
@@ -59,7 +37,6 @@ from data.collector import DataCollector
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('azlema')
 
-# ── Config ────────────────────────────────────────────────────────────────────
 SYMBOL         = "ETH-USDT"
 SYMBOL_ID      = "ETHUSDT"
 TIMEFRAME      = "30m"
@@ -87,7 +64,6 @@ def _sec():      return os.environ.get("BITGET_SECRET_KEY", "").strip()
 def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
-# ── Lock entre processos via arquivo ─────────────────────────────────────────
 LOCK_FILE = "bot.lock"
 
 def _acquire_lock() -> bool:
@@ -111,12 +87,9 @@ def _release_lock():
     except Exception as e:
         log.error(f"Erro ao remover lock: {e}")
 
-# ── Limpeza automática no startup do container ───────────────────────────────
 _release_lock()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HISTORY MANAGER
-# ═══════════════════════════════════════════════════════════════════════════════
+
 class TradeHistoryManager:
     def __init__(self, filepath: str = HISTORY_FILE):
         self.filepath = filepath
@@ -221,9 +194,6 @@ history_mgr  = TradeHistoryManager(HISTORY_FILE)
 backtest_mgr = TradeHistoryManager(BACKTEST_HISTORY_FILE)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PAPER TRADER
-# ═══════════════════════════════════════════════════════════════════════════════
 class PaperTrader:
     def __init__(self, initial_balance: float = PAPER_BALANCE):
         self.balance   = initial_balance
@@ -293,15 +263,12 @@ class PaperTrader:
     def get_balance(self):  return self.balance
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# BITGET CLIENT (real trading — 95% do saldo)
-# ═══════════════════════════════════════════════════════════════════════════════
 class Bitget:
     BASE         = "https://api.bitget.com"
     SYMBOL       = "ETHUSDT"
     PRODUCT_TYPE = "usdt-futures"
     MARGIN       = "USDT"
-    CT_VAL       = 0.01    # 1 contrato = 0.01 ETH
+    CT_VAL       = 0.01
 
     def _sign(self, ts, method, path, body=""):
         msg = ts + method.upper() + path + body
@@ -491,9 +458,6 @@ class Bitget:
         return bal, px
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# REAL-TIME STOP MONITOR (mantido para compatibilidade)
-# ═══════════════════════════════════════════════════════════════════════════════
 class RealTimeStopMonitor:
     def __init__(self, trader: 'LiveTrader'):
         self.trader  = trader
@@ -508,9 +472,6 @@ class RealTimeStopMonitor:
         self._active = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LIVE TRADER
-# ═══════════════════════════════════════════════════════════════════════════════
 class LiveTrader:
     def __init__(self):
         self._paper_mode = get_paper_mode()
@@ -555,7 +516,6 @@ class LiveTrader:
             "reason": reason,
         })
 
-    # ─── Warmup ─────────────────────────────────────────────────────────────
     def warmup(self, df: pd.DataFrame):
         self._warming = True
         self._stop_monitor.disarm()
@@ -575,13 +535,11 @@ class LiveTrader:
                 'index':     int(row.get('index', 0)),
             })
 
-        # Descarta posição virtual do warmup
         if self.strategy.position_size != 0:
             log.info(f"  ↩️ Posição virtual do warmup descartada: "
                      f"{self.strategy.position_size:+.6f} ETH "
                      f"@ {self.strategy.position_price:.2f}")
 
-        # ── Reset completo de estado pós-warmup ───────────────────────────
         self.strategy.position_size  = 0.0
         self.strategy.position_price = 0.0
         self.strategy._highest       = 0.0
@@ -589,7 +547,6 @@ class LiveTrader:
         self.strategy._trail_active  = False
         self.strategy._monitored     = False
 
-        # FIX-2: reseta sinais pendentes E o contador live
         self.strategy._pBuy          = False
         self.strategy._pSell         = False
         self.strategy._el            = False
@@ -617,9 +574,7 @@ class LiveTrader:
     def live_pnl(self):
         return self.strategy.net_profit - self._pnl_baseline
 
-    # ─── Busca candles da Bitget ─────────────────────────────────────────────
     def _candle_single(self) -> Optional[List[List]]:
-        """Retorna os dois últimos candles — [0]=em formação, [1]=fechado."""
         TF = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
               "1h":"1H","2h":"2H","4h":"4H","6h":"6H","12h":"12H","1d":"1D"}
         tf = TF.get(TIMEFRAME, "30m")
@@ -644,12 +599,11 @@ class LiveTrader:
             if len(data) < 2:
                 log.debug("  ℹ️ Apenas 1 candle disponível")
                 return None
-            return data   # [mais recente (index 0), anterior (index 1)]
+            return data
         except Exception as e:
             log.error(f"  ❌ _candle_single erro: {e}")
             return None
 
-    # ─── Helpers de execução ────────────────────────────────────────────────
     def _paper_close_long(self, price: float, reason: str, ts):
         pos = self.paper.get_position()
         if pos and pos['side'] == 'long':
@@ -662,7 +616,6 @@ class LiveTrader:
             self.paper.close_short(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
 
-    # ─── Loop principal ──────────────────────────────────────────────────────
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
         log.info(f"╔══════════════════════════════╗")
@@ -689,10 +642,10 @@ class LiveTrader:
 
         self._running = True
 
-        # ── FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms) ───────
+        # FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms)
         last_processed_closed_ts: Optional[int] = None
 
-        # ── FIX-3/4: flag de candle de entrada ───────────────────────────────
+        # FIX-3/4: flag de candle de entrada
         _pending_entry_check: bool = False
 
         loop_exit_reason = None
@@ -832,13 +785,11 @@ class LiveTrader:
                             f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}"
                         )
 
+                        # ── PASSO 1: processa APENAS saídas de next() ────────────────
+                        # BUY/SELL retornados aqui referem-se ao OPEN do candle fechado
+                        # (já 30 min no passado) — são IGNORADOS no live.
                         for act in actions:
                             kind    = act.get('action', '')
-                            # ── FIX-5: usa sempre o preço de abertura do candle ──
-                            # a_price vem de _exec_open(op, ts) onde op = candle['open'].
-                            # É o preço real de abertura do candle fechado, idêntico ao
-                            # usado no backtest. Não usar mark_price() aqui — isso causaria
-                            # divergência entre PnL simulado e stop calculado.
                             a_price = float(act.get('price') or 0)
                             a_qty   = float(act.get('qty')   or 0)
                             a_rsn   = act.get('exit_reason', kind)
@@ -876,62 +827,89 @@ class LiveTrader:
                                 log.info(f"  ✅ EXIT_SHORT @ {a_price:.2f} | {a_rsn} "
                                          f"| bal={self.strategy.balance:.2f}")
 
-                            elif kind == 'BUY':
-                                if a_qty <= 0:
-                                    continue
+                            # BUY e SELL são deliberadamente ignorados aqui.
+                            # FIX-6: entradas vêm de get_pending_orders() abaixo.
 
+                        # ── PASSO 2: pega ordens agendadas pelo fechamento deste candle ──
+                        # O sinal gerado ao fechar o candle N fica em _el/_es.
+                        # Executamos ao open do candle N+1 (= current_candle['open']).
+                        # Isso espelha exatamente o que _exec_open() faz no backtest.
+                        pending_orders = self.strategy.get_pending_orders()
+                        if pending_orders:
+                            log.info(
+                                f"  📋 {len(pending_orders)} order(s) pendente(s): "
+                                f"{[o['side'] for o in pending_orders]}"
+                            )
+
+                        for order in pending_orders:
+                            side  = order['side']   # 'BUY' | 'SELL'
+                            o_qty = order['qty']
+                            if o_qty <= 0:
+                                continue
+
+                            # Preço de fill = open do candle em formação (= próximo open)
+                            # Idêntico ao que _exec_open(op, ts) usa no backtest.
+                            fill_px = float(current_candle['open'])
+
+                            if side == 'BUY':
                                 if self._is_paper():
-                                    # PAPER: usa a_price (open do candle) — sem alteração
-                                    px = a_price
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'long':
                                         log.debug("  BUY ignorado: paper já está long")
                                         continue
                                     if pos and pos['side'] == 'short':
                                         log.warning("  ⚠️ BUY: short residual fechado forçado")
-                                        self._paper_close_short(px, 'REVERSAL', a_ts)
+                                        self._paper_close_short(fill_px, 'REVERSAL', current_ts)
 
-                                    log.info(f"  🟢 [PAPER] ENTER LONG {a_qty:.6f} ETH @ {px:.2f}")
-                                    r, qty_f = self.paper.open_long(a_qty, self._cache_bal, px, ts=a_ts)
+                                    log.info(f"  🟢 [PAPER] ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f}")
+                                    r, qty_f = self.paper.open_long(o_qty, self._cache_bal, fill_px, ts=current_ts)
                                     if r.get("code") == "0":
-                                        self._add_log("ENTER_LONG", px, qty_f)
-                                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                                        # FIX-6: confirm_fill sincroniza TODO o estado da estratégia
+                                        close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, current_ts)
+                                        if close_act:
+                                            self._add_log(close_act.get('action', 'REVERSAL'),
+                                                          fill_px, qty_f, 'REVERSAL')
+                                            log.info(f"  ↩️ confirm_fill reversal: "
+                                                     f"{close_act.get('action')} @ {fill_px:.2f}")
+                                        self._add_log("ENTER_LONG", fill_px, qty_f)
+                                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
                                         _pending_entry_check = True
+                                        log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={fill_px:.2f} "
+                                                 f"| bal={self.strategy.balance:.2f}")
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
 
                                 else:
-                                    # ── FIX-5: LIVE — usa a_price (open do candle) ────────
-                                    # A ordem de mercado é enviada à exchange sem preço
-                                    # (market order), mas o preço de referência registrado
-                                    # na estratégia é o open do candle — igual ao backtest.
-                                    # Isso garante paridade de PnL, trailing e stop loss.
-                                    px = a_price
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'long':
                                         log.debug("  BUY ignorado: bitget já está long")
                                         continue
                                     if pos and pos['side'] == 'short':
-                                        log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {px:.2f}")
+                                        log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {fill_px:.2f}")
                                         try:
-                                            self.bitget.close_short(pos['size'], px, "REVERSAL")
+                                            self.bitget.close_short(pos['size'], fill_px, "REVERSAL")
                                         except Exception as _e:
                                             log.error(f"  ❌ reversal close_short: {_e}")
 
-                                    log.info(f"  🟢 LIVE ENTER LONG {a_qty:.6f} ETH @ {px:.2f} "
-                                             f"(open do candle — paridade backtest)")
-                                    r, qty_f = self.bitget.open_long(a_qty, self._cache_bal, px)
+                                    log.info(f"  🟢 LIVE ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f} "
+                                             f"(open do candle N+1 — paridade backtest)")
+                                    r, qty_f = self.bitget.open_long(o_qty, self._cache_bal, fill_px)
                                     if r.get("code") == "00000":
-                                        # Sincroniza estado da estratégia com o open do candle
-                                        self.strategy.position_price = px
-                                        self.strategy._highest       = px
-                                        self._add_log("ENTER_LONG", px, qty_f)
-                                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': px}
+                                        # FIX-6: confirm_fill — sem override manual de estado
+                                        close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, current_ts)
+                                        if close_act:
+                                            self._add_log(close_act.get('action', 'REVERSAL'),
+                                                          fill_px, qty_f, 'REVERSAL')
+                                            log.info(f"  ↩️ confirm_fill reversal: "
+                                                     f"{close_act.get('action')} @ {fill_px:.2f}")
+                                        self._add_log("ENTER_LONG", fill_px, qty_f)
+                                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
-                                        log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={px:.2f}")
+                                        log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={fill_px:.2f} "
+                                                 f"| bal={self.strategy.balance:.2f}")
                                         _pending_entry_check = True
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     elif r.get("code") == "SKIP":
@@ -939,58 +917,65 @@ class LiveTrader:
                                     else:
                                         log.error("  ❌ bitget.open_long falhou")
 
-                            elif kind == 'SELL':
-                                if a_qty <= 0:
-                                    continue
-
+                            elif side == 'SELL':
                                 if self._is_paper():
-                                    # PAPER: usa a_price (open do candle) — sem alteração
-                                    px = a_price
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'short':
                                         log.debug("  SELL ignorado: paper já está short")
                                         continue
                                     if pos and pos['side'] == 'long':
                                         log.warning("  ⚠️ SELL: long residual fechado forçado")
-                                        self._paper_close_long(px, 'REVERSAL', a_ts)
+                                        self._paper_close_long(fill_px, 'REVERSAL', current_ts)
 
-                                    log.info(f"  🔴 [PAPER] ENTER SHORT {a_qty:.6f} ETH @ {px:.2f}")
-                                    r, qty_f = self.paper.open_short(a_qty, self._cache_bal, px, ts=a_ts)
+                                    log.info(f"  🔴 [PAPER] ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f}")
+                                    r, qty_f = self.paper.open_short(o_qty, self._cache_bal, fill_px, ts=current_ts)
                                     if r.get("code") == "0":
-                                        self._add_log("ENTER_SHORT", px, qty_f)
-                                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                                        # FIX-6: confirm_fill sincroniza TODO o estado da estratégia
+                                        close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, current_ts)
+                                        if close_act:
+                                            self._add_log(close_act.get('action', 'REVERSAL'),
+                                                          fill_px, qty_f, 'REVERSAL')
+                                            log.info(f"  ↩️ confirm_fill reversal: "
+                                                     f"{close_act.get('action')} @ {fill_px:.2f}")
+                                        self._add_log("ENTER_SHORT", fill_px, qty_f)
+                                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
                                         self.paper.balance = self.strategy.balance
                                         _pending_entry_check = True
+                                        log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={fill_px:.2f} "
+                                                 f"| bal={self.strategy.balance:.2f}")
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_short falhou")
 
                                 else:
-                                    # ── FIX-5: LIVE — usa a_price (open do candle) ────────
-                                    px = a_price
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'short':
                                         log.debug("  SELL ignorado: bitget já está short")
                                         continue
                                     if pos and pos['side'] == 'long':
-                                        log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {px:.2f}")
+                                        log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {fill_px:.2f}")
                                         try:
-                                            self.bitget.close_long(pos['size'], px, "REVERSAL")
+                                            self.bitget.close_long(pos['size'], fill_px, "REVERSAL")
                                         except Exception as _e:
                                             log.error(f"  ❌ reversal close_long: {_e}")
 
-                                    log.info(f"  🔴 LIVE ENTER SHORT {a_qty:.6f} ETH @ {px:.2f} "
-                                             f"(open do candle — paridade backtest)")
-                                    r, qty_f = self.bitget.open_short(a_qty, self._cache_bal, px)
+                                    log.info(f"  🔴 LIVE ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f} "
+                                             f"(open do candle N+1 — paridade backtest)")
+                                    r, qty_f = self.bitget.open_short(o_qty, self._cache_bal, fill_px)
                                     if r.get("code") == "00000":
-                                        # Sincroniza estado da estratégia com o open do candle
-                                        self.strategy.position_price = px
-                                        self.strategy._lowest        = px
-                                        self._add_log("ENTER_SHORT", px, qty_f)
-                                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': px}
+                                        # FIX-6: confirm_fill — sem override manual de estado
+                                        close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, current_ts)
+                                        if close_act:
+                                            self._add_log(close_act.get('action', 'REVERSAL'),
+                                                          fill_px, qty_f, 'REVERSAL')
+                                            log.info(f"  ↩️ confirm_fill reversal: "
+                                                     f"{close_act.get('action')} @ {fill_px:.2f}")
+                                        self._add_log("ENTER_SHORT", fill_px, qty_f)
+                                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
-                                        log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={px:.2f}")
+                                        log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={fill_px:.2f} "
+                                                 f"| bal={self.strategy.balance:.2f}")
                                         _pending_entry_check = True
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     elif r.get("code") == "SKIP":
@@ -1030,9 +1015,6 @@ class LiveTrader:
         log.info("🛑 Trader parado.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# BACKTEST (via dashboard)
-# ═══════════════════════════════════════════════════════════════════════════════
 def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=1000.0,
                  open_fee_pct=0.0, close_fee_pct=0.0) -> Dict:
     log.info(f"🔬 Backtest: {symbol} {timeframe} {limit} candles | "
@@ -1092,9 +1074,6 @@ def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=
         return {"error": str(e)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FLASK DASHBOARD
-# ═══════════════════════════════════════════════════════════════════════════════
 app       = Flask(__name__)
 _trader:   Optional[LiveTrader] = None
 _lock     = threading.Lock()
@@ -1621,9 +1600,6 @@ async function quickBacktest() {
 </html>"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# THREAD DE EXECUÇÃO
-# ═══════════════════════════════════════════════════════════════════════════════
 def _thread():
     global _trader, _starting
     log.info("📥 Baixando candles Bitget...")
@@ -1647,9 +1623,6 @@ def _thread():
         log.info("🔄 Pronto para re-iniciar")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ROTAS FLASK
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.route('/')
 def index(): return DASH
 
@@ -1769,9 +1742,6 @@ def report_page():
             "📊 Use /backtest/history para ver os dados JSON ou integre com o painel.</h2>")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-START
-# ═══════════════════════════════════════════════════════════════════════════════
 def _delayed_start():
     global _starting
     time.sleep(5)
