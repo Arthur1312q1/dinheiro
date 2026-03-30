@@ -21,6 +21,14 @@
 #          do poll), eliminando saídas falsas por preços anteriores ao fill.
 #    • Início de `_highest`/`_lowest` a partir do preço de fill real
 #      (já garantido por `_open_long`/`_open_short`).
+#
+#  FIX-8 (1-Candle Signal Delay na Estratégia):
+#    • Dentro de `next()`, o bloco "Salva sinais" foi movido para ANTES de
+#      `_sched_entries()`. Isso faz com que `_sched_entries()` leia o sinal
+#      do bar ATUAL (N) em vez do bar anterior (N-1), tornando `_el`/`_es`
+#      disponíveis via `get_pending_orders()` imediatamente após `next()`.
+#    • O comportamento do backtest NÃO é alterado: `_exec_open()` no bar N+1
+#      continua executando entries ao open do bar N+1, como antes.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -405,19 +413,18 @@ class AdaptiveZeroLagEMA:
             if exit_act:
                 actions.append(exit_act)
 
-        # ── CLOSE: Agenda entries ─────────────────────────────────────────
-        if not wu:
-            self._sched_entries()
-
-        # ── Salva sinais para próxima barra ───────────────────────────────
+        # ── FIX-8: Atualiza sinais ANTES de _sched_entries() ─────────────
+        # Movido para cima do _sched_entries() para que o sinal gerado
+        # pelo fechamento do bar N seja imediatamente refletido em _el/_es
+        # via get_pending_orders(), eliminando o delay de 1 candle no live.
+        # O backtest NÃO é afetado: _exec_open() no bar N+1 continua
+        # executando entries ao open do bar N+1, como antes.
         if wu:
             # Durante warmup: usa sinais reais do crossover
             self._buy_prev  = buy_sig
             self._sell_prev = sell_sig
         else:
-            # ── FIX-2: Usa _live_bar_count em vez de _bar % 2 ─────────────
-            # _live_bar_count começa em 0 e é incrementado aqui.
-            # Sempre resetado para 0 no warmup (main.py) → 1ª barra live = BUY.
+            # FIX-2: Usa _live_bar_count em vez de _bar % 2
             self._live_bar_count += 1
             if self._live_bar_count % 2 == 1:   # ímpar → BUY
                 self._buy_prev  = True
@@ -425,6 +432,10 @@ class AdaptiveZeroLagEMA:
             else:                                # par   → SELL
                 self._buy_prev  = False
                 self._sell_prev = True
+
+        # ── CLOSE: Agenda entries (lê sinal do bar ATUAL — FIX-8) ─────────
+        if not wu:
+            self._sched_entries()
 
         # ── Log periódico ─────────────────────────────────────────────────
         if idx % 500 == 0:
