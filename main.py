@@ -10,15 +10,14 @@ FIX-3  Intrabar Stop Parity (GAP-FIX)
 FIX-4  Execution Refactoring
 FIX-5  Candle Open Price Parity
 FIX-6  1-Candle Entry Delay (get_pending_orders + confirm_fill)
-  - BUY/SELL de strategy.next() eram IGNORADOS no live.
-  - Entradas vinham de get_pending_orders() — introduzia delay extra.
-  - confirm_fill() sincroniza todo o estado da estratégia.
-FIX-7  Remoção do delay residual de get_pending_orders()
-  - get_pending_orders() postergava a execução para o poll seguinte,
-    causando delay de 1 barra adicional em relação ao backtest.
-  - BUY/SELL agora processados diretamente do loop de actions com
-    fill_px = current_candle['open'] (open do candle em formação).
-  - Sinal no fechamento de N → fill imediato no open de N+1.
+  - BUY/SELL de strategy.next() são IGNORADOS no live.
+  - Entradas vêm de get_pending_orders() após processar o candle fechado.
+  - confirm_fill() sincroniza todo o estado da estratégia (elimina
+    overrides manuais de position_price/_highest/_lowest).
+FIX-7  Zero-Delay Fill Price
+  - fill_px usa _mark_price() (preço de mercado atual) em vez do
+    open do candle N+1, eliminando o atraso residual de 1 candle
+    na execução de entradas.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -790,13 +789,9 @@ class LiveTrader:
                             f"{[(a.get('action'), round(float(a.get('price') or 0), 2)) for a in actions]}"
                         )
 
-                        # ── Processa todas as ações de next() sem delay ──────────────
-                        # EXIT_*: usa o preço do candle fechado (correto — parou naquele bar).
-                        # BUY/SELL: usa current_candle['open'] como fill, eliminando o
-                        #   delay extra que o get_pending_orders() introduzia ao postergar
-                        #   a execução para o poll seguinte. Sinal no fechamento de N →
-                        #   fill imediato no open de N+1 (= current_candle em formação).
-                        # FIX-7: entradas processadas diretamente de actions (sem 2ª fila).
+                        # ── PASSO 1: processa APENAS saídas de next() ────────────────
+                        # BUY/SELL retornados aqui referem-se ao OPEN do candle fechado
+                        # (já 30 min no passado) — são IGNORADOS no live.
                         for act in actions:
                             kind    = act.get('action', '')
                             a_price = float(act.get('price') or 0)
@@ -836,12 +831,33 @@ class LiveTrader:
                                 log.info(f"  ✅ EXIT_SHORT @ {a_price:.2f} | {a_rsn} "
                                          f"| bal={self.strategy.balance:.2f}")
 
-                            elif kind == 'BUY':
-                                # Fill no open do candle em formação — sem delay de barra.
-                                fill_px = float(current_candle['open'])
-                                o_qty   = a_qty
-                                if o_qty <= 0:
-                                    continue
+                            # BUY e SELL são deliberadamente ignorados aqui.
+                            # FIX-6: entradas vêm de get_pending_orders() abaixo.
+
+                        # ── PASSO 2: pega ordens agendadas pelo fechamento deste candle ──
+                        # O sinal gerado ao fechar o candle N fica em _el/_es.
+                        # Executamos imediatamente ao preço de mercado atual (FIX-7:
+                        # zero-delay — sem esperar o open do candle N+1).
+                        pending_orders = self.strategy.get_pending_orders()
+                        if pending_orders:
+                            log.info(
+                                f"  📋 {len(pending_orders)} order(s) pendente(s): "
+                                f"{[o['side'] for o in pending_orders]}"
+                            )
+
+                        for order in pending_orders:
+                            side  = order['side']   # 'BUY' | 'SELL'
+                            o_qty = order['qty']
+                            if o_qty <= 0:
+                                continue
+
+                            # FIX-7: fill ao preço de mercado atual — sem delay de candle.
+                            # Fallback: close do candle recém-fechado.
+                            fill_px = self._mark_price()
+                            if fill_px <= 0:
+                                fill_px = float(closed_candle['close'])
+
+                            if side == 'BUY':
                                 if self._is_paper():
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'long':
@@ -850,9 +866,11 @@ class LiveTrader:
                                     if pos and pos['side'] == 'short':
                                         log.warning("  ⚠️ BUY: short residual fechado forçado")
                                         self._paper_close_short(fill_px, 'REVERSAL', current_ts)
+
                                     log.info(f"  🟢 [PAPER] ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f}")
                                     r, qty_f = self.paper.open_long(o_qty, self._cache_bal, fill_px, ts=current_ts)
                                     if r.get("code") == "0":
+                                        # FIX-6: confirm_fill sincroniza TODO o estado da estratégia
                                         close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, current_ts)
                                         if close_act:
                                             self._add_log(close_act.get('action', 'REVERSAL'),
@@ -869,6 +887,7 @@ class LiveTrader:
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_long falhou")
+
                                 else:
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'long':
@@ -880,9 +899,12 @@ class LiveTrader:
                                             self.bitget.close_short(pos['size'], fill_px, "REVERSAL")
                                         except Exception as _e:
                                             log.error(f"  ❌ reversal close_short: {_e}")
-                                    log.info(f"  🟢 LIVE ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f}")
+
+                                    log.info(f"  🟢 LIVE ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f} "
+                                             f"(mercado atual — sem delay de candle)")
                                     r, qty_f = self.bitget.open_long(o_qty, self._cache_bal, fill_px)
                                     if r.get("code") == "00000":
+                                        # FIX-6: confirm_fill — sem override manual de estado
                                         close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, current_ts)
                                         if close_act:
                                             self._add_log(close_act.get('action', 'REVERSAL'),
@@ -892,21 +914,16 @@ class LiveTrader:
                                         self._add_log("ENTER_LONG", fill_px, qty_f)
                                         self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
-                                        _pending_entry_check = True
                                         log.info(f"  ✅ LONG confirmado | qty={qty_f:.4f} px={fill_px:.2f} "
                                                  f"| bal={self.strategy.balance:.2f}")
+                                        _pending_entry_check = True
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ LONG ignorado — {r.get('msg')}")
                                     else:
                                         log.error("  ❌ bitget.open_long falhou")
 
-                            elif kind == 'SELL':
-                                # Fill no open do candle em formação — sem delay de barra.
-                                fill_px = float(current_candle['open'])
-                                o_qty   = a_qty
-                                if o_qty <= 0:
-                                    continue
+                            elif side == 'SELL':
                                 if self._is_paper():
                                     pos = self.paper.get_position()
                                     if pos and pos['side'] == 'short':
@@ -915,9 +932,11 @@ class LiveTrader:
                                     if pos and pos['side'] == 'long':
                                         log.warning("  ⚠️ SELL: long residual fechado forçado")
                                         self._paper_close_long(fill_px, 'REVERSAL', current_ts)
+
                                     log.info(f"  🔴 [PAPER] ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f}")
                                     r, qty_f = self.paper.open_short(o_qty, self._cache_bal, fill_px, ts=current_ts)
                                     if r.get("code") == "0":
+                                        # FIX-6: confirm_fill sincroniza TODO o estado da estratégia
                                         close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, current_ts)
                                         if close_act:
                                             self._add_log(close_act.get('action', 'REVERSAL'),
@@ -934,6 +953,7 @@ class LiveTrader:
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     else:
                                         log.error("  ❌ paper.open_short falhou")
+
                                 else:
                                     pos = self.bitget.position()
                                     if pos and pos['side'] == 'short':
@@ -945,9 +965,12 @@ class LiveTrader:
                                             self.bitget.close_long(pos['size'], fill_px, "REVERSAL")
                                         except Exception as _e:
                                             log.error(f"  ❌ reversal close_long: {_e}")
-                                    log.info(f"  🔴 LIVE ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f}")
+
+                                    log.info(f"  🔴 LIVE ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f} "
+                                             f"(mercado atual — sem delay de candle)")
                                     r, qty_f = self.bitget.open_short(o_qty, self._cache_bal, fill_px)
                                     if r.get("code") == "00000":
+                                        # FIX-6: confirm_fill — sem override manual de estado
                                         close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, current_ts)
                                         if close_act:
                                             self._add_log(close_act.get('action', 'REVERSAL'),
@@ -957,9 +980,9 @@ class LiveTrader:
                                         self._add_log("ENTER_SHORT", fill_px, qty_f)
                                         self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
-                                        _pending_entry_check = True
                                         log.info(f"  ✅ SHORT confirmado | qty={qty_f:.4f} px={fill_px:.2f} "
                                                  f"| bal={self.strategy.balance:.2f}")
+                                        _pending_entry_check = True
                                         log.debug("  🔒 [ENTRY-PENDING] monitoramento no próximo poll")
                                     elif r.get("code") == "SKIP":
                                         log.warning(f"  ⛔ SHORT ignorado — {r.get('msg')}")
