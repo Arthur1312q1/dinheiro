@@ -21,6 +21,15 @@
 #          do poll), eliminando saídas falsas por preços anteriores ao fill.
 #    • Início de `_highest`/`_lowest` a partir do preço de fill real
 #      (já garantido por `_open_long`/`_open_short`).
+#
+#  FIX-12 (Mark Price Instantâneo no Trailing Stop — CORREÇÃO 1):
+#    • `update_trailing_live` agora calcula `eff_high` e `eff_low` injetando
+#      `current_price` (mark price em tempo real) nas extremas do candle.
+#    • O gatilho de saída verifica AMBOS: eff_low/eff_high do candle E o
+#      current_price diretamente, garantindo que o stop seja respeitado
+#      mesmo quando o preço cruza o nível entre dois polls de candle REST.
+#    • Elimina dessincronização entre o mark price real e as extremas do candle
+#      que causava atrasos na execução de SL/Trail no modo live.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -663,7 +672,7 @@ class AdaptiveZeroLagEMA:
         self._monitored      = False
 
     # ═══════════════════════════════════════════════════════════════════════
-    # FIX-3: update_trailing_live — com suporte a candle de entrada
+    # FIX-12: update_trailing_live — Mark Price Instantâneo (CORREÇÃO 1)
     # ═══════════════════════════════════════════════════════════════════════
     def update_trailing_live(
         self,
@@ -677,7 +686,7 @@ class AdaptiveZeroLagEMA:
         Versão LIVE do trailing stop — atualiza _highest/_lowest e verifica saída.
 
         NÃO avança _bar, NÃO recalcula IFM/ZLEMA.
-        Chamar a cada ~15 s com o candle ATUAL (incompleto).
+        Chamar a cada ~2 s com posição aberta, ~15 s sem posição.
 
         Args:
             high, low       : H/L do candle em formação (polling contínuo).
@@ -688,8 +697,11 @@ class AdaptiveZeroLagEMA:
                               em vez do H/L histórico do candle para verificar
                               o stop — elimina saídas falsas por preços
                               ocorridos ANTES do fill da ordem.
-            current_price   : preço atual do mercado (ticker/last price).
-                              Obrigatório quando is_entry_candle=True.
+            current_price   : mark price em tempo real (ticker/last).
+                              FIX-12: injetado em eff_high/eff_low para
+                              garantir que o stop seja verificado contra o
+                              preço real, não apenas as extremas do candle REST
+                              que possuem atraso de atualização.
 
         Returns:
             Dict de saída se stop foi atingido, None caso contrário.
@@ -697,12 +709,21 @@ class AdaptiveZeroLagEMA:
         if self.position_size == 0.0 or not self._monitored:
             return None
 
+        # ── FIX-12: Injetar o Mark Price instantâneo nas extremas do candle ──
+        # eff_high = máximo entre o high do candle REST e o preço atual de mercado
+        # eff_low  = mínimo entre o low do candle REST e o preço atual de mercado
+        # Isso garante que, mesmo que o candle REST ainda não tenha atualizado
+        # suas extremas, o stop seja verificado com o preço real mais recente.
+        eff_high = max(high, current_price) if current_price and current_price > 0 else high
+        eff_low  = min(low,  current_price) if current_price and current_price > 0 else low
+        eff_curr = current_price if current_price and current_price > 0 else None
+
         if is_entry_candle:
             # ── FIX-3: candle de entrada — usa ticker, não H/L histórico ──
             # _highest/_lowest já foram inicializados ao preço de fill exato
             # por _open_long/_open_short. Nenhuma atualização do pico aqui
             # para não contaminar com movimento anterior ao nosso fill.
-            if current_price <= 0.0:
+            if not eff_curr:
                 # Sem ticker disponível: não verifica (seguro — próximo poll fará)
                 return None
 
@@ -710,20 +731,20 @@ class AdaptiveZeroLagEMA:
                 # Trail ainda não ativado no candle de entrada (profit=0)
                 stop = self.position_price - self.sl * self.tick
                 self.long_stop = stop
-                if current_price <= stop:
+                if eff_curr <= stop:
                     return self._exit_at(stop, "long", "SL", ts)
 
             elif self.position_size < 0.0:
                 stop = self.position_price + self.sl * self.tick
                 self.short_stop = stop
-                if current_price >= stop:
+                if eff_curr >= stop:
                     return self._exit_at(stop, "short", "SL", ts)
 
             return None
 
-        # ── Poll normal (não-entry): usa H/L do candle em formação ────────
+        # ── Poll normal (não-entry): usa eff_high/eff_low (candle + mark price) ──
         if self.position_size > 0.0:
-            self._highest = max(self._highest, high)
+            self._highest = max(self._highest, eff_high)
             profit_ticks  = (self._highest - self.position_price) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
@@ -736,11 +757,16 @@ class AdaptiveZeroLagEMA:
                 rsn  = "SL"
 
             self.long_stop = stop
-            if low <= stop:
+
+            # FIX-12: gatilho duplo — verifica eff_low (candle+mark) E eff_curr
+            trigger = (eff_low <= stop)
+            if eff_curr:
+                trigger = trigger or (eff_curr <= stop)
+            if trigger:
                 return self._exit_at(stop, "long", rsn, ts)
 
         else:  # position_size < 0
-            self._lowest  = min(self._lowest, low)
+            self._lowest  = min(self._lowest, eff_low)
             profit_ticks  = (self.position_price - self._lowest) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
@@ -753,7 +779,12 @@ class AdaptiveZeroLagEMA:
                 rsn  = "SL"
 
             self.short_stop = stop
-            if high >= stop:
+
+            # FIX-12: gatilho duplo — verifica eff_high (candle+mark) E eff_curr
+            trigger = (eff_high >= stop)
+            if eff_curr:
+                trigger = trigger or (eff_curr >= stop)
+            if trigger:
                 return self._exit_at(stop, "short", rsn, ts)
 
         return None
