@@ -512,6 +512,7 @@ class LiveTrader:
         self._cache_px:  float = 0.0
         self._pos_lock        = threading.Lock()
         self._stop_monitor    = RealTimeStopMonitor(self)
+        self._pending_entry_check = False   # flag para monitoramento após entrada
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -758,7 +759,7 @@ class LiveTrader:
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    self._pending_entry_check = True   # será usado no próximo poll
+                    self._pending_entry_check = True
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -844,20 +845,14 @@ class LiveTrader:
         # FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms)
         last_processed_closed_ts: Optional[int] = None
 
-        # FIX-3/4: flag de candle de entrada
-        self._pending_entry_check: bool = False
-
-        # --------------------------------------------------------------
         # FIX-10: Processar IMEDIATAMENTE o último candle do warmup
         # --------------------------------------------------------------
         last_candle = df.iloc[-1]
         try:
-            # Converte timestamp (datetime ou string) para int ms
             ts_last = last_candle['timestamp']
             if isinstance(ts_last, datetime):
                 ts_last_raw = int(ts_last.timestamp() * 1000)
             else:
-                # assume string
                 ts_last_raw = int(pd.Timestamp(ts_last).timestamp() * 1000)
 
             closed_candle = {
@@ -873,14 +868,12 @@ class LiveTrader:
                      f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
                      f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f}")
 
-            # Processa este candle como se fosse um novo fechado
             new_ts = self._process_closed_candle(closed_candle, ts_last_raw, last_processed_closed_ts)
             if new_ts is not None:
                 last_processed_closed_ts = new_ts
                 log.info(f"  ✔ Candle inicial processado (ts={ts_last_raw})")
             else:
                 log.warning("  ⚠️ Processamento do candle inicial falhou, continuando normalmente")
-
         except Exception as e:
             log.error(f"  ❌ Erro ao processar candle inicial: {e}\n{traceback.format_exc()}")
         # --------------------------------------------------------------
@@ -1318,10 +1311,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-            <table>
-            <thead>  <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
-            <tbody id="lv-trades">  <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
-            </table>
+             <table>
+            <thead> <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
+            <tbody id="lv-trades"> <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
+             </table>
         </div>
       </div>
       <div class="card">
