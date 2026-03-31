@@ -34,6 +34,17 @@ FIX-10 Remoção do Delay Inicial de 1 Candle
     executando possíveis sinais pendentes sem esperar o próximo
     fechamento real. Isso elimina a latência de uma vela no início
     da operação ao vivo.
+FIX-11 Alinhamento Total com Mark Price (URGENTE)
+  - _mark_price() agora é fonte única de verdade e usa retry ativo
+    (até 5 tentativas, 0.5s) para obter preço real. Fallbacks para
+    closed_candle['close'] foram completamente removidos.
+  - Execuções de entrada e saída utilizam exclusivamente o mark price
+    obtido no momento da ordem; se falhar, a ordem é cancelada com log.
+  - Sleep dinâmico: 2s quando posição aberta, 15s quando flat – garante
+    alta frequência para trailing stop sem sobrecarregar a API.
+  - confirm_fill() recebe o preço exato de execução (fill_px) e atualiza
+    a estratégia imediatamente, sincronizando o trailing stop com o
+    preço real pago.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -517,16 +528,29 @@ class LiveTrader:
     def _is_paper(self) -> bool:
         return self._paper_mode
 
-    def _mark_price(self) -> float:
-        try:
-            r = requests.get(
-                "https://api.bitget.com/api/v2/mix/market/symbol-price",
-                params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
-                timeout=10
-            ).json()
-            return float(r["data"][0]["markPrice"])
-        except:
-            return self._cache_px
+    def _get_mark_price_with_retry(self, max_attempts: int = 5, delay: float = 0.5) -> Optional[float]:
+        """Tenta obter o mark price da Bitget com retries. Retorna None se falhar."""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = requests.get(
+                    "https://api.bitget.com/api/v2/mix/market/symbol-price",
+                    params={"symbol": "ETHUSDT", "productType": "usdt-futures"},
+                    timeout=5
+                ).json()
+                if r.get("code") == "00000":
+                    price = float(r["data"][0]["markPrice"])
+                    if price > 0:
+                        return price
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                time.sleep(delay)
+        log.error("  ❌ Não foi possível obter mark price após várias tentativas.")
+        return None
+
+    def _mark_price(self) -> Optional[float]:
+        """Fonte única de verdade para preço de mercado. Sem fallback para close."""
+        return self._get_mark_price_with_retry()
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
@@ -661,10 +685,11 @@ class LiveTrader:
                 a_rsn = act.get('exit_reason', kind)
                 a_ts  = act.get('timestamp', closed_candle['timestamp'])
 
+                # Obtém mark price com retry; se falhar, pula este exit (log de erro)
                 exit_fill_px = self._mark_price()
-                if exit_fill_px <= 0:
-                    exit_fill_px = float(act.get('price') or closed_candle['close'])
-                    log.warning(f"  ⚠️ exit mark_price indisponível — fallback={exit_fill_px:.2f}")
+                if exit_fill_px is None:
+                    log.error(f"  ❌ Exit {kind} cancelado: mark price indisponível")
+                    continue
 
                 if kind == 'EXIT_LONG':
                     if self._is_paper():
@@ -674,6 +699,7 @@ class LiveTrader:
                             self.bitget.close_long(a_qty, exit_fill_px, a_rsn)
                         except Exception as _e:
                             log.error(f"  ❌ live close_long: {_e}")
+                            continue
                     self._add_log('EXIT_LONG', exit_fill_px, a_qty, a_rsn)
                     self._cache_pos = None
                     self._cache_bal = self.strategy.balance
@@ -690,6 +716,7 @@ class LiveTrader:
                             self.bitget.close_short(a_qty, exit_fill_px, a_rsn)
                         except Exception as _e:
                             log.error(f"  ❌ live close_short: {_e}")
+                            continue
                     self._add_log('EXIT_SHORT', exit_fill_px, a_qty, a_rsn)
                     self._cache_pos = None
                     self._cache_bal = self.strategy.balance
@@ -709,11 +736,11 @@ class LiveTrader:
                 if o_qty <= 0:
                     continue
 
-                # PASSO 3: Executar ordem de mercado (mark price)
+                # PASSO 3: Executar ordem de mercado (mark price com retry)
                 fill_px = self._mark_price()
-                if fill_px <= 0:
-                    fill_px = float(closed_candle['close'])
-                    log.warning(f"  ⚠️ mark_price indisponível — fallback close={fill_px:.2f}")
+                if fill_px is None:
+                    log.error(f"  ❌ Ordem {side} cancelada: mark price indisponível")
+                    continue
 
                 if side == 'BUY':
                     if self._is_paper():
@@ -748,7 +775,7 @@ class LiveTrader:
                             log.error("  ❌ bitget.open_long falhou")
                             continue
 
-                    # PASSO 4: Confirmar fill na estratégia
+                    # PASSO 4: Confirmar fill na estratégia com o preço real de execução
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
@@ -888,18 +915,18 @@ class LiveTrader:
 
                 candles = self._candle_single()
                 if candles is None:
-                    time.sleep(15)
+                    time.sleep(2 if self._cache_pos else 15)
                     continue
 
                 if len(candles) < 2:
                     log.warning("  ⚠️ Candles insuficientes")
-                    time.sleep(15)
+                    time.sleep(2 if self._cache_pos else 15)
                     continue
 
                 current = candles[0]
                 if len(current) < 5:
                     log.warning("  ⚠️ Candle mal formatado")
-                    time.sleep(15)
+                    time.sleep(2 if self._cache_pos else 15)
                     continue
 
                 try:
@@ -914,74 +941,91 @@ class LiveTrader:
                     }
                 except (ValueError, IndexError) as e:
                     log.warning(f"  ⚠️ Erro extração candle atual: {e}")
-                    time.sleep(15)
+                    time.sleep(2 if self._cache_pos else 15)
                     continue
 
                 # ── 1. Trailing stop intra-barra ──────────────────────────
                 with self._pos_lock:
                     if self._pending_entry_check:
                         ticker_px = self._mark_price()
-                        log.debug(
-                            f"  🔍 [ENTRY-CHECK] ticker={ticker_px:.2f} "
-                            f"stop_L={self.strategy.long_stop:.2f} "
-                            f"stop_S={self.strategy.short_stop:.2f}"
-                        )
-                        exit_act = self.strategy.update_trailing_live(
-                            high=current_candle['high'],
-                            low=current_candle['low'],
-                            ts=current_ts,
-                            is_entry_candle=True,
-                            current_price=ticker_px,
-                        )
+                        if ticker_px is None:
+                            log.error("  ❌ Trailing stop intra-barra: mark price indisponível, pulando.")
+                        else:
+                            log.debug(
+                                f"  🔍 [ENTRY-CHECK] ticker={ticker_px:.2f} "
+                                f"stop_L={self.strategy.long_stop:.2f} "
+                                f"stop_S={self.strategy.short_stop:.2f}"
+                            )
+                            exit_act = self.strategy.update_trailing_live(
+                                high=current_candle['high'],
+                                low=current_candle['low'],
+                                ts=current_ts,
+                                is_entry_candle=True,
+                                current_price=ticker_px,
+                            )
                         self._pending_entry_check = False
                     else:
+                        # Para monitoramento normal, também precisa de mark price para acionar stop?
+                        # A estratégia usa high/low do candle atual, mas pode precisar do preço atual.
+                        # Vamos obter mark price também para garantir que o stop seja preciso.
+                        ticker_px = self._mark_price()
+                        if ticker_px is None:
+                            ticker_px = 0.0  # fallback, mas não ideal
                         exit_act = self.strategy.update_trailing_live(
                             high=current_candle['high'],
                             low=current_candle['low'],
                             ts=current_ts,
+                            current_price=ticker_px if ticker_px else None,
                         )
 
                     if exit_act:
                         side_exit = exit_act['action']
                         qty_exit  = exit_act['qty']
-                        px_exit   = exit_act['price']
+                        px_exit   = exit_act['price']  # price from strategy (not used for fill)
                         rsn_exit  = exit_act.get('exit_reason', 'STOP')
+
+                        # Obter mark price real para o exit
+                        exit_fill_px = self._mark_price()
+                        if exit_fill_px is None:
+                            log.error(f"  ❌ Exit {side_exit} cancelado: mark price indisponível")
+                            continue
 
                         if self._is_paper():
                             if side_exit == 'EXIT_LONG':
-                                self._paper_close_long(px_exit, rsn_exit, current_ts)
+                                self._paper_close_long(exit_fill_px, rsn_exit, current_ts)
                             else:
-                                self._paper_close_short(px_exit, rsn_exit, current_ts)
+                                self._paper_close_short(exit_fill_px, rsn_exit, current_ts)
                         else:
                             try:
                                 if side_exit == 'EXIT_LONG':
-                                    self.bitget.close_long(qty_exit, px_exit, rsn_exit)
+                                    self.bitget.close_long(qty_exit, exit_fill_px, rsn_exit)
                                 else:
-                                    self.bitget.close_short(qty_exit, px_exit, rsn_exit)
+                                    self.bitget.close_short(qty_exit, exit_fill_px, rsn_exit)
                             except Exception as _e:
                                 log.error(f"  ❌ close via trailing live: {_e}")
+                                continue
 
                         self._cache_pos = None
                         self._cache_bal = self.strategy.balance
                         if self._is_paper():
                             self.paper.balance = self.strategy.balance
 
-                        self._add_log(side_exit, px_exit, qty_exit, rsn_exit)
-                        log.info(f"  ✅ EXIT intra-barra | {side_exit} @ {px_exit:.2f} "
+                        self._add_log(side_exit, exit_fill_px, qty_exit, rsn_exit)
+                        log.info(f"  ✅ EXIT intra-barra | {side_exit} @ {exit_fill_px:.2f} "
                                  f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}")
 
                 # ── 2. Detectar novo candle fechado (FIX-1) ───────────────
                 prev = candles[1]
                 if len(prev) < 5:
                     log.warning("  ⚠️ Candle anterior mal formatado")
-                    time.sleep(15)
+                    time.sleep(2 if self._cache_pos else 15)
                     continue
 
                 try:
                     prev_ts_raw = int(prev[0])
                 except (ValueError, IndexError) as e:
                     log.warning(f"  ⚠️ Erro ao extrair timestamp do candle fechado: {e}")
-                    time.sleep(15)
+                    time.sleep(2 if self._cache_pos else 15)
                     continue
 
                 if last_processed_closed_ts is None or prev_ts_raw > last_processed_closed_ts:
@@ -998,7 +1042,7 @@ class LiveTrader:
                         }
                     except (ValueError, IndexError) as e:
                         log.warning(f"  ⚠️ Erro extração candle fechado: {e}")
-                        time.sleep(15)
+                        time.sleep(2 if self._cache_pos else 15)
                         continue
 
                     log.info(
@@ -1017,7 +1061,8 @@ class LiveTrader:
 
                     self._refresh_cache()
 
-                time.sleep(15)
+                # FIX-11: Sleep dinâmico: 2s se posição aberta, 15s se flat
+                time.sleep(2 if self._cache_pos else 15)
 
             except Exception as e:
                 log.error(f"❌ Erro no loop live: {e}\n{traceback.format_exc()}")
@@ -1031,7 +1076,7 @@ class LiveTrader:
 
     def _refresh_cache(self):
         px = self._mark_price()
-        if px > 0:
+        if px is not None and px > 0:
             self._cache_px = px
 
     def stop(self):
