@@ -45,6 +45,18 @@ FIX-11 Alinhamento Total com Mark Price (URGENTE)
   - confirm_fill() recebe o preço exato de execução (fill_px) e atualiza
     a estratégia imediatamente, sincronizando o trailing stop com o
     preço real pago.
+FIX-12 Mark Price Instantâneo no Trailing Stop (CORREÇÃO 1 — strategy)
+  - update_trailing_live injeta current_price em eff_high/eff_low,
+    garantindo que o stop seja verificado contra o mark price real
+    e não apenas as extremas do candle REST (que têm atraso).
+  - Gatilho duplo: eff_low/eff_high (candle + mark) E eff_curr direto.
+FIX-13 Fallback Seguro no Exit Intra-Barra (CORREÇÃO 2 — main)
+  - Eliminada chamada redundante a _mark_price() dentro do bloco
+    if exit_act (trailing stop intra-barra).
+  - exit_fill_px reutiliza ticker_px (já obtido como gatilho do stop)
+    ou cai para px_exit (preço do stop calculado pela estratégia).
+  - Evita cancelamento indevido de saídas por falha de rede ao tentar
+    um segundo pull de mark price que não é necessário.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -950,45 +962,43 @@ class LiveTrader:
                         ticker_px = self._mark_price()
                         if ticker_px is None:
                             log.error("  ❌ Trailing stop intra-barra: mark price indisponível, pulando.")
+                            ticker_px = 0.0
                         else:
                             log.debug(
                                 f"  🔍 [ENTRY-CHECK] ticker={ticker_px:.2f} "
                                 f"stop_L={self.strategy.long_stop:.2f} "
                                 f"stop_S={self.strategy.short_stop:.2f}"
                             )
-                            exit_act = self.strategy.update_trailing_live(
-                                high=current_candle['high'],
-                                low=current_candle['low'],
-                                ts=current_ts,
-                                is_entry_candle=True,
-                                current_price=ticker_px,
-                            )
-                        self._pending_entry_check = False
-                    else:
-                        # Para monitoramento normal, também precisa de mark price para acionar stop?
-                        # A estratégia usa high/low do candle atual, mas pode precisar do preço atual.
-                        # Vamos obter mark price também para garantir que o stop seja preciso.
-                        ticker_px = self._mark_price()
-                        if ticker_px is None:
-                            ticker_px = 0.0  # fallback, mas não ideal
                         exit_act = self.strategy.update_trailing_live(
                             high=current_candle['high'],
                             low=current_candle['low'],
                             ts=current_ts,
-                            current_price=ticker_px if ticker_px else None,
+                            is_entry_candle=True,
+                            current_price=ticker_px,
+                        )
+                        self._pending_entry_check = False
+                    else:
+                        # Poll normal: obtém mark price para injetar nas extremas do candle
+                        ticker_px = self._mark_price()
+                        if ticker_px is None:
+                            ticker_px = 0.0
+                        exit_act = self.strategy.update_trailing_live(
+                            high=current_candle['high'],
+                            low=current_candle['low'],
+                            ts=current_ts,
+                            current_price=ticker_px,
                         )
 
                     if exit_act:
                         side_exit = exit_act['action']
                         qty_exit  = exit_act['qty']
-                        px_exit   = exit_act['price']  # price from strategy (not used for fill)
+                        px_exit   = exit_act['price']  # preço do stop calculado pela estratégia
                         rsn_exit  = exit_act.get('exit_reason', 'STOP')
 
-                        # Obter mark price real para o exit
-                        exit_fill_px = self._mark_price()
-                        if exit_fill_px is None:
-                            log.error(f"  ❌ Exit {side_exit} cancelado: mark price indisponível")
-                            continue
+                        # ── FIX-13 / CORREÇÃO 2: Reutiliza ticker_px já obtido como gatilho ──
+                        # Não forçamos um novo pull de mark price. Se a rede falhar,
+                        # usamos o ticker anterior ou o preço do stop para não perder a sincronia.
+                        exit_fill_px = ticker_px if (ticker_px and ticker_px > 0) else px_exit
 
                         if self._is_paper():
                             if side_exit == 'EXIT_LONG':
