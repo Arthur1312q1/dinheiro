@@ -30,6 +30,14 @@
 #      mesmo quando o preço cruza o nível entre dois polls de candle REST.
 #    • Elimina dessincronização entre o mark price real e as extremas do candle
 #      que causava atrasos na execução de SL/Trail no modo live.
+#
+#  FIX-14 (Rastreamento Pós-Fill + Limpeza de Stops Obsoletos):
+#    • is_entry_candle=True agora atualiza _highest/_lowest com current_price
+#      (mark price pós-fill), ativando trailing precocemente se o preço mover
+#      o suficiente antes do próximo poll de candle. Antes: verificava APENAS
+#      o SL inicial, perdendo oportunidade de rastreamento imediato.
+#    • long_stop/short_stop são zerados quando position_size == 0, evitando
+#      que o main.py leia valores residuais de trades anteriores.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -672,7 +680,7 @@ class AdaptiveZeroLagEMA:
         self._monitored      = False
 
     # ═══════════════════════════════════════════════════════════════════════
-    # FIX-12: update_trailing_live — Mark Price Instantâneo (CORREÇÃO 1)
+    # FIX-12 / FIX-14: update_trailing_live — Mark Price Instantâneo
     # ═══════════════════════════════════════════════════════════════════════
     def update_trailing_live(
         self,
@@ -686,10 +694,10 @@ class AdaptiveZeroLagEMA:
         Versão LIVE do trailing stop — atualiza _highest/_lowest e verifica saída.
 
         NÃO avança _bar, NÃO recalcula IFM/ZLEMA.
-        Chamar a cada ~2 s com posição aberta, ~15 s sem posição.
+        Chamar a cada ~1 s com posição aberta, ~15 s sem posição.
 
         Args:
-            high, low       : H/L do candle em formação (polling contínuo).
+            high, low       : H/L do candle em formação (cache do último fetch).
             ts              : timestamp do poll.
             is_entry_candle : True apenas no primeiro poll APÓS confirmação
                               de uma nova entrada (FIX-3 / FIX-4).
@@ -707,6 +715,10 @@ class AdaptiveZeroLagEMA:
             Dict de saída se stop foi atingido, None caso contrário.
         """
         if self.position_size == 0.0 or not self._monitored:
+            # FIX-14: limpa stops obsoletos quando flat — evita leitura de
+            # valores residuais de trades anteriores pelo main.py.
+            self.long_stop  = 0.0
+            self.short_stop = 0.0
             return None
 
         # ── FIX-12: Injetar o Mark Price instantâneo nas extremas do candle ──
@@ -719,26 +731,48 @@ class AdaptiveZeroLagEMA:
         eff_curr = current_price if current_price and current_price > 0 else None
 
         if is_entry_candle:
-            # ── FIX-3: candle de entrada — usa ticker, não H/L histórico ──
-            # _highest/_lowest já foram inicializados ao preço de fill exato
-            # por _open_long/_open_short. Nenhuma atualização do pico aqui
-            # para não contaminar com movimento anterior ao nosso fill.
+            # ── FIX-3 / FIX-14: candle de entrada — NÃO usa H/L histórico ──
+            # _highest/_lowest foram inicializados ao preço de fill por confirm_fill().
+            # Atualiza apenas com current_price (mark price pós-fill) para rastrear
+            # movimentos favoráveis desde o primeiro poll, sem contaminar com
+            # extremas de velas anteriores ao fill.
             if not eff_curr:
                 # Sem ticker disponível: não verifica (seguro — próximo poll fará)
                 return None
 
             if self.position_size > 0.0:
-                # Trail ainda não ativado no candle de entrada (profit=0)
-                stop = self.position_price - self.sl * self.tick
+                # Permite que _highest cresça com o mark price pós-fill
+                self._highest = max(self._highest, eff_curr)
+                profit_ticks  = (self._highest - self.position_price) / self.tick
+                if profit_ticks >= self.tp:
+                    self._trail_active = True
+
+                if self._trail_active:
+                    stop = self._highest - self.toff * self.tick
+                    rsn  = "TRAIL"
+                else:
+                    stop = self.position_price - self.sl * self.tick
+                    rsn  = "SL"
                 self.long_stop = stop
                 if eff_curr <= stop:
-                    return self._exit_at(stop, "long", "SL", ts)
+                    return self._exit_at(stop, "long", rsn, ts)
 
             elif self.position_size < 0.0:
-                stop = self.position_price + self.sl * self.tick
+                # Permite que _lowest caia com o mark price pós-fill
+                self._lowest = min(self._lowest, eff_curr)
+                profit_ticks = (self.position_price - self._lowest) / self.tick
+                if profit_ticks >= self.tp:
+                    self._trail_active = True
+
+                if self._trail_active:
+                    stop = self._lowest + self.toff * self.tick
+                    rsn  = "TRAIL"
+                else:
+                    stop = self.position_price + self.sl * self.tick
+                    rsn  = "SL"
                 self.short_stop = stop
                 if eff_curr >= stop:
-                    return self._exit_at(stop, "short", "SL", ts)
+                    return self._exit_at(stop, "short", rsn, ts)
 
             return None
 
