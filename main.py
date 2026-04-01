@@ -57,6 +57,30 @@ FIX-13 Fallback Seguro no Exit Intra-Barra (CORREÇÃO 2 — main)
     ou cai para px_exit (preço do stop calculado pela estratégia).
   - Evita cancelamento indevido de saídas por falha de rede ao tentar
     um segundo pull de mark price que não é necessário.
+FIX-14 Loop de Trailing Stop Desacoplado do Fetch de Candle (URGENTE)
+  - O trailing stop intra-barra agora é verificado em TODA iteração do
+    loop quando há posição aberta (position_size != 0), ANTES do fetch
+    de candle. Anteriormente, qualquer falha ou `continue` no fetch
+    (candles is None, len < 2, etc.) pulava silenciosamente a verificação
+    de stop, permitindo que posições ficassem abertas além do stop loss.
+  - sleep_secs reduzido para 1 s quando em posição (antes: 2 s).
+  - _mark_price_fast() adicionado: 2 tentativas × 0.2 s = max 0.4 s
+    de bloqueio (vs 2.5 s do _mark_price completo), reduzindo latência
+    total do loop de ~5-7 s para ~1.5-2.5 s por iteração.
+  - Cache _forming_high/_forming_low: H/L do candle em formação é
+    guardado após cada fetch bem-sucedido e reutilizado pelo trailing
+    stop nas iterações onde o fetch falha. Na primeira iteração
+    (valores default 0 / inf), o current_price (mark price) cobre
+    ambas as extremas via FIX-12 (eff_high/eff_low).
+  - Após EXIT intra-barra, o cache forming é resetado para garantir
+    que a próxima posição comece com extremas limpas.
+  - Stops obsoletos (long_stop/short_stop) são zerados em
+    update_trailing_live quando position_size == 0 — evita leitura
+    de valores residuais de trades anteriores pelo main.py.
+  - is_entry_candle=True agora rastreia movimentos pós-fill favoráveis
+    atualizando _highest/_lowest com current_price, permitindo ativação
+    precoce do trailing se o preço mover o suficiente antes do próximo
+    poll de candle (poll de ~1 s vs espera de fechamento de barra).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -537,6 +561,12 @@ class LiveTrader:
         self._stop_monitor    = RealTimeStopMonitor(self)
         self._pending_entry_check = False   # flag para monitoramento após entrada
 
+        # FIX-14: Cache do candle em formação — necessário para trailing stop
+        # independente do sucesso do fetch de candle (loop desacoplado)
+        self._forming_high: float = 0.0
+        self._forming_low:  float = float('inf')
+        self._forming_ts           = None
+
     def _is_paper(self) -> bool:
         return self._paper_mode
 
@@ -563,6 +593,13 @@ class LiveTrader:
     def _mark_price(self) -> Optional[float]:
         """Fonte única de verdade para preço de mercado. Sem fallback para close."""
         return self._get_mark_price_with_retry()
+
+    def _mark_price_fast(self) -> Optional[float]:
+        """
+        Versão rápida para polling de trailing stop intra-barra.
+        2 tentativas × 0.2 s = max 0.4 s de bloqueio (vs 2.5 s do _mark_price completo).
+        """
+        return self._get_mark_price_with_retry(max_attempts=2, delay=0.2)
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
@@ -925,123 +962,128 @@ class LiveTrader:
                     loop_exit_reason = "stop() chamado"
                     break
 
+                # ── PRIORIDADE 1: Trailing stop intra-barra ───────────────────────
+                # Executado a CADA iteração quando há posição aberta, independente
+                # do sucesso do fetch de candle. Usa _mark_price_fast (2 tentativas,
+                # 0.2 s) para manter latência baixa no loop de 1 s.
+                has_position = self.strategy.position_size != 0
+                sleep_secs   = 1 if has_position else 15
+
+                if has_position:
+                    ticker_px = self._mark_price_fast()
+                    if ticker_px and ticker_px > 0:
+                        self._cache_px = ticker_px
+                    else:
+                        ticker_px = 0.0
+
+                    log.debug(
+                        f"  🔍 [TRAIL-POLL] px={ticker_px:.2f} "
+                        f"stop_L={self.strategy.long_stop:.2f} "
+                        f"stop_S={self.strategy.short_stop:.2f} "
+                        f"trail={'ON' if self.strategy._trail_active else 'off'}"
+                    )
+
+                    with self._pos_lock:
+                        is_entry = self._pending_entry_check
+                        exit_act = self.strategy.update_trailing_live(
+                            high=(self._forming_high
+                                  if self._forming_high > 0 else ticker_px),
+                            low=(self._forming_low
+                                 if self._forming_low < float('inf') else ticker_px),
+                            ts=(self._forming_ts
+                                or datetime.now(timezone.utc)),
+                            is_entry_candle=is_entry,
+                            current_price=ticker_px,
+                        )
+                        if is_entry:
+                            self._pending_entry_check = False
+
+                        if exit_act:
+                            side_exit    = exit_act['action']
+                            qty_exit     = exit_act['qty']
+                            px_exit      = exit_act['price']
+                            rsn_exit     = exit_act.get('exit_reason', 'STOP')
+                            # FIX-13: reutiliza ticker_px já obtido como gatilho
+                            exit_fill_px = (ticker_px
+                                            if ticker_px and ticker_px > 0
+                                            else px_exit)
+                            ts_exit      = self._forming_ts or datetime.now(timezone.utc)
+
+                            if self._is_paper():
+                                if side_exit == 'EXIT_LONG':
+                                    self._paper_close_long(exit_fill_px, rsn_exit, ts_exit)
+                                else:
+                                    self._paper_close_short(exit_fill_px, rsn_exit, ts_exit)
+                            else:
+                                try:
+                                    if side_exit == 'EXIT_LONG':
+                                        self.bitget.close_long(qty_exit, exit_fill_px, rsn_exit)
+                                    else:
+                                        self.bitget.close_short(qty_exit, exit_fill_px, rsn_exit)
+                                except Exception as _e:
+                                    log.error(f"  ❌ close via trailing live: {_e}")
+                                    # Não dá continue — deixa a próxima iteração tentar
+                                    # (strategy já resetou position_size, evita dupla ordem)
+
+                            self._cache_pos = None
+                            self._cache_bal = self.strategy.balance
+                            if self._is_paper():
+                                self.paper.balance = self.strategy.balance
+
+                            self._add_log(side_exit, exit_fill_px, qty_exit, rsn_exit)
+                            log.info(
+                                f"  ✅ EXIT intra-barra | {side_exit} @ {exit_fill_px:.2f} "
+                                f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}"
+                            )
+                            # Reseta cache de candle em formação após saída
+                            self._forming_high = 0.0
+                            self._forming_low  = float('inf')
+
+                # ── PRIORIDADE 2: Fetch de candles e detecção de candle fechado ──
                 candles = self._candle_single()
                 if candles is None:
-                    time.sleep(2 if self._cache_pos else 15)
+                    time.sleep(sleep_secs)
                     continue
 
                 if len(candles) < 2:
                     log.warning("  ⚠️ Candles insuficientes")
-                    time.sleep(2 if self._cache_pos else 15)
+                    time.sleep(sleep_secs)
                     continue
 
                 current = candles[0]
+                prev    = candles[1]
+
                 if len(current) < 5:
                     log.warning("  ⚠️ Candle mal formatado")
-                    time.sleep(2 if self._cache_pos else 15)
+                    time.sleep(sleep_secs)
                     continue
 
+                # Atualiza cache do candle em formação (H/L) — usado pelo trailing stop
                 try:
-                    current_ts = datetime.fromtimestamp(int(current[0]) / 1000, tz=timezone.utc)
-                    current_candle = {
-                        'open':      float(current[1]),
-                        'high':      float(current[2]),
-                        'low':       float(current[3]),
-                        'close':     float(current[4]),
-                        'timestamp': current_ts,
-                        'index':     self.strategy._bar + 1,
-                    }
+                    _form_ts = datetime.fromtimestamp(int(current[0]) / 1000, tz=timezone.utc)
+                    self._forming_high = float(current[2])
+                    self._forming_low  = float(current[3])
+                    self._forming_ts   = _form_ts
                 except (ValueError, IndexError) as e:
-                    log.warning(f"  ⚠️ Erro extração candle atual: {e}")
-                    time.sleep(2 if self._cache_pos else 15)
-                    continue
+                    log.warning(f"  ⚠️ Erro extração candle em formação: {e}")
 
-                # ── 1. Trailing stop intra-barra ──────────────────────────
-                with self._pos_lock:
-                    if self._pending_entry_check:
-                        ticker_px = self._mark_price()
-                        if ticker_px is None:
-                            log.error("  ❌ Trailing stop intra-barra: mark price indisponível, pulando.")
-                            ticker_px = 0.0
-                        else:
-                            log.debug(
-                                f"  🔍 [ENTRY-CHECK] ticker={ticker_px:.2f} "
-                                f"stop_L={self.strategy.long_stop:.2f} "
-                                f"stop_S={self.strategy.short_stop:.2f}"
-                            )
-                        exit_act = self.strategy.update_trailing_live(
-                            high=current_candle['high'],
-                            low=current_candle['low'],
-                            ts=current_ts,
-                            is_entry_candle=True,
-                            current_price=ticker_px,
-                        )
-                        self._pending_entry_check = False
-                    else:
-                        # Poll normal: obtém mark price para injetar nas extremas do candle
-                        ticker_px = self._mark_price()
-                        if ticker_px is None:
-                            ticker_px = 0.0
-                        exit_act = self.strategy.update_trailing_live(
-                            high=current_candle['high'],
-                            low=current_candle['low'],
-                            ts=current_ts,
-                            current_price=ticker_px,
-                        )
-
-                    if exit_act:
-                        side_exit = exit_act['action']
-                        qty_exit  = exit_act['qty']
-                        px_exit   = exit_act['price']  # preço do stop calculado pela estratégia
-                        rsn_exit  = exit_act.get('exit_reason', 'STOP')
-
-                        # ── FIX-13 / CORREÇÃO 2: Reutiliza ticker_px já obtido como gatilho ──
-                        # Não forçamos um novo pull de mark price. Se a rede falhar,
-                        # usamos o ticker anterior ou o preço do stop para não perder a sincronia.
-                        exit_fill_px = ticker_px if (ticker_px and ticker_px > 0) else px_exit
-
-                        if self._is_paper():
-                            if side_exit == 'EXIT_LONG':
-                                self._paper_close_long(exit_fill_px, rsn_exit, current_ts)
-                            else:
-                                self._paper_close_short(exit_fill_px, rsn_exit, current_ts)
-                        else:
-                            try:
-                                if side_exit == 'EXIT_LONG':
-                                    self.bitget.close_long(qty_exit, exit_fill_px, rsn_exit)
-                                else:
-                                    self.bitget.close_short(qty_exit, exit_fill_px, rsn_exit)
-                            except Exception as _e:
-                                log.error(f"  ❌ close via trailing live: {_e}")
-                                continue
-
-                        self._cache_pos = None
-                        self._cache_bal = self.strategy.balance
-                        if self._is_paper():
-                            self.paper.balance = self.strategy.balance
-
-                        self._add_log(side_exit, exit_fill_px, qty_exit, rsn_exit)
-                        log.info(f"  ✅ EXIT intra-barra | {side_exit} @ {exit_fill_px:.2f} "
-                                 f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}")
-
-                # ── 2. Detectar novo candle fechado (FIX-1) ───────────────
-                prev = candles[1]
+                # ── Detectar novo candle fechado (FIX-1) ──────────────────────────
                 if len(prev) < 5:
                     log.warning("  ⚠️ Candle anterior mal formatado")
-                    time.sleep(2 if self._cache_pos else 15)
+                    time.sleep(sleep_secs)
                     continue
 
                 try:
                     prev_ts_raw = int(prev[0])
                 except (ValueError, IndexError) as e:
                     log.warning(f"  ⚠️ Erro ao extrair timestamp do candle fechado: {e}")
-                    time.sleep(2 if self._cache_pos else 15)
+                    time.sleep(sleep_secs)
                     continue
 
                 if last_processed_closed_ts is None or prev_ts_raw > last_processed_closed_ts:
 
                     try:
-                        prev_ts      = datetime.fromtimestamp(prev_ts_raw / 1000, tz=timezone.utc)
+                        prev_ts       = datetime.fromtimestamp(prev_ts_raw / 1000, tz=timezone.utc)
                         closed_candle = {
                             'open':      float(prev[1]),
                             'high':      float(prev[2]),
@@ -1052,7 +1094,7 @@ class LiveTrader:
                         }
                     except (ValueError, IndexError) as e:
                         log.warning(f"  ⚠️ Erro extração candle fechado: {e}")
-                        time.sleep(2 if self._cache_pos else 15)
+                        time.sleep(sleep_secs)
                         continue
 
                     log.info(
@@ -1062,7 +1104,9 @@ class LiveTrader:
                         f"@ {prev_ts}"
                     )
 
-                    new_ts = self._process_closed_candle(closed_candle, prev_ts_raw, last_processed_closed_ts)
+                    new_ts = self._process_closed_candle(
+                        closed_candle, prev_ts_raw, last_processed_closed_ts
+                    )
                     if new_ts is not None:
                         last_processed_closed_ts = new_ts
                         log.debug(f"  ✔ Candle {prev_ts_raw} marcado como processado")
@@ -1071,8 +1115,7 @@ class LiveTrader:
 
                     self._refresh_cache()
 
-                # FIX-11: Sleep dinâmico: 2s se posição aberta, 15s se flat
-                time.sleep(2 if self._cache_pos else 15)
+                time.sleep(sleep_secs)
 
             except Exception as e:
                 log.error(f"❌ Erro no loop live: {e}\n{traceback.format_exc()}")
