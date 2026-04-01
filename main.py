@@ -81,6 +81,27 @@ FIX-14 Loop de Trailing Stop Desacoplado do Fetch de Candle (URGENTE)
     atualizando _highest/_lowest com current_price, permitindo ativação
     precoce do trailing se o preço mover o suficiente antes do próximo
     poll de candle (poll de ~1 s vs espera de fechamento de barra).
+FIX-15 Snapshot de Preço Único por Ciclo de Candle (CORREÇÃO FINAL DE LATÊNCIA)
+  - _mark_price() é capturado UMA ÚNICA VEZ por ciclo de candle fechado,
+    imediatamente antes de qualquer envio de ordem (saída ou entrada).
+    Esse snapshot_px é então reutilizado para:
+      (a) bitget.close_long / close_short (exit_px enviado à exchange)
+      (b) paper.close_long / close_short (exit_px simulado)
+      (c) bitget.open_long / open_short (fill_px enviado à exchange)
+      (d) strategy.confirm_fill(fill_px=snapshot_px) — sincroniza trailing stop
+    Isso elimina chamadas redundantes a _mark_price() por ordem (eram N
+    chamadas/ciclo, agora é sempre 1), garante paridade de preço entre
+    o envio da ordem e o confirm_fill, e reduz latência intra-ciclo.
+  - Se snapshot_px não puder ser obtido (mark price indisponível), o ciclo
+    é marcado como processado (ts_raw retornado) mas nenhuma ordem é
+    enviada — evitando ordens sem referência de preço.
+  - Sequência explícita do ciclo de candle fechado:
+      PASSO 1 → strategy.next(closed_candle)     [sinais da estratégia]
+      PASSO 2 → get_pending_orders()             [entradas pendentes]
+      PASSO 3 → snapshot_px = _mark_price()     [único pull de preço]
+      PASSO 4 → executar saídas (exits)         [com snapshot_px]
+      PASSO 5 → executar entradas (pending)     [com snapshot_px]
+      PASSO 6 → confirm_fill(fill_px=snapshot_px) [sincroniza estratégia]
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -481,6 +502,16 @@ class Bitget:
         return r, sz * self.CT_VAL
 
     def close_long(self, qty, exit_px=0, reason="EXIT"):
+        """Fecha posição long na Bitget.
+
+        Args:
+            qty:     quantidade em ETH (convertida para contratos internamente).
+            exit_px: preço REAL de mercado (mark price / ticker_px) capturado
+                     no momento do disparo — NÃO o valor teórico do stop.
+                     Usado somente para registro de PnL no histórico; o
+                     fill real da exchange pode diferir levemente (slippage).
+            reason:  motivo da saída (ex: 'STOP', 'EXIT_LONG', 'REVERSAL').
+        """
         sz = self._cts(qty)
         r  = self._order("sell", True, sz)
         if r.get("code") == "00000":
@@ -493,6 +524,16 @@ class Bitget:
         return r
 
     def close_short(self, qty, exit_px=0, reason="EXIT"):
+        """Fecha posição short na Bitget.
+
+        Args:
+            qty:     quantidade em ETH (convertida para contratos internamente).
+            exit_px: preço REAL de mercado (mark price / ticker_px) capturado
+                     no momento do disparo — NÃO o valor teórico do stop.
+                     Usado somente para registro de PnL no histórico; o
+                     fill real da exchange pode diferir levemente (slippage).
+            reason:  motivo da saída (ex: 'STOP', 'EXIT_SHORT', 'REVERSAL').
+        """
         sz = self._cts(qty)
         r  = self._order("buy", True, sz)
         if r.get("code") == "00000":
@@ -721,24 +762,54 @@ class LiveTrader:
         ou o valor anterior (last_processed_ts) em caso de falha.
         """
         with self._pos_lock:
-            # PASSO 1: Atualizar estratégia com o candle fechado
+            # ── PASSO 1: Atualizar estratégia com o candle fechado ─────────────
             actions = self.strategy.next(closed_candle)
             log.debug(f"  📊 strategy.next() → {len(actions)} ações")
 
-            # Processa saídas (EXIT_LONG / EXIT_SHORT)
-            for act in actions:
-                kind = act.get('action', '')
-                if kind not in ('EXIT_LONG', 'EXIT_SHORT'):
-                    continue
+            # ── PASSO 2: Obter ordens pendentes IMEDIATAMENTE após next() ──────
+            # (FIX-15) Coletadas no mesmo ciclo, sem esperar próxima iteração.
+            pending_orders = self.strategy.get_pending_orders()
+            if pending_orders:
+                log.debug(f"  📋 {len(pending_orders)} ordem(ns) pendente(s)")
+
+            exits = [a for a in actions
+                     if a.get('action') in ('EXIT_LONG', 'EXIT_SHORT')]
+
+            # ── PASSO 3: Snapshot único de Mark Price ─────────────────────────
+            # (FIX-15) _mark_price() chamado UMA VEZ por ciclo, imediatamente
+            # antes do envio de qualquer ordem. O mesmo valor é usado para:
+            #   • bitget/paper close_long|close_short  (exit_px real)
+            #   • bitget/paper open_long|open_short    (fill_px real)
+            #   • strategy.confirm_fill(fill_px=...)   (sincroniza trailing stop)
+            # Isso garante paridade perfeita entre o preço enviado à exchange
+            # e o preço injetado na estratégia, eliminando divergências de PnL.
+            needs_price = bool(exits or pending_orders)
+            snapshot_px: Optional[float] = None
+            if needs_price:
+                snapshot_px = self._mark_price()
+                if snapshot_px is None:
+                    log.error(
+                        "  ❌ [FIX-15] Mark price indisponível — "
+                        f"{len(exits)} saída(s) e {len(pending_orders)} "
+                        "entrada(s) canceladas neste ciclo. "
+                        "Candle marcado como processado para evitar reprocessamento."
+                    )
+                    return ts_raw   # candle consumido; não reprocessar
+                log.info(
+                    f"  📍 [FIX-15] snapshot_px={snapshot_px:.2f} "
+                    f"({len(exits)} saída(s) | {len(pending_orders)} entrada(s))"
+                )
+
+            # ── PASSO 4: Processar saídas com snapshot_px ─────────────────────
+            for act in exits:
+                kind  = act.get('action', '')
                 a_qty = float(act.get('qty') or 0)
                 a_rsn = act.get('exit_reason', kind)
                 a_ts  = act.get('timestamp', closed_candle['timestamp'])
 
-                # Obtém mark price com retry; se falhar, pula este exit (log de erro)
-                exit_fill_px = self._mark_price()
-                if exit_fill_px is None:
-                    log.error(f"  ❌ Exit {kind} cancelado: mark price indisponível")
-                    continue
+                # snapshot_px é o preço real de mercado no milissegundo do envio
+                # da ordem — NÃO o valor teórico do stop da estratégia (FIX-15).
+                exit_fill_px = snapshot_px  # type: ignore[assignment]
 
                 if kind == 'EXIT_LONG':
                     if self._is_paper():
@@ -754,8 +825,8 @@ class LiveTrader:
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    log.info(f"  ✅ EXIT_LONG @ {exit_fill_px:.2f} | {a_rsn} "
-                             f"| bal={self.strategy.balance:.2f}")
+                    log.info(f"  ✅ EXIT_LONG @ {exit_fill_px:.2f} (mark price real) "
+                             f"| {a_rsn} | bal={self.strategy.balance:.2f}")
 
                 elif kind == 'EXIT_SHORT':
                     if self._is_paper():
@@ -771,25 +842,21 @@ class LiveTrader:
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    log.info(f"  ✅ EXIT_SHORT @ {exit_fill_px:.2f} | {a_rsn} "
-                             f"| bal={self.strategy.balance:.2f}")
+                    log.info(f"  ✅ EXIT_SHORT @ {exit_fill_px:.2f} (mark price real) "
+                             f"| {a_rsn} | bal={self.strategy.balance:.2f}")
 
-            # PASSO 2: Obter ordens pendentes (entradas)
-            pending_orders = self.strategy.get_pending_orders()
-            if pending_orders:
-                log.debug(f"  📋 {len(pending_orders)} ordem(ns) pendente(s)")
-
+            # ── PASSO 5 + 6: Executar entradas e confirmar fill ───────────────
+            # fill_px = snapshot_px é o mesmo preço usado no _order() e no
+            # confirm_fill(), garantindo que trailing stop e position_price
+            # da estratégia reflitam o preço real de execução (FIX-15).
             for order in pending_orders:
-                side = order['side']
+                side  = order['side']
                 o_qty = order['qty']
                 if o_qty <= 0:
                     continue
 
-                # PASSO 3: Executar ordem de mercado (mark price com retry)
-                fill_px = self._mark_price()
-                if fill_px is None:
-                    log.error(f"  ❌ Ordem {side} cancelada: mark price indisponível")
-                    continue
+                fill_px = snapshot_px  # type: ignore[assignment]
+                # (fill_px não é None aqui: needs_price=True e snapshot verificado acima)
 
                 if side == 'BUY':
                     if self._is_paper():
@@ -824,7 +891,8 @@ class LiveTrader:
                             log.error("  ❌ bitget.open_long falhou")
                             continue
 
-                    # PASSO 4: Confirmar fill na estratégia com o preço real de execução
+                    # PASSO 6: Confirmar fill na estratégia — mesmo snapshot_px
+                    # usado no open_long acima (FIX-15: paridade garantida)
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
@@ -874,6 +942,7 @@ class LiveTrader:
                             continue
 
                     close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, closed_candle['timestamp'])
+                    # PASSO 6 (SELL): mesmo snapshot_px para estratégia (FIX-15)
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
