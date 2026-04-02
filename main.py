@@ -102,37 +102,9 @@ FIX-15 Snapshot de Preço Único por Ciclo de Candle (CORREÇÃO FINAL DE LATÊN
       PASSO 4 → executar saídas (exits)         [com snapshot_px]
       PASSO 5 → executar entradas (pending)     [com snapshot_px]
       PASSO 6 → confirm_fill(fill_px=snapshot_px) [sincroniza estratégia]
-FIX-16 Sincronização de Relógio (Clock-Sync) — Zero Latency Entry (URGENTE)
-  - Remoção do sleep dinâmico: sleep_secs = 1 / 15 substituído por
-    CONSTANT_SLEEP = 0.5 s fixo — loop sempre preciso, independente
-    de posição aberta ou fechada.
-  - Gatilho por timestamp local: o bot calcula o próximo fechamento com
-    math.ceil(now / tf_secs) * tf_secs, eliminando a dependência do
-    endpoint REST de candles para detectar virada de barra.
-  - 5 prioridades explícitas por iteração do loop:
-      P1 Trailing stop intra-barra   — a cada 0.5 s, com position
-      P2 Pré-fetch de sinal (T−2 s) — strategy.next() antecipado
-      P3 Execução clock (T≤0)       — disparo imediato de ordens
-      P4 Validação REST (T+3 s)     — atualiza cache do novo candle
-      P5 REST fallback               — só se P2/P3 falharam
-  - Pré-fetch (P2): 2 s antes do fechamento, captura mark price,
-    constrói candle sintético (O/H/L do cache + C=mark price) e roda
-    strategy.next() antecipado. Saídas e entradas ficam em memória.
-  - Execução clock (P3): ao cruzar T=0, obtém mark price fresco,
-    chama _execute_clock_orders() e confirma fill — tudo sem REST.
-    Fallback para snapshot do pré-fetch se _mark_price() falhar.
-  - Validação REST (P4): apenas atualiza _forming_open/high/low do
-    novo candle; strategy.next() não é chamado novamente.
-  - REST fallback (P5): somente quando P2 falhou (mark price
-    indisponível no pré-fetch); processa via _process_closed_candle()
-    normal, garantindo que nenhum candle seja perdido.
-  - _execute_clock_orders(): método novo com lógica espelhada ao
-    PASSO 4+5+6 de _process_closed_candle(), porém desacoplado de REST.
-  - _forming_open adicionado ao cache de candle em formação, necessário
-    para construir o candle sintético do pré-fetch.
 ══════════════════════════════════════════════════════════════════════
 """
-import os, hmac, hashlib, base64, json, time, threading, traceback, logging, math, requests
+import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
@@ -164,16 +136,6 @@ STRATEGY_CONFIG = {
     "risk_percent": 0.01, "tick_size": 0.01, "initial_capital": 1000.0,
     "max_lots": 100, "default_period": 20, "warmup_bars": WARMUP_CANDLES,
 }
-
-# ── Clock-Sync: mapeamento de timeframe → segundos ──────────────────────────
-TIMEFRAME_SECS: Dict[str, int] = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
-    "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
-    "6h": 21600, "12h": 43200, "1d": 86400,
-}
-CONSTANT_SLEEP      = 0.5    # sleep fixo do loop principal em segundos (era dinâmico 1 s / 15 s)
-PREFETCH_LEAD_SECS  = 2.0    # antecedência do pré-fetch antes do fechamento (segundos)
-REST_VALIDATE_DELAY = 3.0    # aguarda X s após T=0 para buscar o novo candle via REST
 
 _PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 PAPER_BALANCE  = float(os.environ.get("PAPER_BALANCE", "1000.0"))
@@ -644,7 +606,6 @@ class LiveTrader:
         # independente do sucesso do fetch de candle (loop desacoplado)
         self._forming_high: float = 0.0
         self._forming_low:  float = float('inf')
-        self._forming_open: float = 0.0   # CLOCK-SYNC: open do candle em formação
         self._forming_ts           = None
 
     def _is_paper(self) -> bool:
@@ -999,195 +960,6 @@ class LiveTrader:
             return ts_raw
 
     # ------------------------------------------------------------------
-    # Execução clock-sync: dispara ordens pré-carregadas no instante T=0
-    # ------------------------------------------------------------------
-    def _execute_clock_orders(
-        self,
-        exits:        List[Dict],
-        orders:       List[Dict],
-        exec_px:      float,
-        candle_ts_ms: int,
-    ) -> None:
-        """
-        Dispara saídas e entradas pré-carregadas pelo pre-fetch exatamente
-        quando o relógio local indica que o candle fechou (T=0), sem aguardar
-        a confirmação REST da Bitget.
-
-        Parâmetros:
-            exits        : lista de ações EXIT_LONG / EXIT_SHORT do pré-fetch.
-            orders       : lista de pending orders do pré-fetch.
-            exec_px      : mark price capturado em T=0 (fallback: snapshot do pré-fetch).
-            candle_ts_ms : timestamp predito do candle fechado (UNIX ms).
-
-        Lógica idêntica ao PASSO 4+5+6 de _process_closed_candle(), porém
-        desacoplada de qualquer chamada REST — garante execução de milissegundo.
-        """
-        ts_dt = datetime.fromtimestamp(candle_ts_ms / 1000, tz=timezone.utc)
-
-        # ── SAÍDAS ─────────────────────────────────────────────────────────
-        for act in exits:
-            kind  = act.get('action', '')
-            a_qty = float(act.get('qty') or 0)
-            a_rsn = act.get('exit_reason', kind)
-
-            if kind == 'EXIT_LONG':
-                if self._is_paper():
-                    self._paper_close_long(exec_px, a_rsn, ts_dt)
-                else:
-                    try:
-                        self.bitget.close_long(a_qty, exec_px, a_rsn)
-                    except Exception as _e:
-                        log.error(f"  ❌ [CLOCK] close_long: {_e}")
-                        continue
-                self._add_log('EXIT_LONG', exec_px, a_qty, a_rsn)
-                self._cache_pos = None
-                self._cache_bal = self.strategy.balance
-                if self._is_paper():
-                    self.paper.balance = self.strategy.balance
-                log.info(
-                    f"  ✅ [CLOCK] EXIT_LONG @ {exec_px:.2f} "
-                    f"| {a_rsn} | bal={self.strategy.balance:.2f}"
-                )
-
-            elif kind == 'EXIT_SHORT':
-                if self._is_paper():
-                    self._paper_close_short(exec_px, a_rsn, ts_dt)
-                else:
-                    try:
-                        self.bitget.close_short(a_qty, exec_px, a_rsn)
-                    except Exception as _e:
-                        log.error(f"  ❌ [CLOCK] close_short: {_e}")
-                        continue
-                self._add_log('EXIT_SHORT', exec_px, a_qty, a_rsn)
-                self._cache_pos = None
-                self._cache_bal = self.strategy.balance
-                if self._is_paper():
-                    self.paper.balance = self.strategy.balance
-                log.info(
-                    f"  ✅ [CLOCK] EXIT_SHORT @ {exec_px:.2f} "
-                    f"| {a_rsn} | bal={self.strategy.balance:.2f}"
-                )
-
-        # ── ENTRADAS ───────────────────────────────────────────────────────
-        for order in orders:
-            side  = order['side']
-            o_qty = order['qty']
-            if o_qty <= 0:
-                continue
-
-            fill_px = exec_px
-
-            if side == 'BUY':
-                qty_f = o_qty
-                if self._is_paper():
-                    pos = self.paper.get_position()
-                    if pos and pos['side'] == 'long':
-                        continue
-                    if pos and pos['side'] == 'short':
-                        log.warning("  ⚠️ [CLOCK] BUY: fechando short residual (reversal)")
-                        self._paper_close_short(fill_px, 'REVERSAL', ts_dt)
-                    log.info(f"  🟢 [CLOCK][PAPER] ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f}")
-                    r, qty_f = self.paper.open_long(o_qty, self._cache_bal, fill_px, ts=ts_dt)
-                    if r.get("code") != "0":
-                        log.error("  ❌ [CLOCK] paper.open_long falhou")
-                        continue
-                else:
-                    pos = self.bitget.position()
-                    if pos and pos['side'] == 'long':
-                        continue
-                    if pos and pos['side'] == 'short':
-                        log.info(f"  ↩️ [CLOCK] REVERSAL: fechando SHORT @ {fill_px:.2f}")
-                        try:
-                            self.bitget.close_short(pos['size'], fill_px, "REVERSAL")
-                        except Exception as _e:
-                            log.error(f"  ❌ [CLOCK] reversal close_short: {_e}")
-                    log.info(
-                        f"  🟢 [CLOCK] LIVE ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f} "
-                        "(clock-sync — zero delay)"
-                    )
-                    r, qty_f = self.bitget.open_long(o_qty, self._cache_bal, fill_px)
-                    if r.get("code") == "SKIP":
-                        log.warning(f"  ⛔ [CLOCK] LONG ignorado — {r.get('msg')}")
-                        continue
-                    if r.get("code") != "00000":
-                        log.error("  ❌ [CLOCK] bitget.open_long falhou")
-                        continue
-
-                close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, ts_dt)
-                if close_act:
-                    self._add_log(
-                        close_act.get('action', 'REVERSAL'), fill_px, qty_f, 'REVERSAL')
-                    log.info(
-                        f"  ↩️ [CLOCK] confirm_fill reversal: "
-                        f"{close_act.get('action')} @ {fill_px:.2f}"
-                    )
-                self._add_log("ENTER_LONG", fill_px, qty_f)
-                self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': fill_px}
-                self._cache_bal = self.strategy.balance
-                if self._is_paper():
-                    self.paper.balance = self.strategy.balance
-                self._pending_entry_check = True
-                log.info(
-                    f"  ✅ [CLOCK] LONG confirmado | fill_px={fill_px:.2f} "
-                    f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}"
-                )
-
-            elif side == 'SELL':
-                qty_f = o_qty
-                if self._is_paper():
-                    pos = self.paper.get_position()
-                    if pos and pos['side'] == 'short':
-                        continue
-                    if pos and pos['side'] == 'long':
-                        log.warning("  ⚠️ [CLOCK] SELL: fechando long residual (reversal)")
-                        self._paper_close_long(fill_px, 'REVERSAL', ts_dt)
-                    log.info(f"  🔴 [CLOCK][PAPER] ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f}")
-                    r, qty_f = self.paper.open_short(o_qty, self._cache_bal, fill_px, ts=ts_dt)
-                    if r.get("code") != "0":
-                        log.error("  ❌ [CLOCK] paper.open_short falhou")
-                        continue
-                else:
-                    pos = self.bitget.position()
-                    if pos and pos['side'] == 'short':
-                        continue
-                    if pos and pos['side'] == 'long':
-                        log.info(f"  ↩️ [CLOCK] REVERSAL: fechando LONG @ {fill_px:.2f}")
-                        try:
-                            self.bitget.close_long(pos['size'], fill_px, "REVERSAL")
-                        except Exception as _e:
-                            log.error(f"  ❌ [CLOCK] reversal close_long: {_e}")
-                    log.info(
-                        f"  🔴 [CLOCK] LIVE ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f} "
-                        "(clock-sync — zero delay)"
-                    )
-                    r, qty_f = self.bitget.open_short(o_qty, self._cache_bal, fill_px)
-                    if r.get("code") == "SKIP":
-                        log.warning(f"  ⛔ [CLOCK] SHORT ignorado — {r.get('msg')}")
-                        continue
-                    if r.get("code") != "00000":
-                        log.error("  ❌ [CLOCK] bitget.open_short falhou")
-                        continue
-
-                close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, ts_dt)
-                if close_act:
-                    self._add_log(
-                        close_act.get('action', 'REVERSAL'), fill_px, qty_f, 'REVERSAL')
-                    log.info(
-                        f"  ↩️ [CLOCK] confirm_fill reversal: "
-                        f"{close_act.get('action')} @ {fill_px:.2f}"
-                    )
-                self._add_log("ENTER_SHORT", fill_px, qty_f)
-                self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': fill_px}
-                self._cache_bal = self.strategy.balance
-                if self._is_paper():
-                    self.paper.balance = self.strategy.balance
-                self._pending_entry_check = True
-                log.info(
-                    f"  ✅ [CLOCK] SHORT confirmado | fill_px={fill_px:.2f} "
-                    f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}"
-                )
-
-    # ------------------------------------------------------------------
 
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
@@ -1253,38 +1025,18 @@ class LiveTrader:
 
         loop_exit_reason = None
 
-        # ── CLOCK-SYNC: estado do ciclo preditivo ────────────────────────────
-        # Cada variável cobre exatamente um ciclo candle → reset em ciclo completo.
-        _prefetch_done:         bool  = False   # pré-fetch executado para este candle
-        _prefetch_exits:        list  = []      # saídas coletadas no pré-fetch
-        _prefetch_orders:       list  = []      # entradas coletadas no pré-fetch
-        _prefetch_snapshot_px:  float = 0.0    # mark price do pré-fetch
-        _prefetch_candle_ts_ms: int   = 0       # ts predito (ms) do candle a fechar
-        _clock_executed:        bool  = False   # execução clock disparada
-        _clock_executed_at:     float = 0.0    # unix ts do momento da execução
-        _rest_validated:        bool  = False   # validação REST pós-execução concluída
-
         while self._running:
             try:
                 if not self._running:
                     loop_exit_reason = "stop() chamado"
                     break
 
-                now     = time.time()
-                tf_secs = TIMEFRAME_SECS.get(TIMEFRAME, 1800)
-
-                # ── Relógio local: próximo fechamento do candle ───────────────
-                # Para 30 m, os fechamentos ocorrem exatamente nos múltiplos de
-                # 1800 s na escala Unix: 00:00, 00:30, 01:00, …
-                next_close_unix = math.ceil(now / tf_secs) * tf_secs
-                time_to_close   = next_close_unix - now       # + = falta; - = passou
-                predicted_ts_ms = int(next_close_unix * 1000) # ts do candle fechando
-
-                # ── PRIORIDADE 1: Trailing stop intra-barra ───────────────────
-                # Executa a CADA iteração quando há posição aberta, independente
-                # do sucesso das outras prioridades. Usa _mark_price_fast
-                # (2 tentativas × 0.2 s) para manter latência baixa no loop de 0.5 s.
+                # ── PRIORIDADE 1: Trailing stop intra-barra ───────────────────────
+                # Executado a CADA iteração quando há posição aberta, independente
+                # do sucesso do fetch de candle. Usa _mark_price_fast (2 tentativas,
+                # 0.2 s) para manter latência baixa no loop de 1 s.
                 has_position = self.strategy.position_size != 0
+                sleep_secs   = 1 if has_position else 15
 
                 if has_position:
                     ticker_px = self._mark_price_fast()
@@ -1307,7 +1059,8 @@ class LiveTrader:
                                   if self._forming_high > 0 else ticker_px),
                             low=(self._forming_low
                                  if self._forming_low < float('inf') else ticker_px),
-                            ts=(self._forming_ts or datetime.now(timezone.utc)),
+                            ts=(self._forming_ts
+                                or datetime.now(timezone.utc)),
                             is_entry_candle=is_entry,
                             current_price=ticker_px,
                         )
@@ -1323,7 +1076,7 @@ class LiveTrader:
                             exit_fill_px = (ticker_px
                                             if ticker_px and ticker_px > 0
                                             else px_exit)
-                            ts_exit = self._forming_ts or datetime.now(timezone.utc)
+                            ts_exit      = self._forming_ts or datetime.now(timezone.utc)
 
                             if self._is_paper():
                                 if side_exit == 'EXIT_LONG':
@@ -1338,6 +1091,8 @@ class LiveTrader:
                                         self.bitget.close_short(qty_exit, exit_fill_px, rsn_exit)
                                 except Exception as _e:
                                     log.error(f"  ❌ close via trailing live: {_e}")
+                                    # Não dá continue — deixa a próxima iteração tentar
+                                    # (strategy já resetou position_size, evita dupla ordem)
 
                             self._cache_pos = None
                             self._cache_bal = self.strategy.balance
@@ -1349,235 +1104,87 @@ class LiveTrader:
                                 f"  ✅ EXIT intra-barra | {side_exit} @ {exit_fill_px:.2f} "
                                 f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}"
                             )
-                            # Reseta cache de candle em formação e estado do pré-fetch
+                            # Reseta cache de candle em formação após saída
                             self._forming_high = 0.0
                             self._forming_low  = float('inf')
-                            # Invalida pré-fetch pendente: posição mudou intra-barra
-                            _prefetch_done  = False
-                            _clock_executed = False
-                            _rest_validated = False
 
-                # ── PRIORIDADE 2: PRÉ-FETCH de sinal (T − PREFETCH_LEAD_SECS) ─
-                # Cerca de 2 s antes do fechamento oficial, captura o mark price,
-                # constrói um candle sintético com os dados em formação e roda
-                # strategy.next() antecipado. As ordens resultantes são guardadas
-                # em memória para disparo imediato na PRIORIDADE 3.
-                if (
-                    time_to_close <= PREFETCH_LEAD_SECS
-                    and time_to_close > 0               # candle ainda não fechou
-                    and not _prefetch_done
-                    and predicted_ts_ms != last_processed_closed_ts
-                ):
-                    snap_pre = self._mark_price_fast()
-                    if snap_pre and snap_pre > 0:
-                        # Candle sintético: usa H/L/O do candle em formação
-                        # e o mark price atual como close sintético.
-                        _fo = self._forming_open if self._forming_open > 0 else snap_pre
-                        _fh = (max(self._forming_high, snap_pre)
-                               if self._forming_high > 0 else snap_pre)
-                        _fl = (min(self._forming_low,  snap_pre)
-                               if self._forming_low < float('inf') else snap_pre)
-                        synthetic_candle = {
-                            'open':      _fo,
-                            'high':      _fh,
-                            'low':       _fl,
-                            'close':     snap_pre,
-                            'timestamp': datetime.fromtimestamp(
-                                next_close_unix - tf_secs, tz=timezone.utc),
-                            'index':     self.strategy._bar + 1,
-                        }
+                # ── PRIORIDADE 2: Fetch de candles e detecção de candle fechado ──
+                candles = self._candle_single()
+                if candles is None:
+                    time.sleep(sleep_secs)
+                    continue
 
-                        with self._pos_lock:
-                            pf_actions = self.strategy.next(synthetic_candle)
-                            pf_pending  = self.strategy.get_pending_orders()
+                if len(candles) < 2:
+                    log.warning("  ⚠️ Candles insuficientes")
+                    time.sleep(sleep_secs)
+                    continue
 
-                        _prefetch_exits       = [a for a in pf_actions
-                                                  if a.get('action') in
-                                                  ('EXIT_LONG', 'EXIT_SHORT')]
-                        _prefetch_orders      = pf_pending
-                        _prefetch_snapshot_px = snap_pre
-                        _prefetch_candle_ts_ms = predicted_ts_ms
-                        _prefetch_done        = True
-                        _clock_executed       = False
-                        _rest_validated       = False
+                current = candles[0]
+                prev    = candles[1]
 
-                        log.info(
-                            f"  ⚡ [PRÉ-FETCH T-{time_to_close:.2f}s] "
-                            f"px={snap_pre:.2f} | sintético: "
-                            f"O={_fo:.2f} H={_fh:.2f} L={_fl:.2f} C={snap_pre:.2f} | "
-                            f"{len(_prefetch_exits)} saída(s) | "
-                            f"{len(_prefetch_orders)} entrada(s) pré-carregada(s)"
-                        )
-                    else:
-                        log.warning(
-                            f"  ⚠️ [PRÉ-FETCH T-{time_to_close:.2f}s] mark price "
-                            "indisponível — aguardando REST fallback (P5)"
-                        )
+                if len(current) < 5:
+                    log.warning("  ⚠️ Candle mal formatado")
+                    time.sleep(sleep_secs)
+                    continue
 
-                # ── PRIORIDADE 3: EXECUÇÃO CLOCK (T ≤ 0) ─────────────────────
-                # No instante exato em que o relógio local indica que o candle
-                # fechou, dispara as ordens pré-carregadas com um mark price fresco
-                # obtido agora — ANTES de qualquer confirmação via REST API da Bitget.
-                if (
-                    time_to_close <= 0
-                    and _prefetch_done
-                    and not _clock_executed
-                    and _prefetch_candle_ts_ms != last_processed_closed_ts
-                ):
-                    overshoot_ms = abs(time_to_close) * 1000
-                    log.info(
-                        f"  🕐 [CLOCK-EXEC T+{overshoot_ms:.0f}ms] "
-                        f"Disparando {len(_prefetch_exits)} saída(s) + "
-                        f"{len(_prefetch_orders)} entrada(s) pré-carregada(s)..."
-                    )
+                # Atualiza cache do candle em formação (H/L) — usado pelo trailing stop
+                try:
+                    _form_ts = datetime.fromtimestamp(int(current[0]) / 1000, tz=timezone.utc)
+                    self._forming_high = float(current[2])
+                    self._forming_low  = float(current[3])
+                    self._forming_ts   = _form_ts
+                except (ValueError, IndexError) as e:
+                    log.warning(f"  ⚠️ Erro extração candle em formação: {e}")
 
-                    # Mark price fresco em T=0; fallback para snapshot do pré-fetch
-                    # somente se a chamada falhar (latência de rede crítica).
-                    exec_px = self._mark_price() or _prefetch_snapshot_px
-                    if exec_px and exec_px > 0:
-                        self._execute_clock_orders(
-                            exits        = _prefetch_exits,
-                            orders       = _prefetch_orders,
-                            exec_px      = exec_px,
-                            candle_ts_ms = _prefetch_candle_ts_ms,
-                        )
-                        last_processed_closed_ts = _prefetch_candle_ts_ms
-                        _clock_executed    = True
-                        _clock_executed_at = now
-                        _rest_validated    = False
-                        self._refresh_cache()
-                    else:
-                        log.error(
-                            "  ❌ [CLOCK-EXEC] Mark price indisponível em T=0 — "
-                            "abortando execução clock; REST fallback (P5) assumirá o ciclo"
-                        )
-                        # Reseta pré-fetch para que o REST fallback processe normalmente
-                        _prefetch_done   = False
-                        _prefetch_exits  = []
-                        _prefetch_orders = []
+                # ── Detectar novo candle fechado (FIX-1) ──────────────────────────
+                if len(prev) < 5:
+                    log.warning("  ⚠️ Candle anterior mal formatado")
+                    time.sleep(sleep_secs)
+                    continue
 
-                # ── PRIORIDADE 4: VALIDAÇÃO REST (T + REST_VALIDATE_DELAY) ────
-                # Aguarda REST_VALIDATE_DELAY s após T=0 e busca o candle via REST
-                # somente para atualizar o cache do novo candle em formação
-                # (_forming_open / _forming_high / _forming_low).
-                # IMPORTANTE: strategy.next() NÃO é chamado aqui — o candle já
-                # foi processado no pré-fetch (P2). Apenas sincroniza o estado
-                # do trailing stop e exibe o candle oficial no log.
-                if (
-                    _clock_executed
-                    and not _rest_validated
-                    and (now - _clock_executed_at) >= REST_VALIDATE_DELAY
-                ):
-                    val_candles = self._candle_single()
-                    if val_candles and len(val_candles) >= 2:
-                        val_cur = val_candles[0]   # novo candle em formação
-                        try:
-                            _vts = datetime.fromtimestamp(
-                                int(val_cur[0]) / 1000, tz=timezone.utc)
-                            self._forming_high = float(val_cur[2])
-                            self._forming_low  = float(val_cur[3])
-                            self._forming_open = float(val_cur[1])
-                            self._forming_ts   = _vts
-                            _rest_validated    = True
-                            log.info(
-                                f"  ✅ [REST-VALIDATE] Novo candle em formação: "
-                                f"O={val_cur[1]} H={val_cur[2]} L={val_cur[3]} "
-                                f"| ts={_vts}"
-                            )
-                        except (ValueError, IndexError) as _ve:
-                            log.warning(
-                                f"  ⚠️ [REST-VALIDATE] Extração de candle falhou: {_ve}"
-                            )
-                    # REST ainda não atualizou? Continuará tentando na próxima iteração.
+                try:
+                    prev_ts_raw = int(prev[0])
+                except (ValueError, IndexError) as e:
+                    log.warning(f"  ⚠️ Erro ao extrair timestamp do candle fechado: {e}")
+                    time.sleep(sleep_secs)
+                    continue
 
-                # ── PRIORIDADE 5: REST FALLBACK ───────────────────────────────
-                # Ativado somente quando o pré-fetch falhou (_prefetch_done=False)
-                # e o clock-exec não aconteceu. Processa o candle pela rota REST
-                # clássica (detecta timestamp novo em prev[0]), garantindo que o
-                # bot nunca perca um fechamento por falha do clock-sync.
-                if not _prefetch_done and not _clock_executed:
-                    fb_candles = self._candle_single()
-                    if fb_candles is None or len(fb_candles) < 2:
-                        time.sleep(CONSTANT_SLEEP)
-                        continue
-
-                    fb_cur  = fb_candles[0]
-                    fb_prev = fb_candles[1]
-
-                    # Atualiza cache do candle em formação
-                    if len(fb_cur) >= 5:
-                        try:
-                            _fts = datetime.fromtimestamp(
-                                int(fb_cur[0]) / 1000, tz=timezone.utc)
-                            self._forming_high = float(fb_cur[2])
-                            self._forming_low  = float(fb_cur[3])
-                            self._forming_open = float(fb_cur[1])
-                            self._forming_ts   = _fts
-                        except (ValueError, IndexError) as _fe:
-                            log.warning(f"  ⚠️ [REST-FALLBACK] Candle em formação: {_fe}")
-
-                    if len(fb_prev) < 5:
-                        time.sleep(CONSTANT_SLEEP)
-                        continue
+                if last_processed_closed_ts is None or prev_ts_raw > last_processed_closed_ts:
 
                     try:
-                        fb_prev_ts_raw = int(fb_prev[0])
-                    except (ValueError, IndexError) as _te:
-                        log.warning(f"  ⚠️ [REST-FALLBACK] Timestamp inválido: {_te}")
-                        time.sleep(CONSTANT_SLEEP)
+                        prev_ts       = datetime.fromtimestamp(prev_ts_raw / 1000, tz=timezone.utc)
+                        closed_candle = {
+                            'open':      float(prev[1]),
+                            'high':      float(prev[2]),
+                            'low':       float(prev[3]),
+                            'close':     float(prev[4]),
+                            'timestamp': prev_ts,
+                            'index':     self.strategy._bar + 1,
+                        }
+                    except (ValueError, IndexError) as e:
+                        log.warning(f"  ⚠️ Erro extração candle fechado: {e}")
+                        time.sleep(sleep_secs)
                         continue
 
-                    if (last_processed_closed_ts is None
-                            or fb_prev_ts_raw > last_processed_closed_ts):
-                        try:
-                            fb_prev_dt   = datetime.fromtimestamp(
-                                fb_prev_ts_raw / 1000, tz=timezone.utc)
-                            fb_closed = {
-                                'open':      float(fb_prev[1]),
-                                'high':      float(fb_prev[2]),
-                                'low':       float(fb_prev[3]),
-                                'close':     float(fb_prev[4]),
-                                'timestamp': fb_prev_dt,
-                                'index':     self.strategy._bar + 1,
-                            }
-                        except (ValueError, IndexError) as _ee:
-                            log.warning(f"  ⚠️ [REST-FALLBACK] Extração de candle: {_ee}")
-                            time.sleep(CONSTANT_SLEEP)
-                            continue
+                    log.info(
+                        f"  🕯️ Novo candle fechado [{prev_ts_raw}]: "
+                        f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
+                        f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f} "
+                        f"@ {prev_ts}"
+                    )
 
-                        log.info(
-                            f"  🛟 [REST-FALLBACK] Candle fechado [{fb_prev_ts_raw}]: "
-                            f"O={fb_closed['open']:.2f} H={fb_closed['high']:.2f} "
-                            f"L={fb_closed['low']:.2f} C={fb_closed['close']:.2f} "
-                            f"@ {fb_prev_dt}"
-                        )
-                        new_ts = self._process_closed_candle(
-                            fb_closed, fb_prev_ts_raw, last_processed_closed_ts)
-                        if new_ts is not None:
-                            last_processed_closed_ts = new_ts
-                            log.debug(
-                                f"  ✔ [REST-FALLBACK] Candle {fb_prev_ts_raw} processado")
-                        else:
-                            log.warning(
-                                f"  ⚠️ [REST-FALLBACK] Processamento do candle "
-                                f"{fb_prev_ts_raw} falhou")
-                        self._refresh_cache()
+                    new_ts = self._process_closed_candle(
+                        closed_candle, prev_ts_raw, last_processed_closed_ts
+                    )
+                    if new_ts is not None:
+                        last_processed_closed_ts = new_ts
+                        log.debug(f"  ✔ Candle {prev_ts_raw} marcado como processado")
+                    else:
+                        log.warning(f"  ⚠️ Processamento do candle {prev_ts_raw} falhou")
 
-                # ── Reset: ciclo clock-sync completo ──────────────────────────
-                # Libera o estado somente quando AMBAS as fases terminaram:
-                # execução clock (P3) + validação REST (P4).
-                if _clock_executed and _rest_validated:
-                    _prefetch_done         = False
-                    _prefetch_exits        = []
-                    _prefetch_orders       = []
-                    _prefetch_snapshot_px  = 0.0
-                    _prefetch_candle_ts_ms = 0
-                    _clock_executed        = False
-                    _clock_executed_at     = 0.0
-                    _rest_validated        = False
-                    log.debug("  🔄 [CLOCK-SYNC] Ciclo completo — estado resetado")
+                    self._refresh_cache()
 
-                time.sleep(CONSTANT_SLEEP)
+                time.sleep(sleep_secs)
 
             except Exception as e:
                 log.error(f"❌ Erro no loop live: {e}\n{traceback.format_exc()}")
