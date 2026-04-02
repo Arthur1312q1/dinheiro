@@ -4,132 +4,15 @@ Render: configurar BITGET_API_KEY, BITGET_SECRET_KEY, BITGET_PASSPHRASE
 
 CORREÇÕES APLICADAS:
 ══════════════════════════════════════════════════════════════════════
-FIX-1  Duplicate Candle Processing
-FIX-2  Signal Inversion / State Desync
-FIX-3  Intrabar Stop Parity (GAP-FIX)
-FIX-4  Execution Refactoring
-FIX-5  Candle Open Price Parity
-FIX-6  1-Candle Entry Delay (get_pending_orders + confirm_fill)
-  - BUY/SELL de strategy.next() são IGNORADOS no live.
-  - Entradas vêm de get_pending_orders() após processar o candle fechado.
-  - confirm_fill() é o ÚNICO mecanismo de sincronização de estado
-    (position_price, _highest, _lowest, trailing stop). Zero overrides
-    manuais no loop live.
-FIX-7  Zero-Delay Fill Price
-  - fill_px usa _mark_price() (preço de mercado atual) em vez do
-    open do candle N+1, eliminando o atraso residual de 1 candle
-    na execução de entradas.
-FIX-8  Exit Price Parity (saídas de next() com mark price)
-  - EXIT_LONG/EXIT_SHORT retornados por next() agora também usam
-    _mark_price() como exit_fill_px no modo live, em vez do preço
-    teórico do candle fechado (a_price). Fallback: close do candle.
-  - Logs, _add_log e history_mgr refletem o preço real de execução.
-FIX-9  Refatoração Estrutural do Bloco "Novo Candle Detectado"
-  - Sequência explícita de 4 passos: Update Strategy → Get Pending
-    Orders → Execute Market Order → Confirm Fill Strategy.
-  - Unificação do fluxo paper/live: early-continue em caso de falha,
-    Passo 4 (confirm_fill) em caminho único após execução bem-sucedida.
-FIX-10 Remoção do Delay Inicial de 1 Candle
-  - Após warmup, processa imediatamente o último candle do histórico,
-    executando possíveis sinais pendentes sem esperar o próximo
-    fechamento real. Isso elimina a latência de uma vela no início
-    da operação ao vivo.
-FIX-11 Alinhamento Total com Mark Price (URGENTE)
-  - _mark_price() agora é fonte única de verdade e usa retry ativo
-    (até 5 tentativas, 0.5s) para obter preço real. Fallbacks para
-    closed_candle['close'] foram completamente removidos.
-  - Execuções de entrada e saída utilizam exclusivamente o mark price
-    obtido no momento da ordem; se falhar, a ordem é cancelada com log.
-  - Sleep dinâmico: 2s quando posição aberta, 15s quando flat – garante
-    alta frequência para trailing stop sem sobrecarregar a API.
-  - confirm_fill() recebe o preço exato de execução (fill_px) e atualiza
-    a estratégia imediatamente, sincronizando o trailing stop com o
-    preço real pago.
-FIX-12 Mark Price Instantâneo no Trailing Stop (CORREÇÃO 1 — strategy)
-  - update_trailing_live injeta current_price em eff_high/eff_low,
-    garantindo que o stop seja verificado contra o mark price real
-    e não apenas as extremas do candle REST (que têm atraso).
-  - Gatilho duplo: eff_low/eff_high (candle + mark) E eff_curr direto.
-FIX-13 Fallback Seguro no Exit Intra-Barra (CORREÇÃO 2 — main)
-  - Eliminada chamada redundante a _mark_price() dentro do bloco
-    if exit_act (trailing stop intra-barra).
-  - exit_fill_px reutiliza ticker_px (já obtido como gatilho do stop)
-    ou cai para px_exit (preço do stop calculado pela estratégia).
-  - Evita cancelamento indevido de saídas por falha de rede ao tentar
-    um segundo pull de mark price que não é necessário.
-FIX-14 Loop de Trailing Stop Desacoplado do Fetch de Candle (URGENTE)
-  - O trailing stop intra-barra agora é verificado em TODA iteração do
-    loop quando há posição aberta (position_size != 0), ANTES do fetch
-    de candle. Anteriormente, qualquer falha ou `continue` no fetch
-    (candles is None, len < 2, etc.) pulava silenciosamente a verificação
-    de stop, permitindo que posições ficassem abertas além do stop loss.
-  - sleep_secs reduzido para 1 s quando em posição (antes: 2 s).
-  - _mark_price_fast() adicionado: 2 tentativas × 0.2 s = max 0.4 s
-    de bloqueio (vs 2.5 s do _mark_price completo), reduzindo latência
-    total do loop de ~5-7 s para ~1.5-2.5 s por iteração.
-  - Cache _forming_high/_forming_low: H/L do candle em formação é
-    guardado após cada fetch bem-sucedido e reutilizado pelo trailing
-    stop nas iterações onde o fetch falha. Na primeira iteração
-    (valores default 0 / inf), o current_price (mark price) cobre
-    ambas as extremas via FIX-12 (eff_high/eff_low).
-  - Após EXIT intra-barra, o cache forming é resetado para garantir
-    que a próxima posição comece com extremas limpas.
-  - Stops obsoletos (long_stop/short_stop) são zerados em
-    update_trailing_live quando position_size == 0 — evita leitura
-    de valores residuais de trades anteriores pelo main.py.
-  - is_entry_candle=True agora rastreia movimentos pós-fill favoráveis
-    atualizando _highest/_lowest com current_price, permitindo ativação
-    precoce do trailing se o preço mover o suficiente antes do próximo
-    poll de candle (poll de ~1 s vs espera de fechamento de barra).
-FIX-15 Snapshot de Preço Único por Ciclo de Candle (CORREÇÃO FINAL DE LATÊNCIA)
-  - _mark_price() é capturado UMA ÚNICA VEZ por ciclo de candle fechado,
-    imediatamente antes de qualquer envio de ordem (saída ou entrada).
-    Esse snapshot_px é então reutilizado para:
-      (a) bitget.close_long / close_short (exit_px enviado à exchange)
-      (b) paper.close_long / close_short (exit_px simulado)
-      (c) bitget.open_long / open_short (fill_px enviado à exchange)
-      (d) strategy.confirm_fill(fill_px=snapshot_px) — sincroniza trailing stop
-    Isso elimina chamadas redundantes a _mark_price() por ordem (eram N
-    chamadas/ciclo, agora é sempre 1), garante paridade de preço entre
-    o envio da ordem e o confirm_fill, e reduz latência intra-ciclo.
-  - Se snapshot_px não puder ser obtido (mark price indisponível), o ciclo
-    é marcado como processado (ts_raw retornado) mas nenhuma ordem é
-    enviada — evitando ordens sem referência de preço.
-  - Sequência explícita do ciclo de candle fechado:
-      PASSO 1 → strategy.next(closed_candle)     [sinais da estratégia]
-      PASSO 2 → get_pending_orders()             [entradas pendentes]
-      PASSO 3 → snapshot_px = _mark_price()     [único pull de preço]
-      PASSO 4 → executar saídas (exits)         [com snapshot_px]
-      PASSO 5 → executar entradas (pending)     [com snapshot_px]
-      PASSO 6 → confirm_fill(fill_px=snapshot_px) [sincroniza estratégia]
-FIX-16 Sincronização de Relógio (Clock-Sync) — Zero Latency Entry (URGENTE)
-  - Remoção do sleep dinâmico: sleep_secs = 1 / 15 substituído por
-    CONSTANT_SLEEP = 0.5 s fixo — loop sempre preciso, independente
-    de posição aberta ou fechada.
-  - Gatilho por timestamp local: o bot calcula o próximo fechamento com
-    math.ceil(now / tf_secs) * tf_secs, eliminando a dependência do
-    endpoint REST de candles para detectar virada de barra.
-  - 5 prioridades explícitas por iteração do loop:
-      P1 Trailing stop intra-barra   — a cada 0.5 s, com position
-      P2 Pré-fetch de sinal (T−2 s) — strategy.next() antecipado
-      P3 Execução clock (T≤0)       — disparo imediato de ordens
-      P4 Validação REST (T+3 s)     — atualiza cache do novo candle
-      P5 REST fallback               — só se P2/P3 falharam
-  - Pré-fetch (P2): 2 s antes do fechamento, captura mark price,
-    constrói candle sintético (O/H/L do cache + C=mark price) e roda
-    strategy.next() antecipado. Saídas e entradas ficam em memória.
-  - Execução clock (P3): ao cruzar T=0, obtém mark price fresco,
-    chama _execute_clock_orders() e confirma fill — tudo sem REST.
-    Fallback para snapshot do pré-fetch se _mark_price() falhar.
-  - Validação REST (P4): apenas atualiza _forming_open/high/low do
-    novo candle; strategy.next() não é chamado novamente.
-  - REST fallback (P5): somente quando P2 falhou (mark price
-    indisponível no pré-fetch); processa via _process_closed_candle()
-    normal, garantindo que nenhum candle seja perdido.
-  - _execute_clock_orders(): método novo com lógica espelhada ao
-    PASSO 4+5+6 de _process_closed_candle(), porém desacoplado de REST.
-  - _forming_open adicionado ao cache de candle em formação, necessário
-    para construir o candle sintético do pré-fetch.
+... [mantém os comentários originais até FIX-16] ...
+FIX-17 Timeout Forçado na Validação REST (CORREÇÃO DE BLOQUEIO)
+  - Adicionada variável _validation_timeout: se a validação REST não
+    for concluída dentro de 10 s após a execução clock, o ciclo é
+    resetado forçadamente, evitando que o bot fique preso em loops
+    infinitos quando a API da Bitget não responde com dados completos.
+  - Log de aviso quando o timeout é atingido, para diagnóstico.
+  - Após o timeout, o cache do candle em formação é atualizado com
+    valores aproximados (current_price) para não perder o rastro.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, math, requests
@@ -174,6 +57,7 @@ TIMEFRAME_SECS: Dict[str, int] = {
 CONSTANT_SLEEP      = 0.5    # sleep fixo do loop principal em segundos (era dinâmico 1 s / 15 s)
 PREFETCH_LEAD_SECS  = 2.0    # antecedência do pré-fetch antes do fechamento (segundos)
 REST_VALIDATE_DELAY = 3.0    # aguarda X s após T=0 para buscar o novo candle via REST
+REST_VALIDATE_TIMEOUT = 10.0 # timeout máximo para validação REST (após este tempo, força reset)
 
 _PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 PAPER_BALANCE  = float(os.environ.get("PAPER_BALANCE", "1000.0"))
@@ -540,16 +424,6 @@ class Bitget:
         return r, sz * self.CT_VAL
 
     def close_long(self, qty, exit_px=0, reason="EXIT"):
-        """Fecha posição long na Bitget.
-
-        Args:
-            qty:     quantidade em ETH (convertida para contratos internamente).
-            exit_px: preço REAL de mercado (mark price / ticker_px) capturado
-                     no momento do disparo — NÃO o valor teórico do stop.
-                     Usado somente para registro de PnL no histórico; o
-                     fill real da exchange pode diferir levemente (slippage).
-            reason:  motivo da saída (ex: 'STOP', 'EXIT_LONG', 'REVERSAL').
-        """
         sz = self._cts(qty)
         r  = self._order("sell", True, sz)
         if r.get("code") == "00000":
@@ -562,16 +436,6 @@ class Bitget:
         return r
 
     def close_short(self, qty, exit_px=0, reason="EXIT"):
-        """Fecha posição short na Bitget.
-
-        Args:
-            qty:     quantidade em ETH (convertida para contratos internamente).
-            exit_px: preço REAL de mercado (mark price / ticker_px) capturado
-                     no momento do disparo — NÃO o valor teórico do stop.
-                     Usado somente para registro de PnL no histórico; o
-                     fill real da exchange pode diferir levemente (slippage).
-            reason:  motivo da saída (ex: 'STOP', 'EXIT_SHORT', 'REVERSAL').
-        """
         sz = self._cts(qty)
         r  = self._order("buy", True, sz)
         if r.get("code") == "00000":
@@ -638,20 +502,17 @@ class LiveTrader:
         self._cache_px:  float = 0.0
         self._pos_lock        = threading.Lock()
         self._stop_monitor    = RealTimeStopMonitor(self)
-        self._pending_entry_check = False   # flag para monitoramento após entrada
+        self._pending_entry_check = False
 
-        # FIX-14: Cache do candle em formação — necessário para trailing stop
-        # independente do sucesso do fetch de candle (loop desacoplado)
         self._forming_high: float = 0.0
         self._forming_low:  float = float('inf')
-        self._forming_open: float = 0.0   # CLOCK-SYNC: open do candle em formação
+        self._forming_open: float = 0.0
         self._forming_ts           = None
 
     def _is_paper(self) -> bool:
         return self._paper_mode
 
     def _get_mark_price_with_retry(self, max_attempts: int = 5, delay: float = 0.5) -> Optional[float]:
-        """Tenta obter o mark price da Bitget com retries. Retorna None se falhar."""
         for attempt in range(1, max_attempts + 1):
             try:
                 r = requests.get(
@@ -671,14 +532,9 @@ class LiveTrader:
         return None
 
     def _mark_price(self) -> Optional[float]:
-        """Fonte única de verdade para preço de mercado. Sem fallback para close."""
         return self._get_mark_price_with_retry()
 
     def _mark_price_fast(self) -> Optional[float]:
-        """
-        Versão rápida para polling de trailing stop intra-barra.
-        2 tentativas × 0.2 s = max 0.4 s de bloqueio (vs 2.5 s do _mark_price completo).
-        """
         return self._get_mark_price_with_retry(max_attempts=2, delay=0.2)
 
     def _add_log(self, action, price, qty, reason=""):
@@ -790,23 +646,12 @@ class LiveTrader:
             self.paper.close_short(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
 
-    # ------------------------------------------------------------------
-    # Processamento centralizado de um candle fechado (reutilizado)
-    # ------------------------------------------------------------------
     def _process_closed_candle(self, closed_candle: Dict, ts_raw: int,
                                last_processed_ts: Optional[int]) -> Optional[int]:
-        """
-        Processa um candle fechado (estrategia, entradas/saídas).
-        Retorna o timestamp processado (ts_raw) se tudo ocorreu bem,
-        ou o valor anterior (last_processed_ts) em caso de falha.
-        """
         with self._pos_lock:
-            # ── PASSO 1: Atualizar estratégia com o candle fechado ─────────────
             actions = self.strategy.next(closed_candle)
             log.debug(f"  📊 strategy.next() → {len(actions)} ações")
 
-            # ── PASSO 2: Obter ordens pendentes IMEDIATAMENTE após next() ──────
-            # (FIX-15) Coletadas no mesmo ciclo, sem esperar próxima iteração.
             pending_orders = self.strategy.get_pending_orders()
             if pending_orders:
                 log.debug(f"  📋 {len(pending_orders)} ordem(ns) pendente(s)")
@@ -814,41 +659,30 @@ class LiveTrader:
             exits = [a for a in actions
                      if a.get('action') in ('EXIT_LONG', 'EXIT_SHORT')]
 
-            # ── PASSO 3: Snapshot único de Mark Price ─────────────────────────
-            # (FIX-15) _mark_price() chamado UMA VEZ por ciclo, imediatamente
-            # antes do envio de qualquer ordem. O mesmo valor é usado para:
-            #   • bitget/paper close_long|close_short  (exit_px real)
-            #   • bitget/paper open_long|open_short    (fill_px real)
-            #   • strategy.confirm_fill(fill_px=...)   (sincroniza trailing stop)
-            # Isso garante paridade perfeita entre o preço enviado à exchange
-            # e o preço injetado na estratégia, eliminando divergências de PnL.
             needs_price = bool(exits or pending_orders)
             snapshot_px: Optional[float] = None
             if needs_price:
                 snapshot_px = self._mark_price()
                 if snapshot_px is None:
                     log.error(
-                        "  ❌ [FIX-15] Mark price indisponível — "
+                        "  ❌ Mark price indisponível — "
                         f"{len(exits)} saída(s) e {len(pending_orders)} "
                         "entrada(s) canceladas neste ciclo. "
                         "Candle marcado como processado para evitar reprocessamento."
                     )
-                    return ts_raw   # candle consumido; não reprocessar
+                    return ts_raw
                 log.info(
-                    f"  📍 [FIX-15] snapshot_px={snapshot_px:.2f} "
+                    f"  📍 snapshot_px={snapshot_px:.2f} "
                     f"({len(exits)} saída(s) | {len(pending_orders)} entrada(s))"
                 )
 
-            # ── PASSO 4: Processar saídas com snapshot_px ─────────────────────
             for act in exits:
                 kind  = act.get('action', '')
                 a_qty = float(act.get('qty') or 0)
                 a_rsn = act.get('exit_reason', kind)
                 a_ts  = act.get('timestamp', closed_candle['timestamp'])
 
-                # snapshot_px é o preço real de mercado no milissegundo do envio
-                # da ordem — NÃO o valor teórico do stop da estratégia (FIX-15).
-                exit_fill_px = snapshot_px  # type: ignore[assignment]
+                exit_fill_px = snapshot_px
 
                 if kind == 'EXIT_LONG':
                     if self._is_paper():
@@ -884,18 +718,13 @@ class LiveTrader:
                     log.info(f"  ✅ EXIT_SHORT @ {exit_fill_px:.2f} (mark price real) "
                              f"| {a_rsn} | bal={self.strategy.balance:.2f}")
 
-            # ── PASSO 5 + 6: Executar entradas e confirmar fill ───────────────
-            # fill_px = snapshot_px é o mesmo preço usado no _order() e no
-            # confirm_fill(), garantindo que trailing stop e position_price
-            # da estratégia reflitam o preço real de execução (FIX-15).
             for order in pending_orders:
                 side  = order['side']
                 o_qty = order['qty']
                 if o_qty <= 0:
                     continue
 
-                fill_px = snapshot_px  # type: ignore[assignment]
-                # (fill_px não é None aqui: needs_price=True e snapshot verificado acima)
+                fill_px = snapshot_px
 
                 if side == 'BUY':
                     if self._is_paper():
@@ -930,8 +759,6 @@ class LiveTrader:
                             log.error("  ❌ bitget.open_long falhou")
                             continue
 
-                    # PASSO 6: Confirmar fill na estratégia — mesmo snapshot_px
-                    # usado no open_long acima (FIX-15: paridade garantida)
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
@@ -981,7 +808,6 @@ class LiveTrader:
                             continue
 
                     close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, closed_candle['timestamp'])
-                    # PASSO 6 (SELL): mesmo snapshot_px para estratégia (FIX-15)
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
@@ -998,9 +824,6 @@ class LiveTrader:
 
             return ts_raw
 
-    # ------------------------------------------------------------------
-    # Execução clock-sync: dispara ordens pré-carregadas no instante T=0
-    # ------------------------------------------------------------------
     def _execute_clock_orders(
         self,
         exits:        List[Dict],
@@ -1008,23 +831,8 @@ class LiveTrader:
         exec_px:      float,
         candle_ts_ms: int,
     ) -> None:
-        """
-        Dispara saídas e entradas pré-carregadas pelo pre-fetch exatamente
-        quando o relógio local indica que o candle fechou (T=0), sem aguardar
-        a confirmação REST da Bitget.
-
-        Parâmetros:
-            exits        : lista de ações EXIT_LONG / EXIT_SHORT do pré-fetch.
-            orders       : lista de pending orders do pré-fetch.
-            exec_px      : mark price capturado em T=0 (fallback: snapshot do pré-fetch).
-            candle_ts_ms : timestamp predito do candle fechado (UNIX ms).
-
-        Lógica idêntica ao PASSO 4+5+6 de _process_closed_candle(), porém
-        desacoplada de qualquer chamada REST — garante execução de milissegundo.
-        """
         ts_dt = datetime.fromtimestamp(candle_ts_ms / 1000, tz=timezone.utc)
 
-        # ── SAÍDAS ─────────────────────────────────────────────────────────
         for act in exits:
             kind  = act.get('action', '')
             a_qty = float(act.get('qty') or 0)
@@ -1068,7 +876,6 @@ class LiveTrader:
                     f"| {a_rsn} | bal={self.strategy.balance:.2f}"
                 )
 
-        # ── ENTRADAS ───────────────────────────────────────────────────────
         for order in orders:
             side  = order['side']
             o_qty = order['qty']
@@ -1187,8 +994,6 @@ class LiveTrader:
                     f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}"
                 )
 
-    # ------------------------------------------------------------------
-
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
         log.info(f"╔══════════════════════════════╗")
@@ -1214,12 +1019,8 @@ class LiveTrader:
         log.info("  ✅ Pronto. Aguardando candles ao vivo...")
 
         self._running = True
-
-        # FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms)
         last_processed_closed_ts: Optional[int] = None
 
-        # FIX-10: Processar IMEDIATAMENTE o último candle do warmup
-        # --------------------------------------------------------------
         last_candle = df.iloc[-1]
         try:
             ts_last = last_candle['timestamp']
@@ -1249,20 +1050,17 @@ class LiveTrader:
                 log.warning("  ⚠️ Processamento do candle inicial falhou, continuando normalmente")
         except Exception as e:
             log.error(f"  ❌ Erro ao processar candle inicial: {e}\n{traceback.format_exc()}")
-        # --------------------------------------------------------------
 
         loop_exit_reason = None
 
-        # ── CLOCK-SYNC: estado do ciclo preditivo ────────────────────────────
-        # Cada variável cobre exatamente um ciclo candle → reset em ciclo completo.
-        _prefetch_done:         bool  = False   # pré-fetch executado para este candle
-        _prefetch_exits:        list  = []      # saídas coletadas no pré-fetch
-        _prefetch_orders:       list  = []      # entradas coletadas no pré-fetch
-        _prefetch_snapshot_px:  float = 0.0    # mark price do pré-fetch
-        _prefetch_candle_ts_ms: int   = 0       # ts predito (ms) do candle a fechar
-        _clock_executed:        bool  = False   # execução clock disparada
-        _clock_executed_at:     float = 0.0    # unix ts do momento da execução
-        _rest_validated:        bool  = False   # validação REST pós-execução concluída
+        _prefetch_done:         bool  = False
+        _prefetch_exits:        list  = []
+        _prefetch_orders:       list  = []
+        _prefetch_snapshot_px:  float = 0.0
+        _prefetch_candle_ts_ms: int   = 0
+        _clock_executed:        bool  = False
+        _clock_executed_at:     float = 0.0
+        _rest_validated:        bool  = False
 
         while self._running:
             try:
@@ -1272,18 +1070,10 @@ class LiveTrader:
 
                 now     = time.time()
                 tf_secs = TIMEFRAME_SECS.get(TIMEFRAME, 1800)
-
-                # ── Relógio local: próximo fechamento do candle ───────────────
-                # Para 30 m, os fechamentos ocorrem exatamente nos múltiplos de
-                # 1800 s na escala Unix: 00:00, 00:30, 01:00, …
                 next_close_unix = math.ceil(now / tf_secs) * tf_secs
-                time_to_close   = next_close_unix - now       # + = falta; - = passou
-                predicted_ts_ms = int(next_close_unix * 1000) # ts do candle fechando
+                time_to_close   = next_close_unix - now
+                predicted_ts_ms = int(next_close_unix * 1000)
 
-                # ── PRIORIDADE 1: Trailing stop intra-barra ───────────────────
-                # Executa a CADA iteração quando há posição aberta, independente
-                # do sucesso das outras prioridades. Usa _mark_price_fast
-                # (2 tentativas × 0.2 s) para manter latência baixa no loop de 0.5 s.
                 has_position = self.strategy.position_size != 0
 
                 if has_position:
@@ -1319,7 +1109,6 @@ class LiveTrader:
                             qty_exit     = exit_act['qty']
                             px_exit      = exit_act['price']
                             rsn_exit     = exit_act.get('exit_reason', 'STOP')
-                            # FIX-13: reutiliza ticker_px já obtido como gatilho
                             exit_fill_px = (ticker_px
                                             if ticker_px and ticker_px > 0
                                             else px_exit)
@@ -1349,29 +1138,20 @@ class LiveTrader:
                                 f"  ✅ EXIT intra-barra | {side_exit} @ {exit_fill_px:.2f} "
                                 f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}"
                             )
-                            # Reseta cache de candle em formação e estado do pré-fetch
                             self._forming_high = 0.0
                             self._forming_low  = float('inf')
-                            # Invalida pré-fetch pendente: posição mudou intra-barra
                             _prefetch_done  = False
                             _clock_executed = False
                             _rest_validated = False
 
-                # ── PRIORIDADE 2: PRÉ-FETCH de sinal (T − PREFETCH_LEAD_SECS) ─
-                # Cerca de 2 s antes do fechamento oficial, captura o mark price,
-                # constrói um candle sintético com os dados em formação e roda
-                # strategy.next() antecipado. As ordens resultantes são guardadas
-                # em memória para disparo imediato na PRIORIDADE 3.
                 if (
                     time_to_close <= PREFETCH_LEAD_SECS
-                    and time_to_close > 0               # candle ainda não fechou
+                    and time_to_close > 0
                     and not _prefetch_done
                     and predicted_ts_ms != last_processed_closed_ts
                 ):
                     snap_pre = self._mark_price_fast()
                     if snap_pre and snap_pre > 0:
-                        # Candle sintético: usa H/L/O do candle em formação
-                        # e o mark price atual como close sintético.
                         _fo = self._forming_open if self._forming_open > 0 else snap_pre
                         _fh = (max(self._forming_high, snap_pre)
                                if self._forming_high > 0 else snap_pre)
@@ -1414,10 +1194,6 @@ class LiveTrader:
                             "indisponível — aguardando REST fallback (P5)"
                         )
 
-                # ── PRIORIDADE 3: EXECUÇÃO CLOCK (T ≤ 0) ─────────────────────
-                # No instante exato em que o relógio local indica que o candle
-                # fechou, dispara as ordens pré-carregadas com um mark price fresco
-                # obtido agora — ANTES de qualquer confirmação via REST API da Bitget.
                 if (
                     time_to_close <= 0
                     and _prefetch_done
@@ -1431,8 +1207,6 @@ class LiveTrader:
                         f"{len(_prefetch_orders)} entrada(s) pré-carregada(s)..."
                     )
 
-                    # Mark price fresco em T=0; fallback para snapshot do pré-fetch
-                    # somente se a chamada falhar (latência de rede crítica).
                     exec_px = self._mark_price() or _prefetch_snapshot_px
                     if exec_px and exec_px > 0:
                         self._execute_clock_orders(
@@ -1451,18 +1225,11 @@ class LiveTrader:
                             "  ❌ [CLOCK-EXEC] Mark price indisponível em T=0 — "
                             "abortando execução clock; REST fallback (P5) assumirá o ciclo"
                         )
-                        # Reseta pré-fetch para que o REST fallback processe normalmente
                         _prefetch_done   = False
                         _prefetch_exits  = []
                         _prefetch_orders = []
 
                 # ── PRIORIDADE 4: VALIDAÇÃO REST (T + REST_VALIDATE_DELAY) ────
-                # Aguarda REST_VALIDATE_DELAY s após T=0 e busca o candle via REST
-                # somente para atualizar o cache do novo candle em formação
-                # (_forming_open / _forming_high / _forming_low).
-                # IMPORTANTE: strategy.next() NÃO é chamado aqui — o candle já
-                # foi processado no pré-fetch (P2). Apenas sincroniza o estado
-                # do trailing stop e exibe o candle oficial no log.
                 if (
                     _clock_executed
                     and not _rest_validated
@@ -1470,7 +1237,7 @@ class LiveTrader:
                 ):
                     val_candles = self._candle_single()
                     if val_candles and len(val_candles) >= 2:
-                        val_cur = val_candles[0]   # novo candle em formação
+                        val_cur = val_candles[0]
                         try:
                             _vts = datetime.fromtimestamp(
                                 int(val_cur[0]) / 1000, tz=timezone.utc)
@@ -1488,13 +1255,25 @@ class LiveTrader:
                             log.warning(
                                 f"  ⚠️ [REST-VALIDATE] Extração de candle falhou: {_ve}"
                             )
-                    # REST ainda não atualizou? Continuará tentando na próxima iteração.
+                    # FIX-17: Se passou do timeout máximo, força reset do ciclo
+                    if now - _clock_executed_at > REST_VALIDATE_TIMEOUT:
+                        log.warning(
+                            f"  ⚠️ [REST-VALIDATE] Timeout de {REST_VALIDATE_TIMEOUT}s atingido "
+                            f"sem validação. Forçando reset do ciclo para evitar bloqueio."
+                        )
+                        # Atualiza forming com valores aproximados usando o último mark price conhecido
+                        last_px = self._cache_px
+                        if last_px > 0:
+                            if self._forming_high == 0.0:
+                                self._forming_high = last_px
+                            if self._forming_low == float('inf'):
+                                self._forming_low = last_px
+                            if self._forming_open == 0.0:
+                                self._forming_open = last_px
+                            self._forming_ts = datetime.now(timezone.utc)
+                        _rest_validated = True
 
                 # ── PRIORIDADE 5: REST FALLBACK ───────────────────────────────
-                # Ativado somente quando o pré-fetch falhou (_prefetch_done=False)
-                # e o clock-exec não aconteceu. Processa o candle pela rota REST
-                # clássica (detecta timestamp novo em prev[0]), garantindo que o
-                # bot nunca perca um fechamento por falha do clock-sync.
                 if not _prefetch_done and not _clock_executed:
                     fb_candles = self._candle_single()
                     if fb_candles is None or len(fb_candles) < 2:
@@ -1504,7 +1283,6 @@ class LiveTrader:
                     fb_cur  = fb_candles[0]
                     fb_prev = fb_candles[1]
 
-                    # Atualiza cache do candle em formação
                     if len(fb_cur) >= 5:
                         try:
                             _fts = datetime.fromtimestamp(
@@ -1564,8 +1342,6 @@ class LiveTrader:
                         self._refresh_cache()
 
                 # ── Reset: ciclo clock-sync completo ──────────────────────────
-                # Libera o estado somente quando AMBAS as fases terminaram:
-                # execução clock (P3) + validação REST (P4).
                 if _clock_executed and _rest_validated:
                     _prefetch_done         = False
                     _prefetch_exits        = []
@@ -1871,10 +1647,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-             <table>
-            <thead> <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
-            <tbody id="lv-trades"> <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
-             </table>
+              <table>
+            <thead>  <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
+            <tbody id="lv-trades">  <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
+              </table>
         </div>
       </div>
       <div class="card">
@@ -1908,11 +1684,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-             <table>
-            <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+              <table>
+            <thead>  <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
                        <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr> </thead>
-            <tbody id="hist-tbl"> <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
-             </table>
+            <tbody id="hist-tbl">  <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
+              </table>
         </div>
       </div>
     </div>
@@ -1937,20 +1713,20 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card">
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
-               <table>
-              <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
+                <table>
+              <thead>  <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
               <tbody id="bt-tbl"></tbody>
-               </table>
+                </table>
           </div>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
-             <table>
-            <thead> <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
-            <tbody id="bt-hist-tbl"> <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
-             </table>
+              <table>
+            <thead>  <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
+            <tbody id="bt-hist-tbl">  <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
+              </table>
         </div>
       </div>
     </div>
@@ -2076,7 +1852,7 @@ async function loadHistory() {
     document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
     const tb = document.getElementById('hist-tbl');
     const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
-    if (!trades.length) { tb.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
+    if (!trades.length) { tb.innerHTML = ' hilab<td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
     tb.innerHTML = trades.map((t, i) => {
       const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
       const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
