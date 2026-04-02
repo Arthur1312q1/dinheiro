@@ -130,11 +130,9 @@ FIX-16 Sincronização de Relógio (Clock-Sync) — Zero Latency Entry (URGENTE)
     PASSO 4+5+6 de _process_closed_candle(), porém desacoplado de REST.
   - _forming_open adicionado ao cache de candle em formação, necessário
     para construir o candle sintético do pré-fetch.
-FIX‑KEEPALIVE: Pinger interno para evitar idle no Render
-FIX‑LOCK: Remoção do lock com atexit
 ══════════════════════════════════════════════════════════════════════
 """
-import os, hmac, hashlib, base64, json, time, threading, traceback, logging, math, requests, atexit
+import os, hmac, hashlib, base64, json, time, threading, traceback, logging, math, requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
@@ -151,8 +149,6 @@ def brazil_iso() -> str:
 
 from strategy.adaptive_zero_lag_ema import AdaptiveZeroLagEMA
 from data.collector import DataCollector
-# FIX‑KEEPALIVE: import do pinger
-from keepalive.pinger import KeepAlivePinger
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('azlema')
@@ -178,8 +174,6 @@ TIMEFRAME_SECS: Dict[str, int] = {
 CONSTANT_SLEEP      = 0.5    # sleep fixo do loop principal em segundos (era dinâmico 1 s / 15 s)
 PREFETCH_LEAD_SECS  = 2.0    # antecedência do pré-fetch antes do fechamento (segundos)
 REST_VALIDATE_DELAY = 3.0    # aguarda X s após T=0 para buscar o novo candle via REST
-# FIX‑KEEPALIVE: timeout para reset do ciclo clock‑sync (evita travamento)
-CLOCK_SYNC_TIMEOUT = 30.0    # segundos
 
 _PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 PAPER_BALANCE  = float(os.environ.get("PAPER_BALANCE", "1000.0"))
@@ -218,9 +212,6 @@ def _release_lock():
             log.info("🔓 Cadeado (lock) removido com sucesso.")
     except Exception as e:
         log.error(f"Erro ao remover lock: {e}")
-
-# FIX‑LOCK: registrar remoção automática ao encerrar o processo
-atexit.register(_release_lock)
 
 _release_lock()
 
@@ -1272,7 +1263,6 @@ class LiveTrader:
         _clock_executed:        bool  = False   # execução clock disparada
         _clock_executed_at:     float = 0.0    # unix ts do momento da execução
         _rest_validated:        bool  = False   # validação REST pós-execução concluída
-        _clock_cycle_start:     float = 0.0    # FIX‑KEEPALIVE: inicio do ciclo para timeout
 
         while self._running:
             try:
@@ -1289,14 +1279,6 @@ class LiveTrader:
                 next_close_unix = math.ceil(now / tf_secs) * tf_secs
                 time_to_close   = next_close_unix - now       # + = falta; - = passou
                 predicted_ts_ms = int(next_close_unix * 1000) # ts do candle fechando
-
-                # FIX‑KEEPALIVE: timeout para reset do ciclo clock-sync
-                if _clock_executed and not _rest_validated and (now - _clock_executed_at) > CLOCK_SYNC_TIMEOUT:
-                    log.warning("  ⚠️ [CLOCK‑SYNC] Timeout na validação REST — forçando reset do ciclo")
-                    _prefetch_done = False
-                    _clock_executed = False
-                    _rest_validated = False
-                    _clock_cycle_start = 0.0
 
                 # ── PRIORIDADE 1: Trailing stop intra-barra ───────────────────
                 # Executa a CADA iteração quando há posição aberta, independente
@@ -1374,7 +1356,6 @@ class LiveTrader:
                             _prefetch_done  = False
                             _clock_executed = False
                             _rest_validated = False
-                            _clock_cycle_start = 0.0
 
                 # ── PRIORIDADE 2: PRÉ-FETCH de sinal (T − PREFETCH_LEAD_SECS) ─
                 # Cerca de 2 s antes do fechamento oficial, captura o mark price,
@@ -1419,7 +1400,6 @@ class LiveTrader:
                         _prefetch_done        = True
                         _clock_executed       = False
                         _rest_validated       = False
-                        _clock_cycle_start    = now
 
                         log.info(
                             f"  ⚡ [PRÉ-FETCH T-{time_to_close:.2f}s] "
@@ -1595,7 +1575,6 @@ class LiveTrader:
                     _clock_executed        = False
                     _clock_executed_at     = 0.0
                     _rest_validated        = False
-                    _clock_cycle_start     = 0.0
                     log.debug("  🔄 [CLOCK-SYNC] Ciclo completo — estado resetado")
 
                 time.sleep(CONSTANT_SLEEP)
@@ -1892,10 +1871,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">ORDENS RECENTES</span></div>
         <div class="tbl-wrap">
-              <table>
-            <thead>  <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th> </tr> </thead>
-            <tbody id="lv-trades">  <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
-              </table>
+             <table>
+            <thead> <tr><th>Hora</th><th>Ação</th><th>Preço</th><th>Qty ETH</th><th>Motivo</th></tr> </thead>
+            <tbody id="lv-trades"> <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">Aguardando...</td></tr> </tbody>
+             </table>
         </div>
       </div>
       <div class="card">
@@ -1929,11 +1908,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card">
         <div class="card-head"><span class="card-title">TODOS OS TRADES</span></div>
         <div class="tbl-wrap">
-              <table>
-            <thead>  <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
-                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th> </tr> </thead>
-            <tbody id="hist-tbl">  <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
-              </table>
+             <table>
+            <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th>
+                       <th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th><th>Modo</th></tr> </thead>
+            <tbody id="hist-tbl"> <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Carregando...</td></tr> </tbody>
+             </table>
         </div>
       </div>
     </div>
@@ -1958,20 +1937,20 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="card">
           <div class="card-head"><span class="card-title">TRADES DO BACKTEST</span></div>
           <div class="tbl-wrap">
-                <table>
-              <thead>  <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th> </tr> </thead>
+               <table>
+              <thead> <tr><th>#</th><th>Entrada</th><th>Saída</th><th>Dir</th><th>Qty</th><th>P. Entrada</th><th>P. Saída</th><th>PnL USDT</th><th>PnL %</th><th>Motivo</th></tr> </thead>
               <tbody id="bt-tbl"></tbody>
-                </table>
+               </table>
           </div>
         </div>
       </div>
       <div class="card" style="margin-top:20px">
         <div class="card-head"><span class="card-title">HISTÓRICO DE BACKTESTS</span></div>
         <div class="tbl-wrap">
-              <table>
-            <thead>  <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th> </tr> </thead>
-            <tbody id="bt-hist-tbl">  <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
-              </table>
+             <table>
+            <thead> <tr><th>Data</th><th>Símbolo</th><th>TF</th><th>Candles</th><th>PnL</th><th>Win Rate</th><th>Trades</th><th>PF</th><th>Drawdown</th><th>Sharpe</th></tr> </thead>
+            <tbody id="bt-hist-tbl"> <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr> </tbody>
+             </table>
         </div>
       </div>
     </div>
@@ -2034,4 +2013,347 @@ async function poll() {
     if (run) se.innerHTML = '<span class="status-dot dot-run"></span><span class="g">Rodando</span>';
     else if (warm) se.innerHTML = '<span class="status-dot dot-warm"></span><span class="y">Warmup...</span>';
     else se.innerHTML = '<span class="status-dot dot-stop"></span><span style="color:var(--muted)">Parado</span>';
-    if (d.bal  != null) document.getElementById('lv-bal').textContent
+    if (d.bal  != null) document.getElementById('lv-bal').textContent  = d.bal.toFixed(2) + ' USDT';
+    const pe = document.getElementById('lv-pnl');
+    if (d.pnl  != null) { pe.textContent = (d.pnl >= 0 ? '+' : '') + d.pnl.toFixed(4) + ' USDT'; pe.className = 'kpi-val ' + (d.pnl >= 0 ? 'g' : 'r'); }
+    const pp = document.getElementById('lv-pos');
+    if (d.pos) { const s = d.pos.side; pp.innerHTML = `<span class="${s === 'long' ? 'g' : 'r'}">${s.toUpperCase()}</span>`; }
+    else { pp.innerHTML = '<span style="color:var(--muted)">FLAT</span>'; }
+    if (d.period != null) document.getElementById('lv-per').textContent = d.period;
+    if (d.ec     != null) document.getElementById('lv-ec').textContent  = d.ec.toFixed(2);
+    if (d.ema    != null) document.getElementById('lv-ema').textContent = d.ema.toFixed(2);
+    const tb = document.getElementById('lv-trades');
+    const tr = [...(d.trades || [])].reverse();
+    if (tr.length) {
+      tb.innerHTML = tr.map(t => {
+        const ac = t.action || ''; let cl = 'dir', lb = ac;
+        if (ac.includes('LONG'))  { cl = 'dir dir-l'; lb = ac.includes('ENTER') ? '▲ LONG'  : '▼ EXIT L'; }
+        if (ac.includes('SHORT')) { cl = 'dir dir-s'; lb = ac.includes('ENTER') ? '▼ SHORT' : '▲ EXIT S'; }
+        return `<tr><td>${(t.time||'').split('T')[1]?.slice(0,8)||'—'}</td><td><span class="${cl}">${lb}</span></td><td>${t.price?.toFixed(2)||'—'}</td><td>${t.qty?.toFixed(6)||'—'}</td><td style="color:var(--muted)">${t.reason||'—'}</td></tr>`;
+      }).join('');
+    }
+    const lb = document.getElementById('lv-log');
+    if (d.log && d.log.length) {
+      lb.innerHTML = d.log.slice(-80).map(l => {
+        let cls = '';
+        if (/✅|LONG|BUY/.test(l)) cls = 'lg'; else if (/❌|EXIT|SHORT/.test(l)) cls = 'lr';
+        else if (/⚠️|WARN|ENTRY-CHECK/.test(l)) cls = 'ly'; else if (/AZLEMA|╔|╚/.test(l)) cls = 'la';
+        return `<div class="${cls}">${l}</div>`;
+      }).join('');
+      lb.scrollTop = lb.scrollHeight;
+    }
+  } catch(e) { console.error(e); }
+}
+poll(); setInterval(poll, 4000);
+async function ctrl(a) {
+  const m = document.getElementById('sysmsg');
+  m.style.display = 'inline-block'; m.className = a === 'start' ? 'msg-ok' : 'msg-er';
+  m.textContent = a === 'start' ? 'Iniciando...' : 'Parando...';
+  try {
+    const d = await (await fetch('/' + a, { method: 'POST' })).json();
+    m.className = d.error ? 'msg-er' : 'msg-ok'; m.textContent = d.message || d.error || 'OK';
+  } catch { m.className = 'msg-er'; m.textContent = 'Erro de rede'; }
+  setTimeout(() => m.style.display = 'none', 5000); setTimeout(poll, 1500);
+}
+async function loadHistory() {
+  try {
+    const d = await (await fetch('/history')).json();
+    const s = d.stats || {};
+    const isPaper = _currentMode === 'paper';
+    const modeEl = document.getElementById('hist-session-mode');
+    const countEl = document.getElementById('hist-session-count');
+    const closedCount = (d.trades||[]).filter(t => t.status === 'closed').length;
+    if (modeEl) { modeEl.textContent = isPaper ? '📄 PAPER' : '💰 LIVE'; modeEl.className = 'mode-indicator ' + (isPaper ? 'mi-paper' : 'mi-live'); }
+    if (countEl) countEl.textContent = closedCount + ' trade' + (closedCount !== 1 ? 's' : '') + ' fechado' + (closedCount !== 1 ? 's' : '');
+    const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
+    document.getElementById('h-total').textContent = s.total || 0;
+    const wrEl = document.getElementById('h-wr'); wrEl.textContent = (s.win_rate||0).toFixed(1) + '%'; wrEl.className = 'kpi-val ' + (s.win_rate >= 50 ? 'g' : 'r');
+    const pnlEl = document.getElementById('h-pnl'); pnlEl.textContent = (s.total_pnl >= 0 ? '+' : '') + (s.total_pnl||0).toFixed(4) + ' USDT'; pnlEl.className = 'kpi-val ' + (s.total_pnl >= 0 ? 'g' : 'r');
+    const pfEl = document.getElementById('h-pf'); pfEl.textContent = pf; pfEl.className = 'kpi-val ' + (s.profit_factor > 1 ? 'g' : 'r');
+    document.getElementById('h-aw').textContent = '+' + (s.avg_win||0).toFixed(4);
+    document.getElementById('h-al').textContent = (s.avg_loss||0).toFixed(4);
+    document.getElementById('h-best').textContent = '+' + (s.best_trade||0).toFixed(4);
+    document.getElementById('h-worst').textContent = (s.worst_trade||0).toFixed(4);
+    const tb = document.getElementById('hist-tbl');
+    const trades = (d.trades || []).filter(t => t.status === 'closed').reverse();
+    if (!trades.length) { tb.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:20px">Nenhum trade fechado</td></tr>'; return; }
+    tb.innerHTML = trades.map((t, i) => {
+      const pnl = t.pnl_usdt || 0, pct = t.pnl_pct || 0;
+      const dir = t.action === 'BUY' ? 'LONG' : 'SHORT', dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s';
+      const pc = pnl >= 0 ? 'g' : 'r', ep = t.exit_price ? t.exit_price.toFixed(2) : '—';
+      const mode = t.mode === 'paper' ? '<span class="p">PAPER</span>' : '<span class="g">LIVE</span>';
+      return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${ep}</td><td class="${pc}">${pnl>=0?'+':''}${pnl.toFixed(4)}</td><td class="${pc}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_reason||'—'}</td><td>${mode}</td></tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+async function clearHistory() { await fetch('/history/clear', { method: 'POST' }); loadHistory(); }
+async function newPaperSession() {
+  if (!confirm('Iniciar nova sessão? Isso vai limpar os trades Paper/Live atuais.')) return;
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '🆕 Nova sessão iniciada';
+  await fetch('/history/clear', { method: 'POST' }); loadHistory();
+  setTimeout(() => m.style.display = 'none', 3000);
+}
+async function runBacktest() {
+  const btn = document.getElementById('btnBT'), prog = document.getElementById('bt-prog');
+  btn.disabled = true; btn.textContent = 'Rodando...'; prog.style.width = '20%';
+  document.getElementById('bt-result').style.display = 'none';
+  try {
+    const sym = document.getElementById('bt-sym').value, tf = document.getElementById('bt-tf').value;
+    const lim = document.getElementById('bt-lim').value, cap = document.getElementById('bt-cap').value;
+    const ofee = document.getElementById('bt-ofee').value, cfee = document.getElementById('bt-cfee').value;
+    prog.style.width = '60%';
+    const d = await (await fetch(`/backtest/run?symbol=${sym}&tf=${tf}&limit=${lim}&capital=${cap}&open_fee=${ofee}&close_fee=${cfee}`, {method:'POST'})).json();
+    prog.style.width = '100%';
+    if (d.error) { alert('Erro: ' + d.error); return; }
+    renderBacktestResult(d); loadBtHistory();
+  } catch(e) { alert('Erro: ' + e); }
+  finally { btn.disabled = false; btn.textContent = '▶ Executar'; setTimeout(() => prog.style.width = '0%', 1000); }
+}
+function renderBacktestResult(d) {
+  const pf = d.profit_factor === Infinity || d.profit_factor > 999 ? '∞' : +(d.profit_factor||0).toFixed(3);
+  const hasFees = d.fees_enabled && (d.open_fee_pct > 0 || d.close_fee_pct > 0);
+  const pnlLabel = hasFees ? 'PnL Líquido' : 'PnL Total';
+  const kpis = [
+    [pnlLabel, (d.total_pnl >= 0 ? '+' : '') + d.total_pnl.toFixed(2) + ' USDT', d.total_pnl >= 0 ? 'g' : 'r'],
+    ['Saldo Final', d.final_bal.toFixed(2) + ' USDT', ''],
+    ['Win Rate', d.win_rate.toFixed(1) + '%', d.win_rate >= 50 ? 'g' : 'r'],
+    ['Total Trades', d.total_trades, ''],
+    ['Profit Factor', pf, d.profit_factor > 1 ? 'g' : 'r'],
+    ['Max Drawdown', d.max_drawdown.toFixed(2) + '%', 'r'],
+    ['Sharpe Ratio', d.sharpe.toFixed(3), d.sharpe >= 1 ? 'g' : d.sharpe >= 0 ? 'y' : 'r'],
+  ];
+  if (hasFees) kpis.push(['Taxas Pagas', '-' + (d.total_fees_paid||0).toFixed(4) + ' USDT', 'r']);
+  document.getElementById('bt-kpis').innerHTML = kpis.map(([lbl,val,cls]) => `<div class="kpi ${cls}"><div class="kpi-lbl">${lbl}</div><div class="kpi-val ${cls}">${val}</div></div>`).join('');
+  const trades = (d.trades || []).slice().reverse();
+  document.getElementById('bt-tbl').innerHTML = trades.length ? trades.map((t,i) => {
+    const pnlB = t.pnl_usdt || 0, pnlN = t.pnl_net != null ? t.pnl_net : pnlB;
+    const pct = hasFees ? (t.pnl_pct_net || 0) : (t.pnl_percent || 0);
+    const fees = t.fees_total || 0, dir = t.action === 'BUY' ? 'LONG' : 'SHORT';
+    const dc = t.action === 'BUY' ? 'dir dir-l' : 'dir dir-s', pcB = pnlB >= 0 ? 'g' : 'r', pcN = pnlN >= 0 ? 'g' : 'r';
+    const feeCols = hasFees ? `<td class="r" style="font-size:.68rem">-${fees.toFixed(4)}</td><td class="${pcN}">${pnlN>=0?'+':''}${pnlN.toFixed(4)}</td>` : '';
+    return `<tr><td>${i+1}</td><td class="mono" style="font-size:.7rem">${(t.entry_time||'—').replace('T',' ').slice(0,19)}</td><td class="mono" style="font-size:.7rem">${(t.exit_time||'—').replace('T',' ').slice(0,19)}</td><td><span class="${dc}">${dir}</span></td><td>${(t.qty||0).toFixed(4)}</td><td>${(t.entry_price||0).toFixed(2)}</td><td>${t.exit_price?t.exit_price.toFixed(2):'—'}</td><td class="${pcB}">${pnlB>=0?'+':''}${pnlB.toFixed(4)}</td>${feeCols}<td class="${pcN}">${pct>=0?'+':''}${pct.toFixed(2)}%</td><td style="color:var(--muted)">${t.exit_comment||'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">Sem trades</td></tr>';
+  document.getElementById('bt-result').style.display = 'block';
+}
+async function loadBtHistory() {
+  try {
+    const d = await (await fetch('/backtest/history')).json();
+    const sessions = (d.sessions || []).slice().reverse();
+    const tb = document.getElementById('bt-hist-tbl');
+    if (!sessions.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">Sem histórico</td></tr>'; return; }
+    tb.innerHTML = sessions.map(s => {
+      const pf = s.profit_factor === Infinity || s.profit_factor > 999 ? '∞' : +(s.profit_factor||0).toFixed(3);
+      const pc = s.total_pnl >= 0 ? 'g' : 'r';
+      return `<tr><td>${(s.id||'—').replace('T',' ').slice(0,19)}</td><td>${s.symbol||'—'}</td><td>${s.timeframe||'—'}</td><td>${s.candles||0}</td><td class="${pc}">${s.total_pnl>=0?'+':''}${(s.total_pnl||0).toFixed(2)}</td><td class="${s.win_rate>=50?'g':'r'}">${(s.win_rate||0).toFixed(1)}%</td><td>${s.total_trades||0}</td><td class="${s.profit_factor>1?'g':'r'}">${pf}</td><td class="r">${(s.max_drawdown||0).toFixed(2)}%</td><td class="${(s.sharpe||0)>=1?'g':(s.sharpe||0)>=0?'y':'r'}">${(s.sharpe||0).toFixed(3)}</td></tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+loadBtHistory();
+async function apiPost(route, successMsg) {
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '...';
+  try {
+    const d = await (await fetch(route, { method: 'POST' })).json();
+    m.className = d.error ? 'abm-er' : 'abm-ok'; m.textContent = d.error || successMsg || d.message || 'OK';
+  } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
+  setTimeout(() => m.style.display = 'none', 3500); setTimeout(poll, 1200);
+}
+async function exportJson(route, filename) {
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = 'Exportando...';
+  try {
+    const d = await (await fetch(route)).json();
+    const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = filename + '_' + new Date().toISOString().slice(0,10) + '.json';
+    a.click(); URL.revokeObjectURL(url); m.textContent = '✓ Download iniciado';
+  } catch(e) { m.className = 'abm-er'; m.textContent = 'Erro: ' + e; }
+  setTimeout(() => m.style.display = 'none', 3000);
+}
+async function quickBacktest() {
+  const sym = prompt('Símbolo (ex: ETH-USDT-SWAP)', 'ETH-USDT-SWAP'); if (!sym) return;
+  const tf  = prompt('Timeframe', '30m'); if (!tf) return;
+  const lim = prompt('Candles', '500'); if (!lim) return;
+  const cap = prompt('Capital inicial (USDT)', '1000'); if (!cap) return;
+  const m = document.getElementById('apibar-msg');
+  m.style.display = 'inline-block'; m.className = 'abm-ok'; m.textContent = '⏳ Rodando...';
+  try {
+    const d = await (await fetch(`/backtest/run?symbol=${encodeURIComponent(sym)}&tf=${tf}&limit=${lim}&capital=${cap}`, { method: 'POST' })).json();
+    if (d.error) { m.className='abm-er'; m.textContent='Erro: '+d.error; }
+    else { m.textContent = `✓ PnL: ${d.total_pnl>=0?'+':''}${(d.total_pnl||0).toFixed(2)} | WR: ${(d.win_rate||0).toFixed(1)}%`; switchTab('backtest'); renderBacktestResult(d); loadBtHistory(); }
+  } catch(e) { m.className='abm-er'; m.textContent='Erro: '+e; }
+  setTimeout(() => m.style.display = 'none', 6000);
+}
+</script>
+</body>
+</html>"""
+
+
+def _thread():
+    global _trader, _starting
+    log.info("📥 Baixando candles Bitget...")
+    try:
+        df = DataCollector(symbol="ETH-USDT-SWAP", timeframe=TIMEFRAME,
+                           limit=TOTAL_CANDLES).fetch_ohlcv()
+        log.info(f"  ✅ {len(df)} candles")
+        if df.empty:
+            log.error("❌ Sem dados"); return
+        df = df.reset_index(drop=True)
+        df['index'] = df.index
+        _trader = LiveTrader()
+        _trader.run(df)
+    except Exception as e:
+        log.error(f"❌ {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    finally:
+        with _lock:
+            _trader   = None
+            _starting = False
+        _release_lock()
+        log.info("🔄 Pronto para re-iniciar")
+
+
+@app.route('/')
+def index(): return DASH
+
+@app.route('/status')
+def status():
+    t = _trader
+    if t is None:
+        return jsonify({"status": "stopped", "tc": 0, "trades": [],
+                        "log": _logs[-80:], "paper": get_paper_mode()})
+    s = "running" if t._running else ("warming" if t._warming else "stopped")
+    return jsonify({
+        "status":  s,
+        "paper":   get_paper_mode(),
+        "pos":     t._cache_pos,
+        "bal":     t._cache_bal,
+        "pnl":     t.live_pnl,
+        "period":  t.strategy.Period,
+        "ec":      t.strategy.EC,
+        "ema":     t.strategy.EMA,
+        "tc":      len(t.log),
+        "trades":  t.log[-10:],
+        "log":     _logs[-80:],
+    })
+
+@app.route('/mode', methods=['GET', 'POST'])
+def mode_endpoint():
+    if flask_request.method == 'GET':
+        return jsonify({
+            "mode":  "paper" if get_paper_mode() else "live",
+            "paper": get_paper_mode(),
+            "pct":   100 if get_paper_mode() else int(LIVE_PCT * 100),
+            "creds": _creds_ok(),
+        })
+    data = flask_request.get_json(silent=True) or {}
+    mode = data.get("mode", "paper").lower()
+    if mode == "live":
+        if not _creds_ok():
+            return jsonify({"error": "❌ Configure BITGET_API_KEY, BITGET_SECRET_KEY e "
+                                     "BITGET_PASSPHRASE no Render antes de usar o modo LIVE."}), 400
+        set_paper_mode(False)
+        log.info("🔄 Modo alterado → LIVE (95% saldo real na Bitget)")
+        return jsonify({"message": "💰 Modo LIVE ativado — 95% do saldo real", "paper": False})
+    else:
+        set_paper_mode(True)
+        log.info("🔄 Modo alterado → PAPER (saldo simulado)")
+        return jsonify({"message": "📄 Modo PAPER ativado — saldo simulado", "paper": True})
+
+@app.route('/start', methods=['POST'])
+def start():
+    global _starting
+    with _lock:
+        if _trader is not None or _starting:
+            return jsonify({"message": "Já está rodando"})
+        if not get_paper_mode() and not _creds_ok():
+            return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
+
+        if Path(LOCK_FILE).exists() and _trader is None:
+            log.warning("Limpando lock órfão encontrado no início manual.")
+            _release_lock()
+
+        if not _acquire_lock():
+            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn."}), 400
+
+        _starting = True
+        threading.Thread(target=_thread, daemon=True).start()
+        mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
+        return jsonify({"message": f"Iniciado em modo {mode_str}"})
+
+@app.route('/stop', methods=['POST'])
+def stop():
+    if _trader: _trader.stop()
+    _release_lock()
+    return jsonify({"message": "Parado"})
+
+@app.route('/ping')
+def ping(): return "pong"
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "ok":     True,
+        "creds":  _creds_ok(),
+        "paper":  get_paper_mode(),
+        "mode":   "paper" if get_paper_mode() else "live",
+        "trader": _trader is not None,
+    })
+
+@app.route('/history')
+def get_history():
+    return jsonify({"trades": history_mgr.get_all_trades(),
+                    "stats":  history_mgr.get_stats()})
+
+@app.route('/history/clear', methods=['POST'])
+def clear_history():
+    history_mgr.clear()
+    return jsonify({"message": "Histórico limpo"})
+
+@app.route('/backtest/run', methods=['POST'])
+def api_backtest():
+    sym           = flask_request.args.get('symbol',    "ETH-USDT-SWAP")
+    tf            = flask_request.args.get('tf',        TIMEFRAME)
+    limit         = int(flask_request.args.get('limit',   500))
+    capital       = float(flask_request.args.get('capital', 1000.0))
+    open_fee_pct  = float(flask_request.args.get('open_fee',  0.0))
+    close_fee_pct = float(flask_request.args.get('close_fee', 0.0))
+    result = run_backtest(sym, tf, limit, capital, open_fee_pct, close_fee_pct)
+    return jsonify(result)
+
+@app.route('/backtest/history')
+def get_bt_history():
+    data = backtest_mgr._load()
+    return jsonify({"sessions": data.get("sessions", [])})
+
+@app.route('/report')
+def report_page():
+    return ("<h2 style='font-family:monospace;color:#f0b90b;background:#0e1219;padding:40px'>"
+            "📊 Use /backtest/history para ver os dados JSON ou integre com o painel.</h2>")
+
+
+def _delayed_start():
+    global _starting
+    time.sleep(5)
+    with _lock:
+        if _trader is not None or _starting:
+            log.debug("Trader já rodando ou iniciando, auto-start ignorado.")
+            return
+        is_paper = get_paper_mode()
+        if not is_paper and not _creds_ok():
+            log.warning("⚠️ Chaves Bitget não configuradas — use o botão Iniciar.")
+            return
+        if not _acquire_lock():
+            log.warning("⚠️ Lock de processo já existe. Auto-start ignorado (outro worker rodando?).")
+            return
+        _starting = True
+        mode_str = "PAPER TRADING" if is_paper else "LIVE (Bitget)"
+        log.info(f"🚀 Auto-start {mode_str}...")
+        threading.Thread(target=_thread, daemon=True).start()
+
+threading.Thread(target=_delayed_start, daemon=True).start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0',
+            port=int(os.environ.get("PORT", 5000)),
+            debug=False)
