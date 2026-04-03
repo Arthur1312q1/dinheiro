@@ -102,21 +102,6 @@ FIX-15 Snapshot de Preço Único por Ciclo de Candle (CORREÇÃO FINAL DE LATÊN
       PASSO 4 → executar saídas (exits)         [com snapshot_px]
       PASSO 5 → executar entradas (pending)     [com snapshot_px]
       PASSO 6 → confirm_fill(fill_px=snapshot_px) [sincroniza estratégia]
-FIX-16 Preço Real de Execução (Fill Price Parity)
-  - Bitget.close_long / close_short buscam o fill real via
-    _fetch_fill_price() (polling /order/detail). Fallback: trigger_px.
-  - PaperTrader registra open_fee em position e deduz fees do PnL.
-  - LiveTrader expõe r["_fill_px"] para _add_log usar preço real.
-FIX-17 Flash Close / Trailing Stop Imediato (CORREÇÃO ANTI-FLASH)
-  - Após confirm_fill(), _highest e _lowest são explicitamente
-    inicializados com fill_px (antes podiam estar em 0 / inf
-    herdados do warmup, disparando o stop na 1ª iteração).
-  - Adicionado _entry_cooldown = 4 iterações (~2 s @ 0.5 s/iter):
-    update_trailing_live fica suspenso enquanto > 0, garantindo que
-    mark price já seja distinto do fill_px antes do 1º stop-check.
-  - Saída paper intra-barra usa _mark_price_fast() no momento exato
-    do fechamento, não o trigger_exit (stale ≈ fill_px de entrada)
-    — resolve o log de exit_price = entry_price (Flash Close no log).
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -788,11 +773,6 @@ class LiveTrader:
         self._stop_monitor    = RealTimeStopMonitor(self)
         self._pending_entry_check = False   # flag para monitoramento após entrada
 
-        # FIX-17: Contador de cooldown pós-abertura de posição.
-        # Enquanto > 0, update_trailing_live é suspenso para evitar Flash Close
-        # causado por mark price ainda igual ao fill_px de entrada.
-        self._entry_cooldown: int = 0
-
         # FIX-14: Cache do candle em formação — necessário para trailing stop
         # independente do sucesso do fetch de candle (loop desacoplado)
         self._forming_high: float = 0.0
@@ -832,6 +812,43 @@ class LiveTrader:
         2 tentativas × 0.2 s = max 0.4 s de bloqueio (vs 2.5 s do _mark_price completo).
         """
         return self._get_mark_price_with_retry(max_attempts=2, delay=0.2)
+
+    def close_long(self, reason: str, trigger_px: float):
+        try:
+            # 1. Captura o preço REAL exato no momento do fechamento
+            real_exit_px = self._mark_price()
+
+            if not self._is_paper():
+                # Executa ordem a mercado na exchange
+                self.bitget.close_long(abs(self.strategy.position_size), real_exit_px, reason)
+            else:
+                self._paper_close_long(real_exit_px, reason, brazil_iso())
+
+            # 2. Registra log e atualiza estado com o PREÇO REAL
+            self._add_log("SELL", real_exit_px, abs(self.strategy.position_size), reason)
+            self.strategy.position_size = 0
+            self.strategy.position_price = 0.0
+            self._cache_pos = None
+            log.info(f"🔴 LONG Fechado a {real_exit_px} (Gatilho teórico: {trigger_px}) - Motivo: {reason}")
+        except Exception as e:
+            log.error(f"Erro crítico ao fechar LONG: {e}")
+
+    def close_short(self, reason: str, trigger_px: float):
+        try:
+            real_exit_px = self._mark_price()
+
+            if not self._is_paper():
+                self.bitget.close_short(abs(self.strategy.position_size), real_exit_px, reason)
+            else:
+                self._paper_close_short(real_exit_px, reason, brazil_iso())
+
+            self._add_log("BUY", real_exit_px, abs(self.strategy.position_size), reason)
+            self.strategy.position_size = 0
+            self.strategy.position_price = 0.0
+            self._cache_pos = None
+            log.info(f"🟢 SHORT Fechado a {real_exit_px} (Gatilho teórico: {trigger_px}) - Motivo: {reason}")
+        except Exception as e:
+            log.error(f"Erro crítico ao fechar SHORT: {e}")
 
     def _add_log(self, action, price, qty, reason=""):
         self.log.append({
@@ -1105,13 +1122,7 @@ class LiveTrader:
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
-                    # FIX-17: Seed _highest/_lowest com fill_px exato para evitar
-                    # gatilho imediato do trailing stop na 1ª iteração pós-abertura.
-                    # Sem isso, _highest=0 / _lowest=inf herdados do warmup podem
-                    # disparar um stop inválido no ciclo seguinte (Flash Close).
-                    self.strategy._highest = fill_px
-                    self.strategy._lowest  = fill_px
-                    self._entry_cooldown   = 4   # ~2 s @ 0.5 s/iter
+                    self._last_entry_time = time.time()
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1161,10 +1172,7 @@ class LiveTrader:
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
-                    # FIX-17: Seed _highest/_lowest com fill_px exato
-                    self.strategy._lowest  = fill_px
-                    self.strategy._highest = fill_px
-                    self._entry_cooldown   = 4   # ~2 s @ 0.5 s/iter
+                    self._last_entry_time = time.time()
                     log.info(f"  ✅ SHORT confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1292,112 +1300,26 @@ class LiveTrader:
 
                 now_epoch: float = time.time()
 
-                # ── PRIORIDADE 1: Trailing stop intra-barra ──────────────────
-                # Executado a CADA iteração quando há posição aberta.
-                # (CLOCK-SYNC: sleep constante de 0.5 s — sem mais 15 s flat)
-                has_position = self.strategy.position_size != 0
+                # --- MONITORAMENTO INTRA-BARRA (Trailing Stop & SL) ---
+                if getattr(self.strategy, 'position_size', 0) != 0:
+                    current_px = self._mark_price()
 
-                if has_position:
-                    ticker_px = self._mark_price_fast()
-                    if ticker_px and ticker_px > 0:
-                        self._cache_px = ticker_px
-                    else:
-                        ticker_px = 0.0
+                    # Cooldown de 3 segundos para evitar fechamento imediato por spread/latência
+                    time_since_entry = time.time() - getattr(self, '_last_entry_time', 0)
 
-                    log.debug(
-                        f"  🔍 [TRAIL-POLL] px={ticker_px:.2f} "
-                        f"stop_L={self.strategy.long_stop:.2f} "
-                        f"stop_S={self.strategy.short_stop:.2f} "
-                        f"trail={'ON' if self.strategy._trail_active else 'off'}"
-                    )
+                    if time_since_entry > 3.0:
+                        # Verifica gatilhos de saída da estratégia
+                        exit_signal, exit_px, reason = self.strategy.update_trailing_live(current_price=current_px)
 
-                    with self._pos_lock:
-                        # ── FIX-17: Cooldown pós-abertura ─────────────────────────────
-                        # Salta update_trailing_live nas primeiras N iterações após abrir
-                        # uma posição (~2 s @ 0.5 s/iter) para garantir que:
-                        #   (a) mark price já seja distinto do fill_px de entrada,
-                        #   (b) estado interno da estratégia esteja consolidado,
-                        #   (c) _highest/_lowest iniciados com fill_px tenham uma
-                        #       atualização de candle real antes do primeiro stop-check.
-                        if self._entry_cooldown > 0:
-                            self._entry_cooldown -= 1
-                            log.debug(
-                                f"  ⏳ [COOLDOWN] trailing stop suspenso | "
-                                f"restante={self._entry_cooldown} iters | "
-                                f"px={ticker_px:.2f}"
-                            )
-                            exit_act = None
-                        else:
-                            is_entry = self._pending_entry_check
-                            exit_act = self.strategy.update_trailing_live(
-                                high=(self._forming_high
-                                      if self._forming_high > 0 else ticker_px),
-                                low=(self._forming_low
-                                     if self._forming_low < float('inf') else ticker_px),
-                                ts=(self._forming_ts or datetime.now(timezone.utc)),
-                                is_entry_candle=is_entry,
-                                current_price=ticker_px,
-                            )
-                            if is_entry:
-                                self._pending_entry_check = False
+                        if exit_signal == "EXIT_LONG":
+                            self.close_long(reason, exit_px)
+                        elif exit_signal == "EXIT_SHORT":
+                            self.close_short(reason, exit_px)
 
-                        if exit_act:
-                            side_exit    = exit_act['action']
-                            qty_exit     = exit_act['qty']
-                            px_exit      = exit_act['price']        # trigger_px da estratégia
-                            rsn_exit     = exit_act.get('exit_reason', 'STOP')
-                            # FIX-13/16: ticker_px é o mark price capturado instantes
-                            # antes — melhor aproximação de mercado para o trigger.
-                            # Passado como trigger_px; o fill real é buscado DENTRO
-                            # de close_long/close_short via _fetch_fill_price().
-                            trigger_exit = (ticker_px
-                                            if ticker_px and ticker_px > 0
-                                            else px_exit)
-                            ts_exit      = self._forming_ts or datetime.now(timezone.utc)
-
-                            if self._is_paper():
-                                # FIX-17: Busca mark price fresco no momento exato do
-                                # fechamento para que PnL e _add_log usem o preço real
-                                # de mercado — não o trigger_exit (stale) que pode ser
-                                # igual ao fill_px de entrada (Flash Close no log).
-                                _fresh_px    = self._mark_price_fast()
-                                actual_close = (_fresh_px
-                                                if _fresh_px and _fresh_px > 0
-                                                else trigger_exit)
-                                if side_exit == 'EXIT_LONG':
-                                    r_close = self._paper_close_long(actual_close, rsn_exit, ts_exit)
-                                else:
-                                    r_close = self._paper_close_short(actual_close, rsn_exit, ts_exit)
-                                fill_exit = r_close.get("_fill_px", actual_close)
-                            else:
-                                r_close = {"code": "err"}
-                                try:
-                                    if side_exit == 'EXIT_LONG':
-                                        r_close = self.bitget.close_long(
-                                            qty_exit, trigger_exit, rsn_exit)
-                                    else:
-                                        r_close = self.bitget.close_short(
-                                            qty_exit, trigger_exit, rsn_exit)
-                                except Exception as _e:
-                                    log.error(f"  ❌ close via trailing live: {_e}")
-                                    # Não dá continue — deixa a próxima iteração tentar
-                                # Extrai o fill real retornado por close_long/short (FIX-16)
-                                fill_exit = r_close.get("_fill_px", trigger_exit)
-
-                            self._cache_pos = None
-                            self._cache_bal = self.strategy.balance
-                            if self._is_paper():
-                                self.paper.balance = self.strategy.balance
-
-                            self._add_log(side_exit, fill_exit, qty_exit, rsn_exit)
-                            log.info(
-                                f"  ✅ EXIT intra-barra | {side_exit} "
-                                f"trigger={trigger_exit:.2f} fill={fill_exit:.2f} "
-                                f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}"
-                            )
-                            # Reseta cache de candle em formação após saída
-                            self._forming_high = 0.0
-                            self._forming_low  = float('inf')
+                    time.sleep(1)  # Loop rápido de 1s durante posição aberta
+                    continue       # Pula a busca de novos candles enquanto monitora a saída
+                else:
+                    time.sleep(1)  # Loop rápido de 1s enquanto flat
 
                 # ── CÁLCULO DO CICLO DO CANDLE (relógio local UTC) ───────────
                 # current_boundary: última borda que passou  (floor)
@@ -1632,10 +1554,7 @@ class LiveTrader:
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
-                                        # FIX-17: Seed _highest/_lowest com fill_px exato
-                                        self.strategy._highest = fill_px
-                                        self.strategy._lowest  = fill_px
-                                        self._entry_cooldown   = 4   # ~2 s @ 0.5 s/iter
+                                        self._last_entry_time = time.time()
                                         log.info(
                                             f"  ✅ [CLOCK] LONG confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
@@ -1720,10 +1639,7 @@ class LiveTrader:
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
-                                        # FIX-17: Seed _highest/_lowest com fill_px exato
-                                        self.strategy._lowest  = fill_px
-                                        self.strategy._highest = fill_px
-                                        self._entry_cooldown   = 4   # ~2 s @ 0.5 s/iter
+                                        self._last_entry_time = time.time()
                                         log.info(
                                             f"  ✅ [CLOCK] SHORT confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
