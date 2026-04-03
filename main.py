@@ -143,6 +143,16 @@ LIVE_PCT       = 0.95
 HISTORY_FILE          = "trades_history.json"
 BACKTEST_HISTORY_FILE = "backtest_history.json"
 
+# ── Taxas Live (Bitget Taker Futures) ────────────────────────────────────────
+# Mantidas em sync com engine.py → open_fee_pct / close_fee_pct.
+# PnL líquido = PnL_bruto − open_fee − close_fee
+OPEN_FEE_PCT  = float(os.environ.get("OPEN_FEE_PCT",  "0.06"))  # 0.06 = 0.06%
+CLOSE_FEE_PCT = float(os.environ.get("CLOSE_FEE_PCT", "0.06"))  # 0.06 = 0.06%
+
+def _calc_fee(price: float, qty: float, pct: float) -> float:
+    """Taxa = valor_nocional × pct / 100 — idêntico a engine.py._fee()"""
+    return abs(price * qty * pct / 100.0)
+
 def get_paper_mode() -> bool:  return _PAPER_TRADING
 def set_paper_mode(val: bool):
     global _PAPER_TRADING; _PAPER_TRADING = val
@@ -296,56 +306,90 @@ class PaperTrader:
     def open_long(self, qty, bal_usdt=0, px=0, ts=None):
         trade_id = self._new_id()
         ts = ts or brazil_iso()
+        open_fee = _calc_fee(px, qty, OPEN_FEE_PCT)
         history_mgr.add_trade({
             "id": trade_id, "action": "BUY", "status": "open",
             "entry_time": str(ts), "entry_price": px,
             "qty": qty, "balance": self.balance, "mode": "paper",
+            "open_fee": round(open_fee, 6),
         })
-        self.position = {"side": "long", "size": qty, "avg_px": px, "id": trade_id}
-        log.info(f"  📄 PAPER LONG aberto | px={px:.2f} qty={qty:.4f}")
+        self.position = {"side": "long", "size": qty, "avg_px": px,
+                         "id": trade_id, "open_fee": open_fee}
+        log.info(f"  📄 PAPER LONG aberto | px={px:.2f} qty={qty:.4f} "
+                 f"open_fee={open_fee:.4f}")
         return {"code": "0", "data": [{"ordId": trade_id}]}, qty
 
     def open_short(self, qty, bal_usdt=0, px=0, ts=None):
         trade_id = self._new_id()
         ts = ts or brazil_iso()
+        open_fee = _calc_fee(px, qty, OPEN_FEE_PCT)
         history_mgr.add_trade({
             "id": trade_id, "action": "SELL", "status": "open",
             "entry_time": str(ts), "entry_price": px,
             "qty": qty, "balance": self.balance, "mode": "paper",
+            "open_fee": round(open_fee, 6),
         })
-        self.position = {"side": "short", "size": qty, "avg_px": px, "id": trade_id}
-        log.info(f"  📄 PAPER SHORT aberto | px={px:.2f} qty={qty:.4f}")
+        self.position = {"side": "short", "size": qty, "avg_px": px,
+                         "id": trade_id, "open_fee": open_fee}
+        log.info(f"  📄 PAPER SHORT aberto | px={px:.2f} qty={qty:.4f} "
+                 f"open_fee={open_fee:.4f}")
         return {"code": "0", "data": [{"ordId": trade_id}]}, qty
 
     def close_long(self, qty, exit_px=0, reason="EXIT", ts=None):
+        """Fecha posição long simulada.
+
+        - exit_px  : preço de saída (mark price no momento do disparo).
+        - PnL líquido = PnL_bruto − open_fee − close_fee  (paridade com engine.py).
+        - Retorna _fill_px no dict para que LiveTrader use o preço correto em _add_log.
+        """
         if not self.position or self.position["side"] != "long":
-            return {"code": "0"}
-        entry_px = self.position["avg_px"]
-        trade_id = self.position["id"]
-        pnl      = (exit_px - entry_px) * qty
+            return {"code": "0", "_fill_px": exit_px}
+        entry_px  = self.position["avg_px"]
+        trade_id  = self.position["id"]
+        qty_real  = self.position["size"]
+        open_fee  = self.position.get("open_fee", 0.0)
+        close_fee = _calc_fee(exit_px, qty_real, CLOSE_FEE_PCT)
+        pnl_gross = (exit_px - entry_px) * qty_real
+        pnl_net   = pnl_gross - open_fee - close_fee
         self.position = None
         ts = str(ts) if ts else brazil_iso()
         try:
-            history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
+            history_mgr.close_trade(trade_id, exit_px, ts, reason,
+                                    round(pnl_net, 6))
         except Exception as _e:
             log.warning(f"  ⚠️ close_trade (long) file error: {_e}")
-        log.info(f"  📄 PAPER LONG fechado | px={exit_px:.2f} pnl={pnl:+.4f} USDT")
-        return {"code": "0"}
+        log.info(f"  📄 PAPER LONG fechado | px={exit_px:.2f} "
+                 f"pnl_gross={pnl_gross:+.4f} fees={open_fee+close_fee:.4f} "
+                 f"pnl_net={pnl_net:+.4f} USDT")
+        return {"code": "0", "_fill_px": exit_px}
 
     def close_short(self, qty, exit_px=0, reason="EXIT", ts=None):
+        """Fecha posição short simulada.
+
+        - exit_px  : preço de saída (mark price no momento do disparo).
+        - PnL líquido = PnL_bruto − open_fee − close_fee  (paridade com engine.py).
+        - Retorna _fill_px no dict para que LiveTrader use o preço correto em _add_log.
+        """
         if not self.position or self.position["side"] != "short":
-            return {"code": "0"}
-        entry_px = self.position["avg_px"]
-        trade_id = self.position["id"]
-        pnl      = (entry_px - exit_px) * qty
+            return {"code": "0", "_fill_px": exit_px}
+        entry_px  = self.position["avg_px"]
+        trade_id  = self.position["id"]
+        qty_real  = self.position["size"]
+        open_fee  = self.position.get("open_fee", 0.0)
+        close_fee = _calc_fee(exit_px, qty_real, CLOSE_FEE_PCT)
+        pnl_gross = (entry_px - exit_px) * qty_real
+        pnl_net   = pnl_gross - open_fee - close_fee
         self.position = None
         ts = str(ts) if ts else brazil_iso()
         try:
-            history_mgr.close_trade(trade_id, exit_px, ts, reason, pnl)
+            history_mgr.close_trade(trade_id, exit_px, ts, reason,
+                                    round(pnl_net, 6))
         except Exception as _e:
             log.warning(f"  ⚠️ close_trade (short) file error: {_e}")
-        log.info(f"  📄 PAPER SHORT fechado | px={exit_px:.2f} pnl={pnl:+.4f} USDT")
-        return {"code": "0"}
+        log.info(f"  📄 PAPER SHORT fechado | px={exit_px:.2f} "
+                 f"pnl_gross={pnl_gross:+.4f} fees={open_fee+close_fee:.4f} "
+                 f"pnl_net={pnl_net:+.4f} USDT")
+        return {"code": "0", "_fill_px": exit_px}
 
     def get_position(self): return self.position
     def get_balance(self):  return self.balance
@@ -479,11 +523,14 @@ class Bitget:
             return {"code": "SKIP", "msg": "Saldo insuficiente"}, 0.0
         r  = self._order("buy", False, sz)
         if r.get("code") == "00000":
-            oid = (r.get("data") or {}).get("orderId", "?")
+            oid      = (r.get("data") or {}).get("orderId", "?")
+            qty_eth  = sz * self.CT_VAL
+            open_fee = _calc_fee(px, qty_eth, OPEN_FEE_PCT)
             history_mgr.add_trade({
                 "id": str(oid), "action": "BUY", "status": "open",
                 "entry_time": brazil_iso(), "entry_price": px,
-                "qty": sz * self.CT_VAL, "balance": bal, "mode": "live",
+                "qty": qty_eth, "balance": bal, "mode": "live",
+                "open_fee": round(open_fee, 6),
             })
         return r, sz * self.CT_VAL
 
@@ -493,56 +540,180 @@ class Bitget:
             return {"code": "SKIP", "msg": "Saldo insuficiente"}, 0.0
         r  = self._order("sell", False, sz)
         if r.get("code") == "00000":
-            oid = (r.get("data") or {}).get("orderId", "?")
+            oid      = (r.get("data") or {}).get("orderId", "?")
+            qty_eth  = sz * self.CT_VAL
+            open_fee = _calc_fee(px, qty_eth, OPEN_FEE_PCT)
             history_mgr.add_trade({
                 "id": str(oid), "action": "SELL", "status": "open",
                 "entry_time": brazil_iso(), "entry_price": px,
-                "qty": sz * self.CT_VAL, "balance": bal, "mode": "live",
+                "qty": qty_eth, "balance": bal, "mode": "live",
+                "open_fee": round(open_fee, 6),
             })
         return r, sz * self.CT_VAL
 
-    def close_long(self, qty, exit_px=0, reason="EXIT"):
-        """Fecha posição long na Bitget.
+    def _fetch_fill_price(self, order_id: str,
+                          max_attempts: int = 4,
+                          delay: float = 0.25) -> Optional[float]:
+        """
+        Busca o preço médio de execução (fill) de uma ordem já enviada.
+
+        Consulta /api/v2/mix/order/detail com polling ativo (o fill pode demorar
+        alguns ms para aparecer). Retorna None se todas as tentativas falharem.
+
+        Campos tentados em ordem de prioridade:
+          priceAvg → fillPrice → avgPrice
+        """
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = self._get("/api/v2/mix/order/detail", {
+                    "symbol":      self.SYMBOL,
+                    "productType": self.PRODUCT_TYPE,
+                    "orderId":     order_id,
+                })
+                if r.get("code") == "00000":
+                    d   = r.get("data") or {}
+                    raw = (d.get("priceAvg")
+                           or d.get("fillPrice")
+                           or d.get("avgPrice"))
+                    if raw:
+                        px = float(raw)
+                        if px > 0:
+                            log.info(
+                                f"  🎯 [FILL-PRICE] orderId={order_id} "
+                                f"fill_px={px:.2f} (tentativa {attempt})"
+                            )
+                            return px
+            except Exception as _e:
+                log.debug(f"  _fetch_fill_price tentativa {attempt}: {_e}")
+            if attempt < max_attempts:
+                time.sleep(delay)
+
+        log.warning(
+            f"  ⚠️ [FILL-PRICE] Não foi possível obter fill price "
+            f"para orderId={order_id} — usando trigger_px como fallback"
+        )
+        return None
+
+    def close_long(self, qty, trigger_px: float = 0.0, reason: str = "EXIT"):
+        """
+        Fecha posição long na Bitget.
+
+        Fluxo de preço de execução (FIX-16):
+          1. Envia ordem market → captura orderId.
+          2. _fetch_fill_price(orderId) — preço REAL da exchange (até 4 polls × 0.25 s).
+          3. Fallback: trigger_px (mark price capturado no momento do disparo).
+
+        PnL gravado = PnL_bruto − open_fee − close_fee  (paridade com engine.py).
+        Retorna r["_fill_px"] para que LiveTrader use o preço real em _add_log.
 
         Args:
-            qty:     quantidade em ETH (convertida para contratos internamente).
-            exit_px: preço REAL de mercado (mark price / ticker_px) capturado
-                     no momento do disparo — NÃO o valor teórico do stop.
-                     Usado somente para registro de PnL no histórico; o
-                     fill real da exchange pode diferir levemente (slippage).
-            reason:  motivo da saída (ex: 'STOP', 'EXIT_LONG', 'REVERSAL').
+            qty        : quantidade em ETH (convertida para contratos internamente).
+            trigger_px : preço de mercado capturado ANTES de enviar a ordem
+                         (usado como fallback se a API de detalhe falhar).
+            reason     : motivo da saída ('TRAIL', 'SL', 'EXIT_LONG', 'REVERSAL', …).
         """
-        sz = self._cts(qty)
-        r  = self._order("sell", True, sz)
+        sz  = self._cts(qty)
+        r   = self._order("sell", True, sz)
+
         if r.get("code") == "00000":
-            ts = brazil_iso()
+            order_id = (r.get("data") or {}).get("orderId", "")
+
+            # ── Preço Real de Execução ──────────────────────────────────────
+            fill_px: float = trigger_px   # fallback inicial
+            if order_id:
+                fetched = self._fetch_fill_price(order_id)
+                if fetched and fetched > 0:
+                    fill_px = fetched
+                    if abs(fill_px - trigger_px) / max(trigger_px, 1) > 0.005:
+                        log.warning(
+                            f"  ⚠️ [SLIPPAGE] close_long "
+                            f"trigger={trigger_px:.2f} fill={fill_px:.2f} "
+                            f"diff={fill_px - trigger_px:+.2f} USDT"
+                        )
+
+            # ── PnL líquido com taxas (= engine.py) ────────────────────────
+            qty_eth = sz * self.CT_VAL
+            ts      = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
                 if t.get("action") == "BUY" and t.get("status") == "open":
-                    pnl = (exit_px - t.get("entry_price", exit_px)) * (sz * self.CT_VAL)
-                    history_mgr.close_trade(t["id"], exit_px, ts, reason, pnl)
+                    entry_price = t.get("entry_price", fill_px)
+                    pnl_gross   = (fill_px - entry_price) * qty_eth
+                    open_fee    = t.get("open_fee", 0.0)
+                    close_fee   = _calc_fee(fill_px, qty_eth, CLOSE_FEE_PCT)
+                    fees_total  = open_fee + close_fee
+                    pnl_net     = pnl_gross - fees_total
+                    history_mgr.close_trade(
+                        t["id"], fill_px, ts, reason, round(pnl_net, 6)
+                    )
+                    log.info(
+                        f"  💰 close_long | fill={fill_px:.2f} "
+                        f"pnl_gross={pnl_gross:+.4f} "
+                        f"fees={fees_total:.4f} "
+                        f"pnl_net={pnl_net:+.4f} USDT"
+                    )
                     break
+
+            r["_fill_px"] = fill_px   # expõe para LiveTrader._add_log
+
         return r
 
-    def close_short(self, qty, exit_px=0, reason="EXIT"):
-        """Fecha posição short na Bitget.
+    def close_short(self, qty, trigger_px: float = 0.0, reason: str = "EXIT"):
+        """
+        Fecha posição short na Bitget.
+
+        Idêntico a close_long mas para posições vendidas:
+          PnL_bruto = (entry_price − fill_px) × qty_eth.
+        Retorna r["_fill_px"] para que LiveTrader use o preço real em _add_log.
 
         Args:
-            qty:     quantidade em ETH (convertida para contratos internamente).
-            exit_px: preço REAL de mercado (mark price / ticker_px) capturado
-                     no momento do disparo — NÃO o valor teórico do stop.
-                     Usado somente para registro de PnL no histórico; o
-                     fill real da exchange pode diferir levemente (slippage).
-            reason:  motivo da saída (ex: 'STOP', 'EXIT_SHORT', 'REVERSAL').
+            qty        : quantidade em ETH (convertida para contratos internamente).
+            trigger_px : preço de mercado capturado ANTES de enviar a ordem
+                         (usado como fallback se a API de detalhe falhar).
+            reason     : motivo da saída ('TRAIL', 'SL', 'EXIT_SHORT', 'REVERSAL', …).
         """
-        sz = self._cts(qty)
-        r  = self._order("buy", True, sz)
+        sz  = self._cts(qty)
+        r   = self._order("buy", True, sz)
+
         if r.get("code") == "00000":
-            ts = brazil_iso()
+            order_id = (r.get("data") or {}).get("orderId", "")
+
+            # ── Preço Real de Execução ──────────────────────────────────────
+            fill_px: float = trigger_px   # fallback inicial
+            if order_id:
+                fetched = self._fetch_fill_price(order_id)
+                if fetched and fetched > 0:
+                    fill_px = fetched
+                    if abs(fill_px - trigger_px) / max(trigger_px, 1) > 0.005:
+                        log.warning(
+                            f"  ⚠️ [SLIPPAGE] close_short "
+                            f"trigger={trigger_px:.2f} fill={fill_px:.2f} "
+                            f"diff={fill_px - trigger_px:+.2f} USDT"
+                        )
+
+            # ── PnL líquido com taxas (= engine.py) ────────────────────────
+            qty_eth = sz * self.CT_VAL
+            ts      = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
                 if t.get("action") == "SELL" and t.get("status") == "open":
-                    pnl = (t.get("entry_price", exit_px) - exit_px) * (sz * self.CT_VAL)
-                    history_mgr.close_trade(t["id"], exit_px, ts, reason, pnl)
+                    entry_price = t.get("entry_price", fill_px)
+                    pnl_gross   = (entry_price - fill_px) * qty_eth
+                    open_fee    = t.get("open_fee", 0.0)
+                    close_fee   = _calc_fee(fill_px, qty_eth, CLOSE_FEE_PCT)
+                    fees_total  = open_fee + close_fee
+                    pnl_net     = pnl_gross - fees_total
+                    history_mgr.close_trade(
+                        t["id"], fill_px, ts, reason, round(pnl_net, 6)
+                    )
+                    log.info(
+                        f"  💰 close_short | fill={fill_px:.2f} "
+                        f"pnl_gross={pnl_gross:+.4f} "
+                        f"fees={fees_total:.4f} "
+                        f"pnl_net={pnl_net:+.4f} USDT"
+                    )
                     break
+
+            r["_fill_px"] = fill_px   # expõe para LiveTrader._add_log
+
         return r
 
     def ct_val(self):
@@ -742,14 +913,18 @@ class LiveTrader:
     def _paper_close_long(self, price: float, reason: str, ts):
         pos = self.paper.get_position()
         if pos and pos['side'] == 'long':
-            self.paper.close_long(pos['size'], price, reason, ts=ts)
+            r = self.paper.close_long(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
+            return r
+        return {"code": "0", "_fill_px": price}
 
     def _paper_close_short(self, price: float, reason: str, ts):
         pos = self.paper.get_position()
         if pos and pos['side'] == 'short':
-            self.paper.close_short(pos['size'], price, reason, ts=ts)
+            r = self.paper.close_short(pos['size'], price, reason, ts=ts)
             self._cache_pos = None
+            return r
+        return {"code": "0", "_fill_px": price}
 
     # ------------------------------------------------------------------
     # Processamento centralizado de um candle fechado (reutilizado)
@@ -807,43 +982,49 @@ class LiveTrader:
                 a_rsn = act.get('exit_reason', kind)
                 a_ts  = act.get('timestamp', closed_candle['timestamp'])
 
-                # snapshot_px é o preço real de mercado no milissegundo do envio
-                # da ordem — NÃO o valor teórico do stop da estratégia (FIX-15).
-                exit_fill_px = snapshot_px  # type: ignore[assignment]
+                # snapshot_px é o trigger: mark price no momento do envio da ordem.
+                # O fill real é buscado DENTRO de close_long/close_short (FIX-16).
+                trigger_px = snapshot_px  # type: ignore[assignment]
 
                 if kind == 'EXIT_LONG':
                     if self._is_paper():
-                        self._paper_close_long(exit_fill_px, a_rsn, a_ts)
+                        r_close   = self._paper_close_long(trigger_px, a_rsn, a_ts)
+                        fill_exit = r_close.get("_fill_px", trigger_px)
                     else:
                         try:
-                            self.bitget.close_long(a_qty, exit_fill_px, a_rsn)
+                            r_close = self.bitget.close_long(a_qty, trigger_px, a_rsn)
                         except Exception as _e:
                             log.error(f"  ❌ live close_long: {_e}")
                             continue
-                    self._add_log('EXIT_LONG', exit_fill_px, a_qty, a_rsn)
+                        fill_exit = r_close.get("_fill_px", trigger_px)
+                    self._add_log('EXIT_LONG', fill_exit, a_qty, a_rsn)
                     self._cache_pos = None
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    log.info(f"  ✅ EXIT_LONG @ {exit_fill_px:.2f} (mark price real) "
-                             f"| {a_rsn} | bal={self.strategy.balance:.2f}")
+                    log.info(f"  ✅ EXIT_LONG trigger={trigger_px:.2f} "
+                             f"fill={fill_exit:.2f} | {a_rsn} "
+                             f"| bal={self.strategy.balance:.2f}")
 
                 elif kind == 'EXIT_SHORT':
                     if self._is_paper():
-                        self._paper_close_short(exit_fill_px, a_rsn, a_ts)
+                        r_close   = self._paper_close_short(trigger_px, a_rsn, a_ts)
+                        fill_exit = r_close.get("_fill_px", trigger_px)
                     else:
                         try:
-                            self.bitget.close_short(a_qty, exit_fill_px, a_rsn)
+                            r_close = self.bitget.close_short(a_qty, trigger_px, a_rsn)
                         except Exception as _e:
                             log.error(f"  ❌ live close_short: {_e}")
                             continue
-                    self._add_log('EXIT_SHORT', exit_fill_px, a_qty, a_rsn)
+                        fill_exit = r_close.get("_fill_px", trigger_px)
+                    self._add_log('EXIT_SHORT', fill_exit, a_qty, a_rsn)
                     self._cache_pos = None
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    log.info(f"  ✅ EXIT_SHORT @ {exit_fill_px:.2f} (mark price real) "
-                             f"| {a_rsn} | bal={self.strategy.balance:.2f}")
+                    log.info(f"  ✅ EXIT_SHORT trigger={trigger_px:.2f} "
+                             f"fill={fill_exit:.2f} | {a_rsn} "
+                             f"| bal={self.strategy.balance:.2f}")
 
             # ── PASSO 5 + 6: Executar entradas e confirmar fill ───────────────
             # fill_px = snapshot_px é o mesmo preço usado no _order() e no
@@ -1116,37 +1297,47 @@ class LiveTrader:
                         if exit_act:
                             side_exit    = exit_act['action']
                             qty_exit     = exit_act['qty']
-                            px_exit      = exit_act['price']
+                            px_exit      = exit_act['price']        # trigger_px da estratégia
                             rsn_exit     = exit_act.get('exit_reason', 'STOP')
-                            # FIX-13: reutiliza ticker_px já obtido como gatilho
-                            exit_fill_px = (ticker_px
+                            # FIX-13/16: ticker_px é o mark price capturado instantes
+                            # antes — melhor aproximação de mercado para o trigger.
+                            # Passado como trigger_px; o fill real é buscado DENTRO
+                            # de close_long/close_short via _fetch_fill_price().
+                            trigger_exit = (ticker_px
                                             if ticker_px and ticker_px > 0
                                             else px_exit)
                             ts_exit      = self._forming_ts or datetime.now(timezone.utc)
 
                             if self._is_paper():
                                 if side_exit == 'EXIT_LONG':
-                                    self._paper_close_long(exit_fill_px, rsn_exit, ts_exit)
+                                    r_close = self._paper_close_long(trigger_exit, rsn_exit, ts_exit)
                                 else:
-                                    self._paper_close_short(exit_fill_px, rsn_exit, ts_exit)
+                                    r_close = self._paper_close_short(trigger_exit, rsn_exit, ts_exit)
+                                fill_exit = trigger_exit  # paper: sem fill real
                             else:
+                                r_close = {"code": "err"}
                                 try:
                                     if side_exit == 'EXIT_LONG':
-                                        self.bitget.close_long(qty_exit, exit_fill_px, rsn_exit)
+                                        r_close = self.bitget.close_long(
+                                            qty_exit, trigger_exit, rsn_exit)
                                     else:
-                                        self.bitget.close_short(qty_exit, exit_fill_px, rsn_exit)
+                                        r_close = self.bitget.close_short(
+                                            qty_exit, trigger_exit, rsn_exit)
                                 except Exception as _e:
                                     log.error(f"  ❌ close via trailing live: {_e}")
                                     # Não dá continue — deixa a próxima iteração tentar
+                                # Extrai o fill real retornado por close_long/short (FIX-16)
+                                fill_exit = r_close.get("_fill_px", trigger_exit)
 
                             self._cache_pos = None
                             self._cache_bal = self.strategy.balance
                             if self._is_paper():
                                 self.paper.balance = self.strategy.balance
 
-                            self._add_log(side_exit, exit_fill_px, qty_exit, rsn_exit)
+                            self._add_log(side_exit, fill_exit, qty_exit, rsn_exit)
                             log.info(
-                                f"  ✅ EXIT intra-barra | {side_exit} @ {exit_fill_px:.2f} "
+                                f"  ✅ EXIT intra-barra | {side_exit} "
+                                f"trigger={trigger_exit:.2f} fill={fill_exit:.2f} "
                                 f"| motivo={rsn_exit} | bal={self.strategy.balance:.2f}"
                             )
                             # Reseta cache de candle em formação após saída
@@ -1257,39 +1448,45 @@ class LiveTrader:
 
                                     if kind == 'EXIT_LONG':
                                         if self._is_paper():
-                                            self._paper_close_long(fire_px, a_rsn, a_ts)
+                                            r_close   = self._paper_close_long(fire_px, a_rsn, a_ts)
+                                            fill_clk  = r_close.get("_fill_px", fire_px)
                                         else:
                                             try:
-                                                self.bitget.close_long(a_qty, fire_px, a_rsn)
+                                                r_close = self.bitget.close_long(a_qty, fire_px, a_rsn)
                                             except Exception as _e:
                                                 log.error(f"  ❌ [CLOCK] close_long: {_e}")
                                                 continue
-                                        self._add_log('EXIT_LONG', fire_px, a_qty, a_rsn)
+                                            fill_clk = r_close.get("_fill_px", fire_px)
+                                        self._add_log('EXIT_LONG', fill_clk, a_qty, a_rsn)
                                         self._cache_pos = None
                                         self._cache_bal = self.strategy.balance
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
                                         log.info(
-                                            f"  ✅ [CLOCK] EXIT_LONG @ {fire_px:.2f} "
+                                            f"  ✅ [CLOCK] EXIT_LONG "
+                                            f"trigger={fire_px:.2f} fill={fill_clk:.2f} "
                                             f"| {a_rsn} | bal={self.strategy.balance:.2f}"
                                         )
 
                                     elif kind == 'EXIT_SHORT':
                                         if self._is_paper():
-                                            self._paper_close_short(fire_px, a_rsn, a_ts)
+                                            r_close  = self._paper_close_short(fire_px, a_rsn, a_ts)
+                                            fill_clk = r_close.get("_fill_px", fire_px)
                                         else:
                                             try:
-                                                self.bitget.close_short(a_qty, fire_px, a_rsn)
+                                                r_close = self.bitget.close_short(a_qty, fire_px, a_rsn)
                                             except Exception as _e:
                                                 log.error(f"  ❌ [CLOCK] close_short: {_e}")
                                                 continue
-                                        self._add_log('EXIT_SHORT', fire_px, a_qty, a_rsn)
+                                            fill_clk = r_close.get("_fill_px", fire_px)
+                                        self._add_log('EXIT_SHORT', fill_clk, a_qty, a_rsn)
                                         self._cache_pos = None
                                         self._cache_bal = self.strategy.balance
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
                                         log.info(
-                                            f"  ✅ [CLOCK] EXIT_SHORT @ {fire_px:.2f} "
+                                            f"  ✅ [CLOCK] EXIT_SHORT "
+                                            f"trigger={fire_px:.2f} fill={fill_clk:.2f} "
                                             f"| {a_rsn} | bal={self.strategy.balance:.2f}"
                                         )
 
