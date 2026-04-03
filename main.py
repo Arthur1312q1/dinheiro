@@ -102,6 +102,31 @@ FIX-15 Snapshot de Preço Único por Ciclo de Candle (CORREÇÃO FINAL DE LATÊN
       PASSO 4 → executar saídas (exits)         [com snapshot_px]
       PASSO 5 → executar entradas (pending)     [com snapshot_px]
       PASSO 6 → confirm_fill(fill_px=snapshot_px) [sincroniza estratégia]
+FIX-16 Preço Real de Execução nas Saídas (Bitget.close_long/close_short)
+  - _fetch_fill_price() busca priceAvg/fillPrice da API de detalhe após
+    cada ordem de fechamento, usando o fill exato da exchange.
+  - Fallback em cascata: API de detalhe → mark_price() pós-ordem → trigger_px.
+  - PnL gravado no histórico = pnl_bruto − open_fee − close_fee (paridade
+    com engine.py).
+FIX-17 Flash Close / Gatilho Imediato / Cooldown Pós-Entrada
+  - CAUSA 1 (Flash Close): _fetch_fill_price falha silenciosamente →
+    fallback para trigger_px (pré-ordem) ≈ entry_price → PnL = zero.
+    CORREÇÃO: adicionado Fallback 2 — mark_price() chamado APÓS a ordem,
+    com log explícito distinguindo cada caminho. Trigger pré-ordem só
+    é usado se ambos falharem.
+  - CAUSA 2 (Gatilho Imediato): strategy.next() → _open_long(open_p)
+    seta _highest = open_p (preço de abertura do candle). confirm_fill()
+    sobrescreve, mas qualquer corrida entre os dois corromperia o stop.
+    CORREÇÃO: após CADA confirm_fill(), forçamos explicitamente
+    strategy._highest = fill_px / strategy._lowest = fill_px (4 pontos
+    de entrada: _process_closed_candle BUY/SELL e clock-sync BUY/SELL).
+  - CAUSA 3 (Sem consolidação): loop de trailing (0.5 s) iniciava
+    imediatamente após o fill com H/L do candle anterior.
+    CORREÇÃO: _entry_cooldown_until = time.time() + 2.0 definido em
+    todos os 4 pontos de confirm_fill. O guard no topo do bloco
+    `if has_position:` faz `continue` enquanto o cooldown não expirar,
+    garantindo que o primeiro poll de stop use um mark price verdadeiramente
+    pós-fill e extremas de candle do período atual.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -618,18 +643,47 @@ class Bitget:
         if r.get("code") == "00000":
             order_id = (r.get("data") or {}).get("orderId", "")
 
-            # ── Preço Real de Execução ──────────────────────────────────────
-            fill_px: float = trigger_px   # fallback inicial
+            # ── Preço Real de Execução (FIX-17) ────────────────────────────
+            # Prioridade:
+            #   1. priceAvg/fillPrice da ordem (API de detalhe)
+            #   2. mark_price() fresco APÓS a ordem ter sido enviada
+            #   3. trigger_px (mark price de ANTES da ordem) — último recurso
+            #
+            # O fallback 3 (trigger_px pré-ordem) é problemático porque, em
+            # mercados laterais, ele pode ser idêntico ao entry_price gravado
+            # em history_mgr, zerando o PnL no log ("Flash Close").
+            # O fallback 2 (mark price pós-ordem) resolve isso.
+            fill_px: float = trigger_px   # valor inicial seguro
+            fetched_from_api = False
+
             if order_id:
                 fetched = self._fetch_fill_price(order_id)
                 if fetched and fetched > 0:
-                    fill_px = fetched
-                    if abs(fill_px - trigger_px) / max(trigger_px, 1) > 0.005:
-                        log.warning(
-                            f"  ⚠️ [SLIPPAGE] close_long "
-                            f"trigger={trigger_px:.2f} fill={fill_px:.2f} "
-                            f"diff={fill_px - trigger_px:+.2f} USDT"
-                        )
+                    fill_px          = fetched
+                    fetched_from_api = True
+
+            if not fetched_from_api:
+                # Fallback 2: mark price imediatamente após a ordem
+                fresh_px = self.mark_price()
+                if fresh_px and fresh_px > 0:
+                    fill_px = fresh_px
+                    log.info(
+                        f"  📍 [FILL-FALLBACK] close_long — "
+                        f"usando mark_price pós-ordem: {fill_px:.2f} "
+                        f"(trigger={trigger_px:.2f})"
+                    )
+                else:
+                    log.warning(
+                        f"  ⚠️ [FILL-FALLBACK] close_long — "
+                        f"mark_price indisponível, usando trigger_px={trigger_px:.2f}"
+                    )
+
+            if abs(fill_px - trigger_px) / max(trigger_px, 1) > 0.005:
+                log.warning(
+                    f"  ⚠️ [SLIPPAGE] close_long "
+                    f"trigger={trigger_px:.2f} fill={fill_px:.2f} "
+                    f"diff={fill_px - trigger_px:+.2f} USDT"
+                )
 
             # ── PnL líquido com taxas (= engine.py) ────────────────────────
             qty_eth = sz * self.CT_VAL
@@ -646,7 +700,8 @@ class Bitget:
                         t["id"], fill_px, ts, reason, round(pnl_net, 6)
                     )
                     log.info(
-                        f"  💰 close_long | fill={fill_px:.2f} "
+                        f"  💰 close_long | entry={entry_price:.2f} "
+                        f"fill={fill_px:.2f} "
                         f"pnl_gross={pnl_gross:+.4f} "
                         f"fees={fees_total:.4f} "
                         f"pnl_net={pnl_net:+.4f} USDT"
@@ -677,18 +732,41 @@ class Bitget:
         if r.get("code") == "00000":
             order_id = (r.get("data") or {}).get("orderId", "")
 
-            # ── Preço Real de Execução ──────────────────────────────────────
-            fill_px: float = trigger_px   # fallback inicial
+            # ── Preço Real de Execução (FIX-17) ────────────────────────────
+            # Mesmo esquema de prioridades de close_long:
+            #   1. priceAvg/fillPrice da API de detalhe da ordem
+            #   2. mark_price() fresco APÓS a ordem
+            #   3. trigger_px (pré-ordem) — último recurso
+            fill_px: float = trigger_px
+            fetched_from_api = False
+
             if order_id:
                 fetched = self._fetch_fill_price(order_id)
                 if fetched and fetched > 0:
-                    fill_px = fetched
-                    if abs(fill_px - trigger_px) / max(trigger_px, 1) > 0.005:
-                        log.warning(
-                            f"  ⚠️ [SLIPPAGE] close_short "
-                            f"trigger={trigger_px:.2f} fill={fill_px:.2f} "
-                            f"diff={fill_px - trigger_px:+.2f} USDT"
-                        )
+                    fill_px          = fetched
+                    fetched_from_api = True
+
+            if not fetched_from_api:
+                fresh_px = self.mark_price()
+                if fresh_px and fresh_px > 0:
+                    fill_px = fresh_px
+                    log.info(
+                        f"  📍 [FILL-FALLBACK] close_short — "
+                        f"usando mark_price pós-ordem: {fill_px:.2f} "
+                        f"(trigger={trigger_px:.2f})"
+                    )
+                else:
+                    log.warning(
+                        f"  ⚠️ [FILL-FALLBACK] close_short — "
+                        f"mark_price indisponível, usando trigger_px={trigger_px:.2f}"
+                    )
+
+            if abs(fill_px - trigger_px) / max(trigger_px, 1) > 0.005:
+                log.warning(
+                    f"  ⚠️ [SLIPPAGE] close_short "
+                    f"trigger={trigger_px:.2f} fill={fill_px:.2f} "
+                    f"diff={fill_px - trigger_px:+.2f} USDT"
+                )
 
             # ── PnL líquido com taxas (= engine.py) ────────────────────────
             qty_eth = sz * self.CT_VAL
@@ -705,7 +783,8 @@ class Bitget:
                         t["id"], fill_px, ts, reason, round(pnl_net, 6)
                     )
                     log.info(
-                        f"  💰 close_short | fill={fill_px:.2f} "
+                        f"  💰 close_short | entry={entry_price:.2f} "
+                        f"fill={fill_px:.2f} "
                         f"pnl_gross={pnl_gross:+.4f} "
                         f"fees={fees_total:.4f} "
                         f"pnl_net={pnl_net:+.4f} USDT"
@@ -778,6 +857,12 @@ class LiveTrader:
         self._forming_high: float = 0.0
         self._forming_low:  float = float('inf')
         self._forming_ts           = None
+
+        # FIX-17: Cooldown de proteção após abertura de posição.
+        # update_trailing_live é bloqueado até este timestamp (epoch float).
+        # Garante que o estado da estratégia se consolide e que um mark price
+        # fresco (pós-fill) seja obtido antes da primeira verificação de stop.
+        self._entry_cooldown_until: float = 0.0
 
     def _is_paper(self) -> bool:
         return self._paper_mode
@@ -1075,6 +1160,10 @@ class LiveTrader:
                     # PASSO 6: Confirmar fill na estratégia — mesmo snapshot_px
                     # usado no open_long acima (FIX-15: paridade garantida)
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
+                    # FIX-17: força _highest/_lowest ao fill real, eliminando qualquer
+                    # resíduo de open_p que strategy.next() possa ter gravado antes.
+                    self.strategy._highest = fill_px
+                    self.strategy._lowest  = float('inf')
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
@@ -1084,7 +1173,8 @@ class LiveTrader:
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    self._pending_entry_check = True
+                    self._pending_entry_check  = True
+                    self._entry_cooldown_until = time.time() + 2.0   # FIX-17: cooldown 2 s
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1124,6 +1214,9 @@ class LiveTrader:
 
                     close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, closed_candle['timestamp'])
                     # PASSO 6 (SELL): mesmo snapshot_px para estratégia (FIX-15)
+                    # FIX-17: força _lowest/_highest ao fill real.
+                    self.strategy._lowest  = fill_px
+                    self.strategy._highest = float('inf')
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
@@ -1133,7 +1226,8 @@ class LiveTrader:
                     self._cache_bal = self.strategy.balance
                     if self._is_paper():
                         self.paper.balance = self.strategy.balance
-                    self._pending_entry_check = True
+                    self._pending_entry_check  = True
+                    self._entry_cooldown_until = time.time() + 2.0   # FIX-17: cooldown 2 s
                     log.info(f"  ✅ SHORT confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1267,6 +1361,21 @@ class LiveTrader:
                 has_position = self.strategy.position_size != 0
 
                 if has_position:
+                    # FIX-17: Cooldown pós-entrada — bloqueia update_trailing_live
+                    # por 2 s após confirm_fill para que:
+                    #   (a) o estado da estratégia (_highest/_lowest) se consolide;
+                    #   (b) o próximo mark price obtido já seja posterior ao fill;
+                    #   (c) H/L do candle em formação sejam referências válidas.
+                    # Sem este cooldown, o trailing pode verificar o stop contra
+                    # extremas do candle ANTERIOR à entrada, fechando no mesmo preço.
+                    if time.time() < self._entry_cooldown_until:
+                        remaining = self._entry_cooldown_until - time.time()
+                        log.debug(
+                            f"  ⏳ [COOLDOWN] Trailing stop suspenso "
+                            f"({remaining:.1f}s restantes após entrada)"
+                        )
+                        time.sleep(SLEEP_CONSTANT)
+                        continue
                     ticker_px = self._mark_price_fast()
                     if ticker_px and ticker_px > 0:
                         self._cache_px = ticker_px
@@ -1560,6 +1669,9 @@ class LiveTrader:
                                         close_act = self.strategy.confirm_fill(
                                             'BUY', fill_px, qty_f, clk_candle['timestamp']
                                         )
+                                        # FIX-17: garante _highest = fill_px exato
+                                        self.strategy._highest = fill_px
+                                        self.strategy._lowest  = float('inf')
                                         if close_act:
                                             self._add_log(
                                                 close_act.get('action', 'REVERSAL'),
@@ -1576,7 +1688,8 @@ class LiveTrader:
                                         self._cache_bal = self.strategy.balance
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
-                                        self._pending_entry_check = True
+                                        self._pending_entry_check  = True
+                                        self._entry_cooldown_until = time.time() + 2.0  # FIX-17
                                         log.info(
                                             f"  ✅ [CLOCK] LONG confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
@@ -1644,6 +1757,9 @@ class LiveTrader:
                                         close_act = self.strategy.confirm_fill(
                                             'SELL', fill_px, qty_f, clk_candle['timestamp']
                                         )
+                                        # FIX-17: garante _lowest = fill_px exato
+                                        self.strategy._lowest  = fill_px
+                                        self.strategy._highest = float('inf')
                                         if close_act:
                                             self._add_log(
                                                 close_act.get('action', 'REVERSAL'),
@@ -1660,7 +1776,8 @@ class LiveTrader:
                                         self._cache_bal = self.strategy.balance
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
-                                        self._pending_entry_check = True
+                                        self._pending_entry_check  = True
+                                        self._entry_cooldown_until = time.time() + 2.0  # FIX-17
                                         log.info(
                                             f"  ✅ [CLOCK] SHORT confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
