@@ -1309,7 +1309,15 @@ class LiveTrader:
 
                     if time_since_entry > 3.0:
                         # Verifica gatilhos de saída da estratégia
-                        exit_signal, exit_px, reason = self.strategy.update_trailing_live(current_price=current_px)
+                        exit_act = self.strategy.update_trailing_live(
+                            high=(self._forming_high if self._forming_high > 0 else (current_px or 0.0)),
+                            low=(self._forming_low if self._forming_low < float('inf') else (current_px or 0.0)),
+                            ts=(self._forming_ts or datetime.now(timezone.utc)),
+                            current_price=current_px,
+                        )
+                        exit_signal = exit_act.get('action') if exit_act else None
+                        exit_px     = exit_act.get('price', 0.0) if exit_act else 0.0
+                        reason      = exit_act.get('exit_reason', 'STOP') if exit_act else ''
 
                         if exit_signal == "EXIT_LONG":
                             self.close_long(reason, exit_px)
