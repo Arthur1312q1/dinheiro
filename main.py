@@ -815,38 +815,47 @@ class LiveTrader:
 
     def close_long(self, reason: str, trigger_px: float):
         try:
-            # 1. Captura o preço REAL exato no momento do fechamento
-            real_exit_px = self._mark_price()
-
+            log.info(f"⏳ Executando fechamento LONG a mercado. Motivo: {reason}")
             if not self._is_paper():
-                # Executa ordem a mercado na exchange
-                self.bitget.close_long(abs(self.strategy.position_size), real_exit_px, reason)
+                self.bitget.close_long(abs(self.strategy.position_size), trigger_px, reason)
+                time.sleep(0.5)  # Aguarda liquidação na exchange
             else:
-                self._paper_close_long(real_exit_px, reason, brazil_iso())
+                self._paper_close_long(trigger_px, reason, brazil_iso())
 
-            # 2. Registra log e atualiza estado com o PREÇO REAL
+            real_exit_px = self._mark_price()
             self._add_log("SELL", real_exit_px, abs(self.strategy.position_size), reason)
-            self.strategy.position_size = 0
+
+            # Reset completo de estado e memória
+            self.strategy.position_size  = 0
             self.strategy.position_price = 0.0
-            self._cache_pos = None
-            log.info(f"🔴 LONG Fechado a {real_exit_px} (Gatilho teórico: {trigger_px}) - Motivo: {reason}")
+            self.strategy._trail_active  = False  # Zera o trailing
+            self._cache_pos              = None
+            self._prev_pos               = 0      # Reseta o detector de posição
+
+            log.info(f"🔴 LONG Fechado a {real_exit_px} (Gatilho: {trigger_px}) - Motivo: {reason}")
         except Exception as e:
             log.error(f"Erro crítico ao fechar LONG: {e}")
 
     def close_short(self, reason: str, trigger_px: float):
         try:
-            real_exit_px = self._mark_price()
-
+            log.info(f"⏳ Executando fechamento SHORT a mercado. Motivo: {reason}")
             if not self._is_paper():
-                self.bitget.close_short(abs(self.strategy.position_size), real_exit_px, reason)
+                self.bitget.close_short(abs(self.strategy.position_size), trigger_px, reason)
+                time.sleep(0.5)  # Aguarda liquidação na exchange
             else:
-                self._paper_close_short(real_exit_px, reason, brazil_iso())
+                self._paper_close_short(trigger_px, reason, brazil_iso())
 
+            real_exit_px = self._mark_price()
             self._add_log("BUY", real_exit_px, abs(self.strategy.position_size), reason)
-            self.strategy.position_size = 0
+
+            # Reset completo de estado e memória
+            self.strategy.position_size  = 0
             self.strategy.position_price = 0.0
-            self._cache_pos = None
-            log.info(f"🟢 SHORT Fechado a {real_exit_px} (Gatilho teórico: {trigger_px}) - Motivo: {reason}")
+            self.strategy._trail_active  = False  # Zera o trailing
+            self._cache_pos              = None
+            self._prev_pos               = 0      # Reseta o detector de posição
+
+            log.info(f"🟢 SHORT Fechado a {real_exit_px} (Gatilho: {trigger_px}) - Motivo: {reason}")
         except Exception as e:
             log.error(f"Erro crítico ao fechar SHORT: {e}")
 
@@ -1301,14 +1310,22 @@ class LiveTrader:
                 now_epoch: float = time.time()
 
                 # --- MONITORAMENTO INTRA-BARRA (Trailing Stop & SL) ---
-                if getattr(self.strategy, 'position_size', 0) != 0:
+                current_pos = getattr(self.strategy, 'position_size', 0)
+
+                # 1. Detecta nova entrada automaticamente e inicia o timer
+                if current_pos != 0 and getattr(self, '_prev_pos', 0) == 0:
+                    self._trade_start_time = time.time()
+                    log.info("⏱️ Cooldown de 5 segundos de proteção iniciado.")
+
+                self._prev_pos = current_pos
+
+                # 2. Monitoramento ativo
+                if current_pos != 0:
                     current_px = self._mark_price()
+                    time_alive = time.time() - getattr(self, '_trade_start_time', time.time())
 
-                    # Cooldown de 3 segundos para evitar fechamento imediato por spread/latência
-                    time_since_entry = time.time() - getattr(self, '_last_entry_time', 0)
-
-                    if time_since_entry > 3.0:
-                        # Verifica gatilhos de saída da estratégia
+                    # Só permite verificar stop após 5 segundos da confirmação da ordem
+                    if time_alive > 5.0:
                         exit_act = self.strategy.update_trailing_live(
                             high=(self._forming_high if self._forming_high > 0 else (current_px or 0.0)),
                             low=(self._forming_low if self._forming_low < float('inf') else (current_px or 0.0)),
@@ -1324,10 +1341,10 @@ class LiveTrader:
                         elif exit_signal == "EXIT_SHORT":
                             self.close_short(reason, exit_px)
 
-                    time.sleep(1)  # Loop rápido de 1s durante posição aberta
-                    continue       # Pula a busca de novos candles enquanto monitora a saída
+                    time.sleep(1)  # Mantém o loop rápido
+                    continue
                 else:
-                    time.sleep(1)  # Loop rápido de 1s enquanto flat
+                    time.sleep(1)  # Aguarda novos sinais
 
                 # ── CÁLCULO DO CICLO DO CANDLE (relógio local UTC) ───────────
                 # current_boundary: última borda que passou  (floor)
