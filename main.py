@@ -716,90 +716,6 @@ class Bitget:
 
         return r
 
-    # ── Plan Orders — Stop nativo da exchange ────────────────────────────────
-
-    def place_plan_order(self, close_side: str, qty_eth: float,
-                         trigger_px: float) -> Optional[str]:
-        """
-        Coloca uma Stop-Market plan order na Bitget (reduceOnly).
-
-        Args:
-            close_side : 'sell' (fecha LONG) ou 'buy' (fecha SHORT).
-            qty_eth    : tamanho em ETH; convertido para contratos internamente.
-            trigger_px : nível de gatilho em mark-price.
-
-        Returns:
-            orderId como str, ou None se falhou.
-        """
-        sz_cts = int(qty_eth / self.CT_VAL)
-        if sz_cts <= 0:
-            log.warning("  ⚠️ [PLAN-ORDER] sz_cts=0 — order não enviada")
-            return None
-        size_eth = round(sz_cts * self.CT_VAL, 8)
-        body = {
-            "symbol":       self.SYMBOL,
-            "productType":  self.PRODUCT_TYPE,
-            "marginMode":   "crossed",
-            "marginCoin":   self.MARGIN,
-            "size":         str(size_eth),
-            "planType":     "loss_plan",
-            "triggerPrice": str(round(trigger_px, 2)),
-            "triggerType":  "mark_price",
-            "side":         close_side,
-            "orderType":    "market",
-            "reduceOnly":   "YES",
-        }
-        try:
-            r = self._post("/api/v2/mix/order/place-plan-order", body)
-            if r.get("code") == "00000":
-                oid = str((r.get("data") or {}).get("orderId", ""))
-                log.info(f"  ✅ [PLAN-ORDER] {close_side.upper()} "
-                         f"trigger={trigger_px:.2f} sz={sz_cts}cts ordId={oid}")
-                return oid
-            log.error(f"  ❌ [PLAN-ORDER] code={r.get('code')} msg={r.get('msg')}")
-        except Exception as e:
-            log.error(f"  ❌ [PLAN-ORDER] exception: {e}")
-        return None
-
-    def cancel_plan_order(self, order_id: str) -> bool:
-        """Cancela uma plan order pelo orderId. Retorna True se sucesso."""
-        try:
-            r = self._post("/api/v2/mix/order/cancel-plan-order", {
-                "symbol":      self.SYMBOL,
-                "productType": self.PRODUCT_TYPE,
-                "orderId":     order_id,
-            })
-            ok = r.get("code") == "00000"
-            if ok:
-                log.info(f"  ✅ [PLAN-ORDER] Cancelada ordId={order_id}")
-            else:
-                log.warning(f"  ⚠️ [PLAN-ORDER] cancel falhou "
-                            f"ordId={order_id}: code={r.get('code')} "
-                            f"msg={r.get('msg')}")
-            return ok
-        except Exception as e:
-            log.error(f"  ❌ [PLAN-ORDER] cancel exception: {e}")
-            return False
-
-    def cancel_all_plan_orders(self) -> bool:
-        """Cancela todas as plan orders pendentes do símbolo (cleanup de emergência)."""
-        try:
-            r = self._post("/api/v2/mix/order/cancel-all-plan-order", {
-                "symbol":      self.SYMBOL,
-                "productType": self.PRODUCT_TYPE,
-                "planType":    "loss_plan",
-            })
-            ok = r.get("code") == "00000"
-            if ok:
-                log.info("  ✅ [PLAN-ORDER] Todas as plan orders canceladas")
-            else:
-                log.warning(f"  ⚠️ [PLAN-ORDER] cancel-all: "
-                            f"code={r.get('code')} msg={r.get('msg')}")
-            return ok
-        except Exception as e:
-            log.error(f"  ❌ [PLAN-ORDER] cancel-all exception: {e}")
-            return False
-
     def ct_val(self):
         return self.CT_VAL
 
@@ -817,7 +733,6 @@ class Bitget:
                 log.warning(f"  setup leverage {hold}: {e}")
         bal = self.balance()
         px  = self.mark_price()
-        self.cancel_all_plan_orders()
         log.info(f"  Bitget v2 | Saldo: {bal:.4f} USDT | Preco: {px:.2f}")
         return bal, px
 
@@ -864,13 +779,6 @@ class LiveTrader:
         self._forming_low:  float = float('inf')
         self._forming_ts           = None
 
-        # ── Plan Order (SL nativo — LIVE only) ───────────────────────────────
-        # O modo PAPER continua usando monitoramento local inalterado.
-        self._sl_order_id:   Optional[str] = None  # orderId da plan order ativa
-        self._last_sl_px:    float         = 0.0   # último trigger enviado à exchange
-        self._sl_hold_side:  str           = ""    # 'long' ou 'short'
-        self._sl_qty_eth:    float         = 0.0   # tamanho da posição monitorada
-
     def _is_paper(self) -> bool:
         return self._paper_mode
 
@@ -905,127 +813,40 @@ class LiveTrader:
         """
         return self._get_mark_price_with_retry(max_attempts=2, delay=0.2)
 
-    # ── Helpers de Plan Order (LIVE only) ─────────────────────────────────────
-
-    def _cancel_active_sl(self):
-        """Cancela a plan order de SL ativa, se houver. No-op em paper mode."""
-        if self._is_paper() or not self._sl_order_id:
-            return
-        self.bitget.cancel_plan_order(self._sl_order_id)
-        self._sl_order_id = None
-        self._last_sl_px  = 0.0
-
-    def _update_exchange_sl(self, new_stop_px: float, qty_eth: float, hold_side: str):
-        """
-        Cancela a plan order anterior e coloca uma nova no preço atualizado.
-        Só executa em modo LIVE. Ignora updates com variação < $0.10 para
-        evitar spam de API. hold_side: 'long' ou 'short'.
-        """
-        if self._is_paper() or new_stop_px <= 0:
-            return
-        # Ignora se o stop praticamente não mudou
-        if self._sl_order_id and abs(new_stop_px - self._last_sl_px) < 0.10:
-            return
-        if self._sl_order_id:
-            self.bitget.cancel_plan_order(self._sl_order_id)
-            self._sl_order_id = None
-        close_side = "sell" if hold_side == "long" else "buy"
-        oid = self.bitget.place_plan_order(close_side, qty_eth, new_stop_px)
-        if oid:
-            self._sl_order_id = oid
-            self._last_sl_px  = new_stop_px
-            log.info(f"  🔄 [SL-UPDATE] {hold_side.upper()} stop={new_stop_px:.2f} "
-                     f"orderId={oid}")
-        else:
-            log.warning(f"  ⚠️ [SL-UPDATE] Falha ao colocar SL @ {new_stop_px:.2f} — "
-                        f"polling local mantém proteção de fallback")
-
-    def _reconcile_exchange_close(self, approx_px: float, reason: str = "SL_EXCHANGE"):
-        """
-        Chamado quando a exchange fechou a posição (plan order acionada).
-        Atualiza histórico com preço aproximado e reseta todo o estado interno.
-        approx_px: mark price atual — proxy do fill real da plan order.
-        """
-        qty_closed  = abs(self.strategy.position_size)
-        is_long     = self.strategy.position_size > 0
-        side_closed = 'EXIT_LONG' if is_long else 'EXIT_SHORT'
-        hist_action = 'BUY'       if is_long else 'SELL'
-        log_emoji   = '🔴'        if is_long else '🟢'
-
-        ts = brazil_iso()
-        for t in reversed(history_mgr.get_all_trades()):
-            if t.get("action") == hist_action and t.get("status") == "open":
-                entry_price = t.get("entry_price", approx_px)
-                open_fee    = t.get("open_fee", 0.0)
-                close_fee   = _calc_fee(approx_px, qty_closed, CLOSE_FEE_PCT)
-                pnl_gross   = ((approx_px - entry_price) * qty_closed if is_long
-                               else (entry_price - approx_px) * qty_closed)
-                pnl_net     = pnl_gross - open_fee - close_fee
-                history_mgr.close_trade(t["id"], approx_px, ts, reason,
-                                        round(pnl_net, 6))
-                log.info(f"  🏦 [SL-EXCHANGE] Reconciliação | "
-                         f"fill≈{approx_px:.2f} pnl_net={pnl_net:+.4f} USDT")
-                break
-
-        self._add_log(side_closed, approx_px, qty_closed, reason)
-
-        # Reset completo de estado
-        self.strategy.position_size  = 0
-        self.strategy.position_price = 0.0
-        self.strategy._trail_active  = False
-        self.strategy._monitored     = False
-        self.strategy._highest       = 0.0
-        self.strategy._lowest        = float('inf')
-        self._cache_pos              = None
-        self._sl_order_id            = None
-        self._last_sl_px             = 0.0
-        self._last_entry_time        = 0.0
-        self._forming_high           = 0.0
-        self._forming_low            = float('inf')
-        log.info(f"  {log_emoji} [SL-EXCHANGE] Posição fechada pela exchange "
-                 f"@ ~{approx_px:.2f} | motivo={reason}")
-
     def close_long(self, reason: str, trigger_px: float):
         try:
-            self._cancel_active_sl()   # cancela plan order antes de executar localmente
+            # 1. Captura o preço REAL exato no momento do fechamento
             real_exit_px = self._mark_price()
+
             if not self._is_paper():
+                # Executa ordem a mercado na exchange
                 self.bitget.close_long(abs(self.strategy.position_size), real_exit_px, reason)
             else:
                 self._paper_close_long(real_exit_px, reason, brazil_iso())
+
+            # 2. Registra log e atualiza estado com o PREÇO REAL
             self._add_log("SELL", real_exit_px, abs(self.strategy.position_size), reason)
-            # Reset completo — evita EXIT fantasma na próxima entrada
-            self.strategy.position_size  = 0
+            self.strategy.position_size = 0
             self.strategy.position_price = 0.0
-            self.strategy._trail_active  = False
-            self.strategy._monitored     = False
-            self.strategy._highest       = 0.0
-            self.strategy._lowest        = float('inf')
-            self._cache_pos              = None
-            self._last_entry_time        = 0.0
-            log.info(f"🔴 LONG Fechado a {real_exit_px:.2f} (Gatilho: {trigger_px:.2f}) - Motivo: {reason}")
+            self._cache_pos = None
+            log.info(f"🔴 LONG Fechado a {real_exit_px} (Gatilho teórico: {trigger_px}) - Motivo: {reason}")
         except Exception as e:
             log.error(f"Erro crítico ao fechar LONG: {e}")
 
     def close_short(self, reason: str, trigger_px: float):
         try:
-            self._cancel_active_sl()   # cancela plan order antes de executar localmente
             real_exit_px = self._mark_price()
+
             if not self._is_paper():
                 self.bitget.close_short(abs(self.strategy.position_size), real_exit_px, reason)
             else:
                 self._paper_close_short(real_exit_px, reason, brazil_iso())
+
             self._add_log("BUY", real_exit_px, abs(self.strategy.position_size), reason)
-            # Reset completo — evita EXIT fantasma na próxima entrada
-            self.strategy.position_size  = 0
+            self.strategy.position_size = 0
             self.strategy.position_price = 0.0
-            self.strategy._trail_active  = False
-            self.strategy._monitored     = False
-            self.strategy._highest       = 0.0
-            self.strategy._lowest        = float('inf')
-            self._cache_pos              = None
-            self._last_entry_time        = 0.0
-            log.info(f"🟢 SHORT Fechado a {real_exit_px:.2f} (Gatilho: {trigger_px:.2f}) - Motivo: {reason}")
+            self._cache_pos = None
+            log.info(f"🟢 SHORT Fechado a {real_exit_px} (Gatilho teórico: {trigger_px}) - Motivo: {reason}")
         except Exception as e:
             log.error(f"Erro crítico ao fechar SHORT: {e}")
 
@@ -1192,14 +1013,6 @@ class LiveTrader:
                 )
 
             # ── PASSO 4: Processar saídas com snapshot_px ─────────────────────
-            # Guarda de cooldown: ignora EXITs por 5s após uma entrada para
-            # evitar que lixo de estado feche a trade no mesmo snapshot_px da abertura.
-            time_since_entry = time.time() - getattr(self, '_last_entry_time', 0)
-            if exits and time_since_entry < 5.0:
-                log.info(f"  🛡️ [COOLDOWN] {len(exits)} EXIT(s) ignorados — "
-                         f"{time_since_entry:.1f}s desde última entrada (< 5s)")
-                exits = []
-
             for act in exits:
                 kind  = act.get('action', '')
                 a_qty = float(act.get('qty') or 0)
@@ -1282,7 +1095,6 @@ class LiveTrader:
                             continue
                         if pos and pos['side'] == 'short':
                             log.info(f"  ↩️ LIVE REVERSAL: fechando SHORT @ {fill_px:.2f}")
-                            self._cancel_active_sl()
                             try:
                                 self.bitget.close_short(pos['size'], fill_px, "REVERSAL")
                             except Exception as _e:
@@ -1311,12 +1123,6 @@ class LiveTrader:
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
                     self._last_entry_time = time.time()
-                    # LIVE: coloca SL inicial na exchange imediatamente após entrada
-                    if not self._is_paper():
-                        self._sl_order_id = None
-                        self._last_sl_px  = 0.0
-                        sl_init = getattr(self.strategy, 'long_stop', 0.0)
-                        self._update_exchange_sl(sl_init, qty_f, 'long')
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1340,7 +1146,6 @@ class LiveTrader:
                             continue
                         if pos and pos['side'] == 'long':
                             log.info(f"  ↩️ LIVE REVERSAL: fechando LONG @ {fill_px:.2f}")
-                            self._cancel_active_sl()
                             try:
                                 self.bitget.close_long(pos['size'], fill_px, "REVERSAL")
                             except Exception as _e:
@@ -1368,12 +1173,6 @@ class LiveTrader:
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
                     self._last_entry_time = time.time()
-                    # LIVE: coloca SL inicial na exchange imediatamente após entrada
-                    if not self._is_paper():
-                        self._sl_order_id = None
-                        self._last_sl_px  = 0.0
-                        sl_init = getattr(self.strategy, 'short_stop', 0.0)
-                        self._update_exchange_sl(sl_init, qty_f, 'short')
                     log.info(f"  ✅ SHORT confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1501,96 +1300,91 @@ class LiveTrader:
 
                 now_epoch: float = time.time()
 
-                # --- MONITORAMENTO INTRA-BARRA ---
-                # PAPER : polling local com update_trailing_live (sem alterações)
-                # LIVE  : atualiza SL na exchange quando trailing avança;
-                #         se posição sumiu → reconcilia com _reconcile_exchange_close
-                current_pos = getattr(self.strategy, 'position_size', 0)
+                # ── PRIORIDADE 0: Atualiza cache H/L do candle em formação ──────
+                # Executado em TODA iteração — com ou sem posição aberta.
+                # Garante que _forming_high/_forming_low reflitam o high/low real
+                # da barra atual ANTES de qualquer verificação de stop, replicando
+                # exatamente o comportamento do backtesting (SL vs H/L do candle).
+                _candles_p0 = self._candle_single()
+                if _candles_p0 is not None and len(_candles_p0) >= 2:
+                    try:
+                        _fr              = _candles_p0[0]
+                        self._forming_high = float(_fr[2])
+                        self._forming_low  = float(_fr[3])
+                        self._forming_ts   = datetime.fromtimestamp(
+                            int(_fr[0]) / 1000, tz=timezone.utc)
+                        forming_open_cache = float(_fr[1])
+                    except (ValueError, IndexError) as _e0:
+                        log.warning(f"  ⚠️ [P0] Erro cache forming: {_e0}")
 
-                # Detecta nova entrada e inicia timer de cooldown
-                if current_pos != 0 and getattr(self, '_prev_pos', 0) == 0:
-                    self._trade_start_time = time.time()
-                    log.info("⏱️ [COOLDOWN] 5s de proteção iniciado")
-                self._prev_pos = current_pos
-
-                if current_pos != 0:
-                    current_px = self._mark_price_fast()
-                    time_alive = time.time() - getattr(self, '_trade_start_time', time.time())
-
-                    if self._is_paper():
-                        # ── PAPER: polling local completo ────────────────────
-                        if time_alive > 5.0 and current_px and current_px > 0:
-                            exit_act = self.strategy.update_trailing_live(
-                                high=(self._forming_high if self._forming_high > 0
-                                      else current_px),
-                                low=(self._forming_low if self._forming_low < float('inf')
-                                     else current_px),
-                                ts=(self._forming_ts or datetime.now(timezone.utc)),
-                                current_price=current_px,
-                            )
-                            if exit_act:
-                                e_signal = exit_act.get('action')
-                                e_px     = exit_act.get('price', current_px)
-                                e_rsn    = exit_act.get('exit_reason', 'STOP')
-                                if e_signal == "EXIT_LONG":
-                                    self.close_long(e_rsn, e_px)
-                                elif e_signal == "EXIT_SHORT":
-                                    self.close_short(e_rsn, e_px)
-                    else:
-                        # ── LIVE: SL dorme na exchange ────────────────────────
-                        # 1. Verifica se a exchange já fechou a posição (SL acionado)
-                        exchange_pos = None
+                    # Fallback REST: processa candle fechado (qualquer estado)
+                    if len(_candles_p0[1]) >= 5:
                         try:
-                            exchange_pos = self.bitget.position()
-                        except Exception as _ep:
-                            log.warning(f"  ⚠️ [LIVE-POLL] Erro ao checar posição: {_ep}")
+                            _prev_ts_raw_p0 = int(_candles_p0[1][0])
+                            if (last_processed_closed_ts is None
+                                    or _prev_ts_raw_p0 > last_processed_closed_ts):
+                                _prev_ts_p0 = datetime.fromtimestamp(
+                                    _prev_ts_raw_p0 / 1000, tz=timezone.utc)
+                                _cc_p0: Dict = {
+                                    'open':      float(_candles_p0[1][1]),
+                                    'high':      float(_candles_p0[1][2]),
+                                    'low':       float(_candles_p0[1][3]),
+                                    'close':     float(_candles_p0[1][4]),
+                                    'timestamp': _prev_ts_p0,
+                                    'index':     self.strategy._bar + 1,
+                                }
+                                log.info(
+                                    f"  🕯️ [FALLBACK-REST] Candle [{_prev_ts_raw_p0}]: "
+                                    f"O={_cc_p0['open']:.2f} H={_cc_p0['high']:.2f} "
+                                    f"L={_cc_p0['low']:.2f} C={_cc_p0['close']:.2f}"
+                                )
+                                _new_ts_p0 = self._process_closed_candle(
+                                    _cc_p0, _prev_ts_raw_p0, last_processed_closed_ts)
+                                if _new_ts_p0 is not None:
+                                    last_processed_closed_ts = _new_ts_p0
+                                    log.info(f"  ✔ [FALLBACK-REST] Candle {_prev_ts_raw_p0} processado")
+                                else:
+                                    log.warning(f"  ⚠️ [FALLBACK-REST] Processamento {_prev_ts_raw_p0} falhou")
+                                self._refresh_cache()
+                        except (ValueError, IndexError) as _e0b:
+                            log.warning(f"  ⚠️ [P0] Erro fallback REST: {_e0b}")
 
-                        if exchange_pos is None and time_alive > 5.0:
-                            # Posição desapareceu → SL foi acionado pela exchange
-                            mark_now = self._mark_price() or current_px or 0.0
-                            log.info("  🏦 [LIVE-POLL] Posição fechada pela exchange — "
-                                     "reconciliando estado interno")
-                            with self._pos_lock:
-                                self._reconcile_exchange_close(mark_now, "SL_EXCHANGE")
-                            self._prev_pos = 0
-                            time.sleep(1)
-                            continue
+                # ── PRIORIDADE 1: Verificação SL/trailing intrabar ──────────────
+                # Usa H/L frescos (atualizados acima) — replica a lógica do
+                # backtesting que verifica SL contra high/low de cada barra.
+                if getattr(self.strategy, 'position_size', 0) != 0:
+                    current_px = self._mark_price_fast()
 
-                        # 2. Trailing avançou? → atualiza plan order na exchange
-                        if time_alive > 5.0 and current_px and current_px > 0:
-                            exit_act = self.strategy.update_trailing_live(
-                                high=(self._forming_high if self._forming_high > 0
-                                      else current_px),
-                                low=(self._forming_low if self._forming_low < float('inf')
-                                     else current_px),
-                                ts=(self._forming_ts or datetime.now(timezone.utc)),
-                                current_price=current_px,
-                            )
-                            if exit_act:
-                                # update_trailing_live retornou exit → trailing acionou
-                                # localmente; cancela SL e fecha a mercado como fallback
-                                e_signal = exit_act.get('action')
-                                e_px     = exit_act.get('price', current_px)
-                                e_rsn    = exit_act.get('exit_reason', 'STOP')
-                                log.info(f"  ⚡ [LIVE-TRAIL] exit local={e_signal} "
-                                         f"@ {e_px:.2f} — fechando a mercado (fallback)")
-                                if e_signal == "EXIT_LONG":
-                                    self.close_long(e_rsn, e_px)
-                                elif e_signal == "EXIT_SHORT":
-                                    self.close_short(e_rsn, e_px)
-                            else:
-                                # Sem exit ainda → verifica se stop subiu e atualiza SL
-                                is_long   = current_pos > 0
-                                new_sl    = (getattr(self.strategy, 'long_stop',  0.0)
-                                             if is_long else
-                                             getattr(self.strategy, 'short_stop', 0.0))
-                                hold_side = 'long' if is_long else 'short'
-                                qty_open  = abs(current_pos)
-                                if new_sl and new_sl > 0:
-                                    self._update_exchange_sl(new_sl, qty_open, hold_side)
+                    time_since_entry = time.time() - getattr(self, '_last_entry_time', 0)
+
+                    if time_since_entry > 3.0 and current_px and current_px > 0:
+                        # eff_high/eff_low: máximo entre H/L do candle REST e
+                        # mark price atual (cobre extremos não capturados pelo REST)
+                        eff_high = max(
+                            self._forming_high if self._forming_high > 0 else current_px,
+                            current_px,
+                        )
+                        eff_low = min(
+                            self._forming_low if self._forming_low < float('inf') else current_px,
+                            current_px,
+                        )
+                        exit_act = self.strategy.update_trailing_live(
+                            high=eff_high,
+                            low=eff_low,
+                            ts=(self._forming_ts or datetime.now(timezone.utc)),
+                            current_price=current_px,
+                        )
+                        if exit_act:
+                            e_signal = exit_act.get('action')
+                            e_px     = exit_act.get('price', current_px)
+                            e_rsn    = exit_act.get('exit_reason', 'STOP')
+                            if e_signal == "EXIT_LONG":
+                                self.close_long(e_rsn, e_px)
+                            elif e_signal == "EXIT_SHORT":
+                                self.close_short(e_rsn, e_px)
 
                     time.sleep(1)
-                    continue
+                    continue  # candle já processado em P0; pula clock-sync
                 else:
                     time.sleep(1)
 
@@ -1781,7 +1575,6 @@ class LiveTrader:
                                                     f"  ↩️ [CLOCK] REVERSAL: "
                                                     f"fechando SHORT @ {fill_px:.2f}"
                                                 )
-                                                self._cancel_active_sl()
                                                 try:
                                                     self.bitget.close_short(
                                                         pos['size'], fill_px, "REVERSAL"
@@ -1829,12 +1622,6 @@ class LiveTrader:
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
-                                        # LIVE: SL inicial na exchange
-                                        if not self._is_paper():
-                                            self._sl_order_id = None
-                                            self._last_sl_px  = 0.0
-                                            sl_init = getattr(self.strategy, 'long_stop', 0.0)
-                                            self._update_exchange_sl(sl_init, qty_f, 'long')
                                         log.info(
                                             f"  ✅ [CLOCK] LONG confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
@@ -1873,7 +1660,6 @@ class LiveTrader:
                                                     f"  ↩️ [CLOCK] REVERSAL: "
                                                     f"fechando LONG @ {fill_px:.2f}"
                                                 )
-                                                self._cancel_active_sl()
                                                 try:
                                                     self.bitget.close_long(
                                                         pos['size'], fill_px, "REVERSAL"
@@ -1921,12 +1707,6 @@ class LiveTrader:
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
-                                        # LIVE: SL inicial na exchange
-                                        if not self._is_paper():
-                                            self._sl_order_id = None
-                                            self._last_sl_px  = 0.0
-                                            sl_init = getattr(self.strategy, 'short_stop', 0.0)
-                                            self._update_exchange_sl(sl_init, qty_f, 'short')
                                         log.info(
                                             f"  ✅ [CLOCK] SHORT confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
@@ -1956,78 +1736,9 @@ class LiveTrader:
                         )
 
                 # ── PRIORIDADE 4 (FALLBACK SEGURO): Validação e Sync REST ────
-                # Alimenta o cache do candle em formação (forming_open_cache,
-                # _forming_high, _forming_low, _forming_ts) e processa via
-                # _process_closed_candle() qualquer candle fechado que o
-                # clock-sync não tenha capturado (restart, clock drift,
-                # primeira iteração antes do cache estar populado).
-                candles = self._candle_single()
-                if candles is not None and len(candles) >= 2:
-
-                    # Atualiza cache do candle em formação
-                    try:
-                        forming_raw        = candles[0]
-                        _form_ts           = datetime.fromtimestamp(
-                            int(forming_raw[0]) / 1000, tz=timezone.utc
-                        )
-                        forming_open_cache = float(forming_raw[1])   # open do forming
-                        self._forming_high = float(forming_raw[2])
-                        self._forming_low  = float(forming_raw[3])
-                        self._forming_ts   = _form_ts
-                    except (ValueError, IndexError) as e:
-                        log.warning(f"  ⚠️ Erro extração candle em formação: {e}")
-
-                    # Fallback: processar candle fechado não capturado pelo clock-sync
-                    if len(candles[1]) >= 5:
-                        try:
-                            prev_ts_raw = int(candles[1][0])
-                        except (ValueError, IndexError) as e:
-                            log.warning(f"  ⚠️ Erro timestamp candle fechado REST: {e}")
-                            time.sleep(SLEEP_CONSTANT)
-                            continue
-
-                        if (last_processed_closed_ts is None
-                                or prev_ts_raw > last_processed_closed_ts):
-                            try:
-                                prev_ts            = datetime.fromtimestamp(
-                                    prev_ts_raw / 1000, tz=timezone.utc
-                                )
-                                closed_candle_rest: Dict = {
-                                    'open':      float(candles[1][1]),
-                                    'high':      float(candles[1][2]),
-                                    'low':       float(candles[1][3]),
-                                    'close':     float(candles[1][4]),
-                                    'timestamp': prev_ts,
-                                    'index':     self.strategy._bar + 1,
-                                }
-                            except (ValueError, IndexError) as e:
-                                log.warning(f"  ⚠️ Erro extração candle REST: {e}")
-                                time.sleep(SLEEP_CONSTANT)
-                                continue
-
-                            log.info(
-                                f"  🕯️ [FALLBACK-REST] Candle [{prev_ts_raw}]: "
-                                f"O={closed_candle_rest['open']:.2f} "
-                                f"H={closed_candle_rest['high']:.2f} "
-                                f"L={closed_candle_rest['low']:.2f} "
-                                f"C={closed_candle_rest['close']:.2f}"
-                            )
-
-                            new_ts = self._process_closed_candle(
-                                closed_candle_rest, prev_ts_raw, last_processed_closed_ts
-                            )
-                            if new_ts is not None:
-                                last_processed_closed_ts = new_ts
-                                log.info(
-                                    f"  ✔ [FALLBACK-REST] Candle {prev_ts_raw} processado"
-                                )
-                            else:
-                                log.warning(
-                                    f"  ⚠️ [FALLBACK-REST] Processamento "
-                                    f"{prev_ts_raw} falhou"
-                                )
-
-                            self._refresh_cache()
+                # Nota: o fetch e o update do cache de formação foram movidos para
+                # PRIORIDADE 0 (topo do loop) para garantir H/L frescos antes do
+                # bloco de monitoramento intrabar — candle já processado acima.
 
                 time.sleep(SLEEP_CONSTANT)
 
