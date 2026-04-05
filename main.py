@@ -1123,6 +1123,7 @@ class LiveTrader:
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
                     self._last_entry_time = time.time()
+                    self.strategy._just_filled = True   # FIX-17: próximo poll usa is_entry_candle
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1173,6 +1174,7 @@ class LiveTrader:
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
                     self._last_entry_time = time.time()
+                    self.strategy._just_filled = True   # FIX-17: próximo poll usa is_entry_candle
                     log.info(f"  ✅ SHORT confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1350,28 +1352,23 @@ class LiveTrader:
                             log.warning(f"  ⚠️ [P0] Erro fallback REST: {_e0b}")
 
                 # ── PRIORIDADE 1: Verificação SL/trailing intrabar ──────────────
-                # Usa H/L frescos (atualizados acima) — replica a lógica do
-                # backtesting que verifica SL contra high/low de cada barra.
+                # Replica exatamente _check_trail do backtest:
+                #   • poll normal  → usa H/L do candle em formação (sem injeção de mark price)
+                #   • is_entry_candle=True → usa current_price pós-fill (_just_filled)
                 if getattr(self.strategy, 'position_size', 0) != 0:
                     current_px = self._mark_price_fast()
 
-                    time_since_entry = time.time() - getattr(self, '_last_entry_time', 0)
+                    # is_entry_candle=True apenas no primeiro poll após confirm_fill()
+                    is_entry = getattr(self.strategy, '_just_filled', False)
+                    if is_entry:
+                        self.strategy._just_filled = False   # consome o flag
 
-                    if time_since_entry > 3.0 and current_px and current_px > 0:
-                        # eff_high/eff_low: máximo entre H/L do candle REST e
-                        # mark price atual (cobre extremos não capturados pelo REST)
-                        eff_high = max(
-                            self._forming_high if self._forming_high > 0 else current_px,
-                            current_px,
-                        )
-                        eff_low = min(
-                            self._forming_low if self._forming_low < float('inf') else current_px,
-                            current_px,
-                        )
+                    if current_px and current_px > 0:
                         exit_act = self.strategy.update_trailing_live(
-                            high=eff_high,
-                            low=eff_low,
+                            high=self._forming_high if self._forming_high > 0 else current_px,
+                            low=self._forming_low  if self._forming_low < float('inf') else current_px,
                             ts=(self._forming_ts or datetime.now(timezone.utc)),
+                            is_entry_candle=is_entry,
                             current_price=current_px,
                         )
                         if exit_act:
@@ -1622,6 +1619,7 @@ class LiveTrader:
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
+                                        self.strategy._just_filled = True   # FIX-17
                                         log.info(
                                             f"  ✅ [CLOCK] LONG confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
@@ -1707,6 +1705,7 @@ class LiveTrader:
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
+                                        self.strategy._just_filled = True   # FIX-17
                                         log.info(
                                             f"  ✅ [CLOCK] SHORT confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
