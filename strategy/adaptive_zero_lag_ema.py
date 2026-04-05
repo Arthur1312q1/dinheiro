@@ -31,13 +31,15 @@
 #    • Elimina dessincronização entre o mark price real e as extremas do candle
 #      que causava atrasos na execução de SL/Trail no modo live.
 #
-#  FIX-14 (Rastreamento Pós-Fill + Limpeza de Stops Obsoletos):
-#    • is_entry_candle=True agora atualiza _highest/_lowest com current_price
-#      (mark price pós-fill), ativando trailing precocemente se o preço mover
-#      o suficiente antes do próximo poll de candle. Antes: verificava APENAS
-#      o SL inicial, perdendo oportunidade de rastreamento imediato.
-#    • long_stop/short_stop são zerados quando position_size == 0, evitando
-#      que o main.py leia valores residuais de trades anteriores.
+#  FIX-17 (Paridade Total Backtest/Live — _check_trail):
+#    • update_trailing_live reescrito para ser IDÊNTICO ao _check_trail do
+#      backtest: poll normal usa high/low diretamente (sem injeção de mark
+#      price), eliminando divergências causadas pelo "gatilho duplo" do FIX-12.
+#    • is_entry_candle=True usa current_price exclusivamente (sem eff_curr
+#      wrapper), mantendo o tratamento especial do candle de entrada.
+#    • _just_filled (bool em AdaptiveZeroLagEMA) sinaliza ao loop de main.py
+#      que o próximo poll deve passar is_entry_candle=True e depois reset.
+#      Flag setado em main.py após cada confirm_fill (caminhos _process e CLOCK).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
@@ -680,7 +682,7 @@ class AdaptiveZeroLagEMA:
         self._monitored      = False
 
     # ═══════════════════════════════════════════════════════════════════════
-    # FIX-12 / FIX-14: update_trailing_live — Mark Price Instantâneo
+    # FIX-17: update_trailing_live — Paridade total com backtest (_check_trail)
     # ═══════════════════════════════════════════════════════════════════════
     def update_trailing_live(
         self,
@@ -691,134 +693,92 @@ class AdaptiveZeroLagEMA:
         current_price:    float = 0.0,
     ) -> Optional[Dict]:
         """
-        Versão LIVE do trailing stop — atualiza _highest/_lowest e verifica saída.
+        VERSÃO CORRIGIDA PARA PARIDADE TOTAL COM BACKTEST.
+        Agora é idêntica ao _check_trail do backtest, com tratamento especial
+        apenas no candle de entrada (is_entry_candle=True).
 
         NÃO avança _bar, NÃO recalcula IFM/ZLEMA.
-        Chamar a cada ~1 s com posição aberta, ~15 s sem posição.
 
         Args:
             high, low       : H/L do candle em formação (cache do último fetch).
             ts              : timestamp do poll.
             is_entry_candle : True apenas no primeiro poll APÓS confirmação
-                              de uma nova entrada (FIX-3 / FIX-4).
-                              Quando True, usa `current_price` (ticker/last)
-                              em vez do H/L histórico do candle para verificar
-                              o stop — elimina saídas falsas por preços
-                              ocorridos ANTES do fill da ordem.
-            current_price   : mark price em tempo real (ticker/last).
-                              FIX-12: injetado em eff_high/eff_low para
-                              garantir que o stop seja verificado contra o
-                              preço real, não apenas as extremas do candle REST
-                              que possuem atraso de atualização.
+                              de uma nova entrada. Quando True, usa
+                              current_price (mark price pós-fill) para
+                              verificar e atualizar _highest/_lowest —
+                              elimina saídas falsas por preços anteriores
+                              ao fill e permite ativação precoce do trail.
+            current_price   : mark price em tempo real (usado apenas quando
+                              is_entry_candle=True).
 
         Returns:
             Dict de saída se stop foi atingido, None caso contrário.
         """
         if self.position_size == 0.0 or not self._monitored:
-            # FIX-14: limpa stops obsoletos quando flat — evita leitura de
-            # valores residuais de trades anteriores pelo main.py.
             self.long_stop  = 0.0
             self.short_stop = 0.0
             return None
 
-        # ── FIX-12: Injetar o Mark Price instantâneo nas extremas do candle ──
-        # eff_high = máximo entre o high do candle REST e o preço atual de mercado
-        # eff_low  = mínimo entre o low do candle REST e o preço atual de mercado
-        # Isso garante que, mesmo que o candle REST ainda não tenha atualizado
-        # suas extremas, o stop seja verificado com o preço real mais recente.
-        eff_high = max(high, current_price) if current_price and current_price > 0 else high
-        eff_low  = min(low,  current_price) if current_price and current_price > 0 else low
-        eff_curr = current_price if current_price and current_price > 0 else None
-
+        # ==================== CANDLE DE ENTRADA (pós-fill) ====================
         if is_entry_candle:
-            # ── FIX-3 / FIX-14: candle de entrada — NÃO usa H/L histórico ──
-            # _highest/_lowest foram inicializados ao preço de fill por confirm_fill().
-            # Atualiza apenas com current_price (mark price pós-fill) para rastrear
-            # movimentos favoráveis desde o primeiro poll, sem contaminar com
-            # extremas de velas anteriores ao fill.
-            if not eff_curr:
-                # Sem ticker disponível: não verifica (seguro — próximo poll fará)
+            if current_price <= 0.0:
                 return None
+            price = current_price
 
             if self.position_size > 0.0:
-                # Permite que _highest cresça com o mark price pós-fill
-                self._highest = max(self._highest, eff_curr)
-                profit_ticks  = (self._highest - self.position_price) / self.tick
+                self._highest = max(self._highest, price)
+                profit_ticks = (self._highest - self.position_price) / self.tick
                 if profit_ticks >= self.tp:
                     self._trail_active = True
 
-                if self._trail_active:
-                    stop = self._highest - self.toff * self.tick
-                    rsn  = "TRAIL"
-                else:
-                    stop = self.position_price - self.sl * self.tick
-                    rsn  = "SL"
+                stop = (self._highest - self.toff * self.tick) if self._trail_active else \
+                       (self.position_price - self.sl * self.tick)
+                rsn = "TRAIL" if self._trail_active else "SL"
                 self.long_stop = stop
-                if eff_curr <= stop:
+                if price <= stop:
                     return self._exit_at(stop, "long", rsn, ts)
 
             elif self.position_size < 0.0:
-                # Permite que _lowest caia com o mark price pós-fill
-                self._lowest = min(self._lowest, eff_curr)
+                self._lowest = min(self._lowest, price)
                 profit_ticks = (self.position_price - self._lowest) / self.tick
                 if profit_ticks >= self.tp:
                     self._trail_active = True
 
-                if self._trail_active:
-                    stop = self._lowest + self.toff * self.tick
-                    rsn  = "TRAIL"
-                else:
-                    stop = self.position_price + self.sl * self.tick
-                    rsn  = "SL"
+                stop = (self._lowest + self.toff * self.tick) if self._trail_active else \
+                       (self.position_price + self.sl * self.tick)
+                rsn = "TRAIL" if self._trail_active else "SL"
                 self.short_stop = stop
-                if eff_curr >= stop:
+                if price >= stop:
                     return self._exit_at(stop, "short", rsn, ts)
-
             return None
 
-        # ── Poll normal (não-entry): usa eff_high/eff_low (candle + mark price) ──
+        # ==================== POLL NORMAL (igual ao backtest) ====================
         if self.position_size > 0.0:
-            self._highest = max(self._highest, eff_high)
-            profit_ticks  = (self._highest - self.position_price) / self.tick
+            self._highest = max(self._highest, high)
+            profit_ticks = (self._highest - self.position_price) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
 
-            if self._trail_active:
-                stop = self._highest - self.toff * self.tick
-                rsn  = "TRAIL"
-            else:
-                stop = self.position_price - self.sl * self.tick
-                rsn  = "SL"
-
+            stop = (self._highest - self.toff * self.tick) if self._trail_active else \
+                   (self.position_price - self.sl * self.tick)
+            rsn = "TRAIL" if self._trail_active else "SL"
             self.long_stop = stop
 
-            # FIX-12: gatilho duplo — verifica eff_low (candle+mark) E eff_curr
-            trigger = (eff_low <= stop)
-            if eff_curr:
-                trigger = trigger or (eff_curr <= stop)
-            if trigger:
+            if low <= stop:
                 return self._exit_at(stop, "long", rsn, ts)
 
-        else:  # position_size < 0
-            self._lowest  = min(self._lowest, eff_low)
-            profit_ticks  = (self.position_price - self._lowest) / self.tick
+        elif self.position_size < 0.0:
+            self._lowest = min(self._lowest, low)
+            profit_ticks = (self.position_price - self._lowest) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
 
-            if self._trail_active:
-                stop = self._lowest + self.toff * self.tick
-                rsn  = "TRAIL"
-            else:
-                stop = self.position_price + self.sl * self.tick
-                rsn  = "SL"
-
+            stop = (self._lowest + self.toff * self.tick) if self._trail_active else \
+                   (self.position_price + self.sl * self.tick)
+            rsn = "TRAIL" if self._trail_active else "SL"
             self.short_stop = stop
 
-            # FIX-12: gatilho duplo — verifica eff_high (candle+mark) E eff_curr
-            trigger = (eff_high >= stop)
-            if eff_curr:
-                trigger = trigger or (eff_curr >= stop)
-            if trigger:
+            if high >= stop:
                 return self._exit_at(stop, "short", rsn, ts)
 
         return None
