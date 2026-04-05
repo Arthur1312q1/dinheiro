@@ -168,6 +168,14 @@ class AdaptiveZeroLagEMA:
         # Regra: _live_bar_count ímpar → BUY, par (exceto 0) → SELL.
         self._live_bar_count = 0
 
+        # ── FIX-18: Flag de entry candle ──────────────────────────────────
+        # Setado para True após confirm_fill() (main.py / engine.py).
+        # Consumido pelo PRIMEIRO poll intrabar após a entrada, passando
+        # is_entry_candle=True para update_trailing_live().
+        # Garante que o SL não seja verificado contra o H/L do candle
+        # anterior ao fill — elimina saídas imediatas no preço de entrada.
+        self._just_filled = False   # FIX-18
+
     # ═══════════════════════════════════════════════════════════════════════
     # IFM COSINE — exato Pine v3
     # ═══════════════════════════════════════════════════════════════════════
