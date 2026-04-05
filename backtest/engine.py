@@ -188,20 +188,31 @@ class BacktestEngine:
                 current_bar = bars[-1]   # candle aberto (intrabar)
 
                 # ── LÓGICA INTRABAR ──────────────────────────────────────────
-                # Verifica se high/low do candle em formação tocou no stop.
-                # O preço de saída é o stop_price EXATO (igual ao backtest).
+                # FIX-18: is_entry_candle só no PRIMEIRO poll após confirm_fill.
+                # Evita saída imediata no preço de entrada causada pelo H/L do
+                # candle em formação que inclui preços anteriores ao fill.
+                is_entry = getattr(self.strategy, '_just_filled', False)
+                if is_entry:
+                    self.strategy._just_filled = False  # consome o flag imediatamente
+
+                # Usa mark price real como current_price (injetado apenas quando
+                # is_entry_candle=True; poll normal usa H/L do candle diretamente)
+                ticker_px = self._mark_price_fast() if hasattr(self, '_mark_price_fast') \
+                            else float(current_bar.get('close', 0))
                 exit_action = self.strategy.update_trailing_live(
                     high=float(current_bar['high']),
                     low=float(current_bar['low']),
                     ts=current_bar['timestamp'],
+                    is_entry_candle=is_entry,
+                    current_price=ticker_px,
                 )
 
                 if exit_action:
-                    exit_price = exit_action.get('price', exit_action.get('exit_price', 0.0))
+                    exit_price = exit_action.get('price', exit_action.get('exit_price', ticker_px))
+                    reason = exit_action.get('exit_reason', 'INTRABAR_STOP')
                     print(
-                        f"!!! STOP HIT INTRABAR: "
-                        f"{exit_action.get('exit_reason', '?')} "
-                        f"em {exit_price} !!!"
+                        f"!!! STOP HIT INTRABAR: {reason} "
+                        f"em {exit_price:.2f} (is_entry_candle={is_entry}) !!!"
                     )
                     self.execute_live_exit(exit_action)
                     time.sleep(2)
@@ -277,6 +288,12 @@ class BacktestEngine:
             'tick_size'     : syminfo.mintick
             'comment'       : label da ordem
 
+        IMPORTANTE — FIX-18: após confirmar o fill com strategy.confirm_fill(),
+        obrigatoriamente setar:
+            self.strategy._just_filled = True
+        Isso garante que o PRIMEIRO poll intrabar pós-fill use is_entry_candle=True
+        em update_trailing_live(), evitando saídas imediatas no preço de entrada.
+
         Exemplo de integração (Bitget / ccxt):
             order_resp = exchange.create_market_order(
                 symbol=self.symbol,
@@ -284,6 +301,8 @@ class BacktestEngine:
                 amount=order['qty'],
             )
             # Após confirmar o fill, chamar strategy.confirm_fill(...)
+            # e obrigatoriamente:
+            self.strategy._just_filled = True
         """
         raise NotImplementedError(
             "Implemente execute_live_entry() com a lógica de ordem da sua exchange."
