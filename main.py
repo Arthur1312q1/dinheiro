@@ -772,6 +772,7 @@ class LiveTrader:
         self._pos_lock        = threading.Lock()
         self._stop_monitor    = RealTimeStopMonitor(self)
         self._pending_entry_check = False   # flag para monitoramento após entrada
+        self.strategy._just_filled = False  # FIX-18: usado pelo poll intrabar
 
         # FIX-14: Cache do candle em formação — necessário para trailing stop
         # independente do sucesso do fetch de candle (loop desacoplado)
@@ -1112,6 +1113,7 @@ class LiveTrader:
                     # PASSO 6: Confirmar fill na estratégia — mesmo snapshot_px
                     # usado no open_long acima (FIX-15: paridade garantida)
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
+                    self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
@@ -1123,7 +1125,6 @@ class LiveTrader:
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
                     self._last_entry_time = time.time()
-                    self.strategy._just_filled = True   # FIX-17: próximo poll usa is_entry_candle
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1162,6 +1163,7 @@ class LiveTrader:
                             continue
 
                     close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, closed_candle['timestamp'])
+                    self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
                     # PASSO 6 (SELL): mesmo snapshot_px para estratégia (FIX-15)
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
@@ -1174,7 +1176,6 @@ class LiveTrader:
                         self.paper.balance = self.strategy.balance
                     self._pending_entry_check = True
                     self._last_entry_time = time.time()
-                    self.strategy._just_filled = True   # FIX-17: próximo poll usa is_entry_candle
                     log.info(f"  ✅ SHORT confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
                     log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
@@ -1601,6 +1602,7 @@ class LiveTrader:
                                         close_act = self.strategy.confirm_fill(
                                             'BUY', fill_px, qty_f, clk_candle['timestamp']
                                         )
+                                        self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
                                         if close_act:
                                             self._add_log(
                                                 close_act.get('action', 'REVERSAL'),
@@ -1619,7 +1621,6 @@ class LiveTrader:
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
-                                        self.strategy._just_filled = True   # FIX-17
                                         log.info(
                                             f"  ✅ [CLOCK] LONG confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
@@ -1687,6 +1688,7 @@ class LiveTrader:
                                         close_act = self.strategy.confirm_fill(
                                             'SELL', fill_px, qty_f, clk_candle['timestamp']
                                         )
+                                        self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
                                         if close_act:
                                             self._add_log(
                                                 close_act.get('action', 'REVERSAL'),
@@ -1705,7 +1707,6 @@ class LiveTrader:
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
-                                        self.strategy._just_filled = True   # FIX-17
                                         log.info(
                                             f"  ✅ [CLOCK] SHORT confirmado | "
                                             f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
