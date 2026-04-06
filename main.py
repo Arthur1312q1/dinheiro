@@ -1075,9 +1075,6 @@ class LiveTrader:
                              f"| bal={self.strategy.balance:.2f}")
 
             # ── PASSO 5 + 6: Executar entradas e confirmar fill ───────────────
-            # fill_px = snapshot_px é o mesmo preço usado no _order() e no
-            # confirm_fill(), garantindo que trailing stop e position_price
-            # da estratégia reflitam o preço real de execução (FIX-15).
             for order in pending_orders:
                 side  = order['side']
                 o_qty = order['qty']
@@ -1085,7 +1082,12 @@ class LiveTrader:
                     continue
 
                 fill_px = snapshot_px  # type: ignore[assignment]
-                # (fill_px não é None aqui: needs_price=True e snapshot verificado acima)
+
+                # PARIDADE BACKTEST: Forçar preço de ABERTURA do novo candle no modo Paper.
+                # No Live, envia a mercado com snapshot_px e corrige pelo priceAvg depois.
+                if self._is_paper() and getattr(self, '_forming_open', 0.0) > 0:
+                    fill_px = self._forming_open
+                    log.info(f"  🎯 [PARIDADE BACKTEST] Usando Abertura do novo candle: {fill_px:.2f}")
 
                 if side == 'BUY':
                     if self._is_paper():
@@ -1335,35 +1337,33 @@ class LiveTrader:
                 now_epoch: float = time.time()
 
                 # ── PRIORIDADE 0: Atualiza cache H/L do candle em formação ──────
-                # Executado em TODA iteração — com ou sem posição aberta.
-                # Garante que _forming_high/_forming_low reflitam o high/low real
-                # da barra atual ANTES de qualquer verificação de stop, replicando
-                # exatamente o comportamento do backtesting (SL vs H/L do candle).
                 _candles_p0 = self._candle_single()
                 if _candles_p0 is not None and len(_candles_p0) >= 2:
                     try:
-                        _fr              = _candles_p0[0]
+                        # CORREÇÃO CRÍTICA DOS ÍNDICES BITGET: [1] é em formação (new), [0] é fechado (old)
+                        _fr                = _candles_p0[1]
                         self._forming_high = float(_fr[2])
                         self._forming_low  = float(_fr[3])
+                        self._forming_open = float(_fr[1])
                         self._forming_ts   = datetime.fromtimestamp(
                             int(_fr[0]) / 1000, tz=timezone.utc)
-                        forming_open_cache = float(_fr[1])
+                        forming_open_cache = self._forming_open
                     except (ValueError, IndexError) as _e0:
                         log.warning(f"  ⚠️ [P0] Erro cache forming: {_e0}")
 
-                    # Fallback REST: processa candle fechado (qualquer estado)
-                    if len(_candles_p0[1]) >= 5:
+                    # Fallback REST: processa candle fechado [0]
+                    if len(_candles_p0[0]) >= 5:
                         try:
-                            _prev_ts_raw_p0 = int(_candles_p0[1][0])
+                            _prev_ts_raw_p0 = int(_candles_p0[0][0])
                             if (last_processed_closed_ts is None
                                     or _prev_ts_raw_p0 > last_processed_closed_ts):
                                 _prev_ts_p0 = datetime.fromtimestamp(
                                     _prev_ts_raw_p0 / 1000, tz=timezone.utc)
                                 _cc_p0: Dict = {
-                                    'open':      float(_candles_p0[1][1]),
-                                    'high':      float(_candles_p0[1][2]),
-                                    'low':       float(_candles_p0[1][3]),
-                                    'close':     float(_candles_p0[1][4]),
+                                    'open':      float(_candles_p0[0][1]),
+                                    'high':      float(_candles_p0[0][2]),
+                                    'low':       float(_candles_p0[0][3]),
+                                    'close':     float(_candles_p0[0][4]),
                                     'timestamp': _prev_ts_p0,
                                     'index':     self.strategy._bar + 1,
                                 }
@@ -1467,18 +1467,14 @@ class LiveTrader:
                     prefetch_snapshot_px = None
 
                     if (fire_px and fire_px > 0
-                            and self._forming_high > 0):
+                            and self._forming_high > 0
+                            and self._forming_ts is not None):
 
-                        # CORREÇÃO CRÍTICA (Timestamp Parity):
-                        # Garante que o timestamp avaliado pelo CLOCK-SYNC seja
-                        # matematicamente idêntico ao do FALLBACK-REST, barrando a
-                        # dupla execução que bagunçava os contadores de barra.
-                        clk_ts_raw: int = int((current_boundary_epoch - _interval_secs) * 1000)
+                        clk_ts_raw: int = int(self._forming_ts.timestamp() * 1000)
 
                         if (last_processed_closed_ts is None
                                 or clk_ts_raw > last_processed_closed_ts):
 
-                            clk_ts = datetime.fromtimestamp(clk_ts_raw / 1000, tz=timezone.utc)
                             clk_open: float = (forming_open_cache
                                                if forming_open_cache > 0 else fire_px)
                             clk_candle: Dict = {
@@ -1486,7 +1482,7 @@ class LiveTrader:
                                 'high':      max(self._forming_high, fire_px),
                                 'low':       min(self._forming_low,  fire_px),
                                 'close':     fire_px,
-                                'timestamp': clk_ts,
+                                'timestamp': self._forming_ts,
                                 'index':     self.strategy._bar + 1,
                             }
 
@@ -1575,6 +1571,11 @@ class LiveTrader:
                                         continue
 
                                     fill_px = fire_px
+
+                                    # PARIDADE BACKTEST: Forçar preço de ABERTURA do novo candle no modo Paper
+                                    if self._is_paper() and clk_open > 0:
+                                        fill_px = clk_open
+                                        log.info(f"  🎯 [PARIDADE BACKTEST] Usando Abertura do novo candle: {fill_px:.2f}")
 
                                     if side == 'BUY':
                                         if self._is_paper():
