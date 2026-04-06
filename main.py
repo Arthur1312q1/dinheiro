@@ -1342,8 +1342,7 @@ class LiveTrader:
                 _candles_p0 = self._candle_single()
                 if _candles_p0 is not None and len(_candles_p0) >= 2:
                     try:
-                        # CORREÇÃO CRÍTICA: [1] é o candle em formação, [0] é o fechado.
-                        _fr              = _candles_p0[1]
+                        _fr              = _candles_p0[0]
                         self._forming_high = float(_fr[2])
                         self._forming_low  = float(_fr[3])
                         self._forming_ts   = datetime.fromtimestamp(
@@ -1351,19 +1350,20 @@ class LiveTrader:
                         forming_open_cache = float(_fr[1])
                     except (ValueError, IndexError) as _e0:
                         log.warning(f"  ⚠️ [P0] Erro cache forming: {_e0}")
+
                     # Fallback REST: processa candle fechado (qualquer estado)
-                    if len(_candles_p0[0]) >= 5:
+                    if len(_candles_p0[1]) >= 5:
                         try:
-                            _prev_ts_raw_p0 = int(_candles_p0[0][0])
+                            _prev_ts_raw_p0 = int(_candles_p0[1][0])
                             if (last_processed_closed_ts is None
                                     or _prev_ts_raw_p0 > last_processed_closed_ts):
                                 _prev_ts_p0 = datetime.fromtimestamp(
                                     _prev_ts_raw_p0 / 1000, tz=timezone.utc)
                                 _cc_p0: Dict = {
-                                    'open':      float(_candles_p0[0][1]),
-                                    'high':      float(_candles_p0[0][2]),
-                                    'low':       float(_candles_p0[0][3]),
-                                    'close':     float(_candles_p0[0][4]),
+                                    'open':      float(_candles_p0[1][1]),
+                                    'high':      float(_candles_p0[1][2]),
+                                    'low':       float(_candles_p0[1][3]),
+                                    'close':     float(_candles_p0[1][4]),
                                     'timestamp': _prev_ts_p0,
                                     'index':     self.strategy._bar + 1,
                                 }
@@ -1467,14 +1467,18 @@ class LiveTrader:
                     prefetch_snapshot_px = None
 
                     if (fire_px and fire_px > 0
-                            and self._forming_high > 0
-                            and self._forming_ts is not None):
+                            and self._forming_high > 0):
 
-                        clk_ts_raw: int = int(self._forming_ts.timestamp() * 1000)
+                        # CORREÇÃO CRÍTICA (Timestamp Parity):
+                        # Garante que o timestamp avaliado pelo CLOCK-SYNC seja
+                        # matematicamente idêntico ao do FALLBACK-REST, barrando a
+                        # dupla execução que bagunçava os contadores de barra.
+                        clk_ts_raw: int = int((current_boundary_epoch - _interval_secs) * 1000)
 
                         if (last_processed_closed_ts is None
                                 or clk_ts_raw > last_processed_closed_ts):
 
+                            clk_ts = datetime.fromtimestamp(clk_ts_raw / 1000, tz=timezone.utc)
                             clk_open: float = (forming_open_cache
                                                if forming_open_cache > 0 else fire_px)
                             clk_candle: Dict = {
@@ -1482,7 +1486,7 @@ class LiveTrader:
                                 'high':      max(self._forming_high, fire_px),
                                 'low':       min(self._forming_low,  fire_px),
                                 'close':     fire_px,
-                                'timestamp': self._forming_ts,
+                                'timestamp': clk_ts,
                                 'index':     self.strategy._bar + 1,
                             }
 
