@@ -339,6 +339,13 @@ class AdaptiveZeroLagEMA:
         if self.position_size == 0.0 or not self._monitored:
             return None
 
+        # GUARDA CRÍTICA (Anti-Ghost Trailing):
+        # Se a posição acabou de ser aberta (fill no mesmo ciclo), ignoramos
+        # o H/L deste candle fechado, pois ele pertence ao passado antes do fill.
+        # Isso evita que mínimas/máximas históricas ativem o trailing stop indevidamente.
+        if getattr(self, '_just_filled', False):
+            return None
+
         if self.position_size > 0.0:
             self._highest = max(self._highest, h)
             profit_ticks  = (self._highest - self.position_price) / self.tick
