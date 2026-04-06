@@ -40,11 +40,26 @@
 #    • _just_filled (bool em AdaptiveZeroLagEMA) sinaliza ao loop de main.py
 #      que o próximo poll deve passar is_entry_candle=True e depois reset.
 #      Flag setado em main.py após cada confirm_fill (caminhos _process e CLOCK).
+#
+#  FIX-19 (Reset Absoluto de Memória em confirm_fill — CORREÇÃO FECHAMENTO IMEDIATO):
+#    • confirm_fill() agora reseta EXPLICITAMENTE long_stop e short_stop para 0.0,
+#      eliminando valores residuais de trades anteriores que podiam ativar o
+#      trailing stop no primeiro poll pós-entrada ("gatilho fantasma").
+#    • _highest e _lowest inicializados com fill_price para AMBOS os lados
+#      (antes: lado não-primário usava float('inf') / 0.0 que criava gap
+#       entre position_price e o tracker, permitindo ativação prematura).
+#    • update_trailing_live: guarda de entrada (is_entry_candle=True) força
+#      _highest = position_price (LONG) e _lowest = position_price (SHORT)
+#      antes de qualquer cálculo de stop — garante que slippage residual
+#      ou candles parciais não acionem o trail antes do primeiro tick limpo.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import math
+import logging
 from collections import deque
 from typing import Dict, List, Optional, Any
+
+log = logging.getLogger('azlema')
 
 _PI  = 3.14159265359
 _RNG = 50    # Pine: range = 50  → loop 0..50 (51 iterações)
@@ -510,7 +525,15 @@ class AdaptiveZeroLagEMA:
 
     def confirm_fill(self, side: str, price: float, qty: float, ts) -> Optional[Dict]:
         """
-        Confirma fill de uma order na exchange (para live trading).
+        Sincronização Absoluta (FIX-19): confirma fill e reseta TODA memória
+        de trailing stop para evitar que resíduos de trades anteriores ativem
+        o stop prematuramente no primeiro poll pós-entrada.
+
+        Mudanças vs versão anterior:
+        - long_stop e short_stop explicitamente zerados (evita "gatilho fantasma").
+        - _highest e _lowest inicializados com fill_price para ambos os lados
+          (antes o lado não-primário ficava em float('inf')/0.0, criando gap).
+        - Log de confirmação para rastreabilidade.
         """
         close_act = None
 
@@ -519,24 +542,36 @@ class AdaptiveZeroLagEMA:
                 close_act = self._close(price, ts, "REVERSAL")
             self.position_size  =  qty
             self.position_price =  price
+            # RESET CRÍTICO: ambos os trackers partem do fill real (FIX-19)
             self._highest       =  price
-            self._lowest        =  float('inf')
+            self._lowest        =  price
             self._trail_active  =  False
             self._monitored     =  True
             self._el            =  False
+            # Zera stops residuais de trades anteriores
+            self.long_stop      =  0.0
+            self.short_stop     =  0.0
             self.balance        =  self.ic + self.net_profit
+            log.info(f"🔄 [STRATEGY] LONG confirmado: qty={qty} @ {price:.2f} | "
+                     f"_highest=_lowest={price:.2f} | stops zerados")
 
         elif side == 'SELL':
             if self.position_size > 0.0:
                 close_act = self._close(price, ts, "REVERSAL")
             self.position_size  = -qty
             self.position_price =  price
+            # RESET CRÍTICO: ambos os trackers partem do fill real (FIX-19)
             self._lowest        =  price
-            self._highest       =  float('inf')
+            self._highest       =  price
             self._trail_active  =  False
             self._monitored     =  True
             self._es            =  False
+            # Zera stops residuais de trades anteriores
+            self.long_stop      =  0.0
+            self.short_stop     =  0.0
             self.balance        =  self.ic + self.net_profit
+            log.info(f"🔄 [STRATEGY] SHORT confirmado: qty={qty} @ {price:.2f} | "
+                     f"_highest=_lowest={price:.2f} | stops zerados")
 
         return close_act
 
@@ -732,6 +767,14 @@ class AdaptiveZeroLagEMA:
             if current_price <= 0.0:
                 return None
             price = current_price
+
+            # GUARDA FIX-19: força reset dos trackers para position_price antes
+            # de qualquer cálculo — impede que slippage residual ou candle parcial
+            # (cujo H/L foi registrado ANTES do fill) ative o trail indevidamente.
+            if self.position_size > 0.0:
+                self._highest = min(self._highest, self.position_price)
+            elif self.position_size < 0.0:
+                self._lowest  = max(self._lowest,  self.position_price)
 
             if self.position_size > 0.0:
                 self._highest = max(self._highest, price)
