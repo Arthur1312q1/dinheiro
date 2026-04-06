@@ -1342,7 +1342,8 @@ class LiveTrader:
                 _candles_p0 = self._candle_single()
                 if _candles_p0 is not None and len(_candles_p0) >= 2:
                     try:
-                        _fr              = _candles_p0[0]
+                        # CORREÇÃO CRÍTICA: [1] é o candle em formação, [0] é o fechado.
+                        _fr              = _candles_p0[1]
                         self._forming_high = float(_fr[2])
                         self._forming_low  = float(_fr[3])
                         self._forming_ts   = datetime.fromtimestamp(
@@ -1350,20 +1351,19 @@ class LiveTrader:
                         forming_open_cache = float(_fr[1])
                     except (ValueError, IndexError) as _e0:
                         log.warning(f"  ⚠️ [P0] Erro cache forming: {_e0}")
-
                     # Fallback REST: processa candle fechado (qualquer estado)
-                    if len(_candles_p0[1]) >= 5:
+                    if len(_candles_p0[0]) >= 5:
                         try:
-                            _prev_ts_raw_p0 = int(_candles_p0[1][0])
+                            _prev_ts_raw_p0 = int(_candles_p0[0][0])
                             if (last_processed_closed_ts is None
                                     or _prev_ts_raw_p0 > last_processed_closed_ts):
                                 _prev_ts_p0 = datetime.fromtimestamp(
                                     _prev_ts_raw_p0 / 1000, tz=timezone.utc)
                                 _cc_p0: Dict = {
-                                    'open':      float(_candles_p0[1][1]),
-                                    'high':      float(_candles_p0[1][2]),
-                                    'low':       float(_candles_p0[1][3]),
-                                    'close':     float(_candles_p0[1][4]),
+                                    'open':      float(_candles_p0[0][1]),
+                                    'high':      float(_candles_p0[0][2]),
+                                    'low':       float(_candles_p0[0][3]),
+                                    'close':     float(_candles_p0[0][4]),
                                     'timestamp': _prev_ts_p0,
                                     'index':     self.strategy._bar + 1,
                                 }
