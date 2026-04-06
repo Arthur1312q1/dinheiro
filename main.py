@@ -102,6 +102,19 @@ FIX-15 Snapshot de Preço Único por Ciclo de Candle (CORREÇÃO FINAL DE LATÊN
       PASSO 4 → executar saídas (exits)         [com snapshot_px]
       PASSO 5 → executar entradas (pending)     [com snapshot_px]
       PASSO 6 → confirm_fill(fill_px=snapshot_px) [sincroniza estratégia]
+FIX-16 Paridade de Execução via priceAvg Real (CORREÇÃO FILL PRICE)
+  - Após open_long/open_short bem-sucedido no modo LIVE, o bot consulta
+    /api/v2/mix/order/detail para obter o priceAvg REAL de execução
+    (com retry robusto: 5 tentativas × 0.5 s = máx 2.5 s de polling).
+  - confirm_fill() recebe o priceAvg real quando disponível, ou
+    snapshot_px como fallback seguro — eliminando divergências causadas
+    por slippage entre o mark_price do momento da ordem e o fill real.
+  - Resolve o fechamento prematuro do trailing stop no zero a zero: se
+    o bot acha que entrou a 2500.00 mas pagou 2500.50, um trail de 15
+    ticks pode disparar imediatamente; com o priceAvg correto, _highest
+    e _lowest da estratégia partem do ponto exato da nota de corretagem.
+  - Paper mode não é afetado (sem orderId real); lógica de fallback
+    transparente garante retrocompatibilidade total.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -552,16 +565,16 @@ class Bitget:
         return r, sz * self.CT_VAL
 
     def _fetch_fill_price(self, order_id: str,
-                          max_attempts: int = 4,
-                          delay: float = 0.25) -> Optional[float]:
+                          max_attempts: int = 5,
+                          delay: float = 0.5) -> Optional[float]:
         """
-        Busca o preço médio de execução (fill) de uma ordem já enviada.
+        Busca o preço médio de execução REAL da ordem na Bitget.
+        Essencial para evitar que o trailing stop use preços teóricos e feche
+        o trade errado (slippage entre mark_price e priceAvg real).
 
-        Consulta /api/v2/mix/order/detail com polling ativo (o fill pode demorar
-        alguns ms para aparecer). Retorna None se todas as tentativas falharem.
-
-        Campos tentados em ordem de prioridade:
-          priceAvg → fillPrice → avgPrice
+        Polling ativo: a Bitget pode demorar alguns ms para registrar o fill.
+        Campos tentados em ordem de prioridade: priceAvg → fillPrice.
+        Retorna None se todas as tentativas falharem (fallback: snapshot_px).
         """
         for attempt in range(1, max_attempts + 1):
             try:
@@ -571,26 +584,23 @@ class Bitget:
                     "orderId":     order_id,
                 })
                 if r.get("code") == "00000":
-                    d   = r.get("data") or {}
-                    raw = (d.get("priceAvg")
-                           or d.get("fillPrice")
-                           or d.get("avgPrice"))
-                    if raw:
-                        px = float(raw)
-                        if px > 0:
-                            log.info(
-                                f"  🎯 [FILL-PRICE] orderId={order_id} "
-                                f"fill_px={px:.2f} (tentativa {attempt})"
-                            )
-                            return px
+                    d        = r.get("data") or {}
+                    fill_px  = float(d.get("priceAvg") or d.get("fillPrice") or 0)
+                    if fill_px > 0:
+                        log.info(
+                            f"  ✅ [FILL-PRICE] Preço real de execução obtido: "
+                            f"{fill_px:.2f} | orderId={order_id} (tentativa {attempt})"
+                        )
+                        return fill_px
             except Exception as _e:
-                log.debug(f"  _fetch_fill_price tentativa {attempt}: {_e}")
+                log.error(f"  ⚠️ Erro ao buscar detalhe da ordem {order_id}: {_e}")
             if attempt < max_attempts:
                 time.sleep(delay)
 
         log.warning(
-            f"  ⚠️ [FILL-PRICE] Não foi possível obter fill price "
-            f"para orderId={order_id} — usando trigger_px como fallback"
+            f"  ⚠️ [FILL-PRICE] Não foi possível obter fill price real "
+            f"para orderId={order_id} após {max_attempts} tentativas — "
+            "usando snapshot_px como fallback"
         )
         return None
 
@@ -1109,9 +1119,20 @@ class LiveTrader:
                         if r.get("code") != "00000":
                             log.error("  ❌ bitget.open_long falhou")
                             continue
+                        # Sincronização Crítica (FIX-16): busca o priceAvg REAL
+                        # retornado pela Bitget para evitar que o trailing stop
+                        # seja acionado por slippage entre snapshot_px e fill real.
+                        oid = (r.get("data") or {}).get("orderId")
+                        if oid:
+                            fetched_px = self.bitget._fetch_fill_price(oid)
+                            if fetched_px:
+                                fill_px = fetched_px
+                                log.info(f"  🎯 [FIX-16] fill_px corrigido → {fill_px:.2f} "
+                                         f"(priceAvg real, era snapshot={snapshot_px:.2f})")
 
-                    # PASSO 6: Confirmar fill na estratégia — mesmo snapshot_px
-                    # usado no open_long acima (FIX-15: paridade garantida)
+                    # PASSO 6: Confirmar fill na estratégia com preço REAL de execução.
+                    # fill_px = priceAvg da Bitget quando disponível (FIX-16),
+                    # ou snapshot_px como fallback seguro (FIX-15).
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
                     self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
                     if close_act:
@@ -1161,6 +1182,16 @@ class LiveTrader:
                         if r.get("code") != "00000":
                             log.error("  ❌ bitget.open_short falhou")
                             continue
+                        # Sincronização Crítica (FIX-16): busca o priceAvg REAL
+                        # retornado pela Bitget para evitar que o trailing stop
+                        # seja acionado por slippage entre snapshot_px e fill real.
+                        oid = (r.get("data") or {}).get("orderId")
+                        if oid:
+                            fetched_px = self.bitget._fetch_fill_price(oid)
+                            if fetched_px:
+                                fill_px = fetched_px
+                                log.info(f"  🎯 [FIX-16] fill_px corrigido → {fill_px:.2f} "
+                                         f"(priceAvg real, era snapshot={snapshot_px:.2f})")
 
                     close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, closed_candle['timestamp'])
                     self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
