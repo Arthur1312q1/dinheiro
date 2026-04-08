@@ -1081,9 +1081,13 @@ class LiveTrader:
                 if o_qty <= 0:
                     continue
 
-                # PARIDADE BACKTEST: O snapshot_px é capturado no milissegundo 
-                # exato da virada. Ele atua como o verdadeiro "Open" do novo candle.
                 fill_px = snapshot_px  # type: ignore[assignment]
+
+                # PARIDADE BACKTEST: Forçar preço de ABERTURA do novo candle no modo Paper.
+                # No Live, envia a mercado com snapshot_px e corrige pelo priceAvg depois.
+                if self._is_paper() and getattr(self, '_forming_open', 0.0) > 0:
+                    fill_px = self._forming_open
+                    log.info(f"  🎯 [PARIDADE BACKTEST] Usando Abertura do novo candle: {fill_px:.2f}")
 
                 if side == 'BUY':
                     if self._is_paper():
@@ -1566,9 +1570,12 @@ class LiveTrader:
                                     if o_qty <= 0:
                                         continue
 
-                                    # PARIDADE BACKTEST: fire_px é capturado instantes
-                                    # antes/durante a borda do relógio. Ele É a abertura.
                                     fill_px = fire_px
+
+                                    # PARIDADE BACKTEST: Forçar preço de ABERTURA do novo candle no modo Paper
+                                    if self._is_paper() and clk_open > 0:
+                                        fill_px = clk_open
+                                        log.info(f"  🎯 [PARIDADE BACKTEST] Usando Abertura do novo candle: {fill_px:.2f}")
 
                                     if side == 'BUY':
                                         if self._is_paper():
