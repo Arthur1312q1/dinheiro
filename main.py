@@ -118,6 +118,7 @@ FIX-16 Paridade de Execução via priceAvg Real (CORREÇÃO FILL PRICE)
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
+import fcntl
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
@@ -176,29 +177,33 @@ def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
 LOCK_FILE = "bot.lock"
+_lock_fd = None
 
 def _acquire_lock() -> bool:
+    global _lock_fd
     try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.close(fd)
-        log.debug("Lock de processo adquirido.")
+        _lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
+        # Tenta travar o arquivo no nível do Sistema Operacional.
+        # Se outro worker já travou, levanta erro imediatamente e aborta.
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        log.debug("Lock de processo adquirido com sucesso (fcntl).")
         return True
-    except FileExistsError:
-        log.warning("Lock de processo já existe. Outro worker está rodando?")
-        return False
-    except Exception as e:
-        log.error(f"Erro ao tentar criar lock: {e}")
+    except (IOError, OSError):
+        log.warning("⚠️ Lock em uso: Outro processo/worker já está rodando o bot!")
         return False
 
 def _release_lock():
+    global _lock_fd
     try:
-        if Path(LOCK_FILE).exists():
-            Path(LOCK_FILE).unlink()
-            log.info("🔓 Cadeado (lock) removido com sucesso.")
+        if _lock_fd is not None:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+            _lock_fd = None
+            log.info("🔓 Cadeado (lock) removido.")
     except Exception as e:
         log.error(f"Erro ao remover lock: {e}")
 
-_release_lock()
+# O fcntl limpa automaticamente quando o worker morre — sem _release_lock() global.
 
 
 class TradeHistoryManager:
