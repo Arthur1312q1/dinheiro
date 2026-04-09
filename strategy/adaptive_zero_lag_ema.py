@@ -191,6 +191,11 @@ class AdaptiveZeroLagEMA:
         # anterior ao fill — elimina saídas imediatas no preço de entrada.
         self._just_filled = False   # FIX-18
 
+        # ── Segurança Extra: Hard Stop Fixo ───────────────────────────────
+        self.hard_sl_pct     = 0.0118   # 1.18% absoluto
+        self.hard_sl_long    = 0.0
+        self.hard_sl_short   = 0.0
+
     # ═══════════════════════════════════════════════════════════════════════
     # IFM COSINE — exato Pine v3
     # ═══════════════════════════════════════════════════════════════════════
@@ -351,30 +356,34 @@ class AdaptiveZeroLagEMA:
             profit_ticks  = (self._highest - self.position_price) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
-            if self._trail_active:
-                stop = self._highest - self.toff * self.tick
-                rsn  = "TRAIL"
-            else:
-                stop = self.position_price - self.sl * self.tick
-                rsn  = "SL"
-            self.long_stop = stop
-            if l <= stop:
-                return self._exit_at(stop, "long", rsn, ts)
+
+            stop = (self._highest - self.toff * self.tick) if self._trail_active else (self.position_price - self.sl * self.tick)
+
+            # GATILHO DE SEGURANÇA: Hard SL (Chão Absoluto de 1.18%)
+            self.hard_sl_long = self.position_price * (1.0 - self.hard_sl_pct)
+            effective_stop = max(stop, self.hard_sl_long)
+            rsn = "HARD_SL" if (effective_stop == self.hard_sl_long and self.hard_sl_long > stop) else ("TRAIL" if self._trail_active else "SL")
+
+            self.long_stop = effective_stop
+            if l <= effective_stop:
+                return self._exit_at(effective_stop, "long", rsn, ts)
 
         elif self.position_size < 0.0:
             self._lowest = min(self._lowest, l)
             profit_ticks = (self.position_price - self._lowest) / self.tick
             if profit_ticks >= self.tp:
                 self._trail_active = True
-            if self._trail_active:
-                stop = self._lowest + self.toff * self.tick
-                rsn  = "TRAIL"
-            else:
-                stop = self.position_price + self.sl * self.tick
-                rsn  = "SL"
-            self.short_stop = stop
-            if h >= stop:
-                return self._exit_at(stop, "short", rsn, ts)
+
+            stop = (self._lowest + self.toff * self.tick) if self._trail_active else (self.position_price + self.sl * self.tick)
+
+            # GATILHO DE SEGURANÇA: Hard SL (Teto Absoluto de 1.18%)
+            self.hard_sl_short = self.position_price * (1.0 + self.hard_sl_pct)
+            effective_stop = min(stop, self.hard_sl_short)
+            rsn = "HARD_SL" if (effective_stop == self.hard_sl_short and self.hard_sl_short < stop) else ("TRAIL" if self._trail_active else "SL")
+
+            self.short_stop = effective_stop
+            if h >= effective_stop:
+                return self._exit_at(effective_stop, "short", rsn, ts)
 
         return None
 
@@ -730,6 +739,8 @@ class AdaptiveZeroLagEMA:
         self._lowest         = float('inf')
         self._trail_active   = False
         self._monitored      = False
+        self.hard_sl_long    = 0.0
+        self.hard_sl_short   = 0.0
 
     # ═══════════════════════════════════════════════════════════════════════
     # FIX-17: update_trailing_live — Paridade total com backtest (_check_trail)
@@ -819,11 +830,15 @@ class AdaptiveZeroLagEMA:
 
             stop = (self._highest - self.toff * self.tick) if self._trail_active else \
                    (self.position_price - self.sl * self.tick)
-            rsn = "TRAIL" if self._trail_active else "SL"
-            self.long_stop = stop
 
-            if low <= stop:
-                return self._exit_at(stop, "long", rsn, ts)
+            # GATILHO DE SEGURANÇA: Hard SL
+            self.hard_sl_long = self.position_price * (1.0 - self.hard_sl_pct)
+            effective_stop = max(stop, self.hard_sl_long)
+            rsn = "HARD_SL" if (effective_stop == self.hard_sl_long and self.hard_sl_long > stop) else ("TRAIL" if self._trail_active else "SL")
+
+            self.long_stop = effective_stop
+            if low <= effective_stop:
+                return self._exit_at(effective_stop, "long", rsn, ts)
 
         elif self.position_size < 0.0:
             self._lowest = min(self._lowest, low)
@@ -833,10 +848,14 @@ class AdaptiveZeroLagEMA:
 
             stop = (self._lowest + self.toff * self.tick) if self._trail_active else \
                    (self.position_price + self.sl * self.tick)
-            rsn = "TRAIL" if self._trail_active else "SL"
-            self.short_stop = stop
 
-            if high >= stop:
-                return self._exit_at(stop, "short", rsn, ts)
+            # GATILHO DE SEGURANÇA: Hard SL
+            self.hard_sl_short = self.position_price * (1.0 + self.hard_sl_pct)
+            effective_stop = min(stop, self.hard_sl_short)
+            rsn = "HARD_SL" if (effective_stop == self.hard_sl_short and self.hard_sl_short < stop) else ("TRAIL" if self._trail_active else "SL")
+
+            self.short_stop = effective_stop
+            if high >= effective_stop:
+                return self._exit_at(effective_stop, "short", rsn, ts)
 
         return None
