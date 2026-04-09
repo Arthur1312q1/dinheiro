@@ -115,6 +115,14 @@ FIX-16 Paridade de Execução via priceAvg Real (CORREÇÃO FILL PRICE)
     e _lowest da estratégia partem do ponto exato da nota de corretagem.
   - Paper mode não é afetado (sem orderId real); lógica de fallback
     transparente garante retrocompatibilidade total.
+FIX-20 Aquisição de Lock Robusta (CORREÇÃO LOCK ÓRFÃO NO RENDER)
+  - _acquire_lock() agora remove o arquivo de lock e recria um fd limpo
+    quando detecta PID morto, em vez de tentar flock no mesmo fd antigo
+    (comportamento anterior era não-atômico e falhava no Render).
+  - Dois loops de tentativa com unlink+recreate garantem que locks
+    obsoletos de deploys anteriores não bloqueiem o /start.
+  - Endpoint /start também tenta force-break via _force_break_stale_lock()
+    antes de retornar erro ao usuário.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
@@ -157,14 +165,10 @@ LIVE_PCT       = 0.95
 HISTORY_FILE          = "trades_history.json"
 BACKTEST_HISTORY_FILE = "backtest_history.json"
 
-# ── Taxas Live (Bitget Taker Futures) ────────────────────────────────────────
-# Mantidas em sync com engine.py → open_fee_pct / close_fee_pct.
-# PnL líquido = PnL_bruto − open_fee − close_fee
-OPEN_FEE_PCT  = float(os.environ.get("OPEN_FEE_PCT",  "0.06"))  # 0.06 = 0.06%
-CLOSE_FEE_PCT = float(os.environ.get("CLOSE_FEE_PCT", "0.06"))  # 0.06 = 0.06%
+OPEN_FEE_PCT  = float(os.environ.get("OPEN_FEE_PCT",  "0.06"))
+CLOSE_FEE_PCT = float(os.environ.get("CLOSE_FEE_PCT", "0.06"))
 
 def _calc_fee(price: float, qty: float, pct: float) -> float:
-    """Taxa = valor_nocional × pct / 100 — idêntico a engine.py._fee()"""
     return abs(price * qty * pct / 100.0)
 
 def get_paper_mode() -> bool:  return _PAPER_TRADING
@@ -177,105 +181,18 @@ def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
 LOCK_FILE = "bot.lock"
-_lock_fd: Optional[int] = None   # fd do arquivo de lock (None = sem lock)
+_lock_fd: Optional[int] = None
 
-# ── Por que PID + fcntl juntos? ────────────────────────────────────────────
-# • fcntl.flock(LOCK_EX|LOCK_NB): atômico no kernel — impede 2 processos OS
-#   de adquirirem o lock ao mesmo tempo. Liberado automaticamente se o
-#   processo morrer (kernel fecha os fds do processo morto).
-# • PID no arquivo: permite que um processo recém-iniciado detecte se o
-#   holder anterior ainda está vivo (os.kill(pid, 0)) e, se não estiver,
-#   assuma o lock sem esperar o timeout do Gunicorn (120 s).
-# • Guard de re-entrada (_lock_fd is not None): impede que a mesma instância
-#   Python tente adquirir um segundo fd para o mesmo arquivo — no Linux,
-#   dois flock(LOCK_EX) sobre fds distintos para o mesmo arquivo, mesmo no
-#   mesmo processo, podem falhar dependendo do kernel.
-# ──────────────────────────────────────────────────────────────────────────
 
 def _pid_alive(pid: int) -> bool:
-    """Verifica se um PID ainda existe no sistema sem enviar sinal real."""
     try:
-        os.kill(pid, 0)   # sinal 0 = apenas verifica existência
+        os.kill(pid, 0)
         return True
     except (OSError, ProcessLookupError):
         return False
 
-def _acquire_lock() -> bool:
-    """
-    Adquire lock exclusivo via fcntl + PID.
-
-    1. Se este processo já segura o lock (_lock_fd is not None) → True imediato
-       (re-entrada segura: evita conflito de dois fds no mesmo processo).
-    2. Abre bot.lock e tenta flock(LOCK_EX | LOCK_NB).
-    3. Se falhar (outro processo segura o lock):
-       - Lê o PID gravado no arquivo.
-       - Se o processo holder estiver morto (deploy antigo do Render ainda
-         em graceful shutdown mas já encerrado), força aquisição com
-         flock(LOCK_EX) bloqueante brevemente — o kernel concede assim que
-         o holder libera ou morre.
-    4. Em caso de sucesso, grava o PID deste processo no arquivo para
-       diagnóstico por futuros _acquire_lock() de outros processos.
-    """
-    global _lock_fd
-
-    # Guard de re-entrada: já seguramos o lock neste processo
-    if _lock_fd is not None:
-        return True
-
-    fd = None
-    try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
-
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # ── Sucesso imediato ──────────────────────────────────────────
-            _write_pid(fd)
-            _lock_fd = fd
-            log.debug(f"🔒 Lock adquirido (PID={os.getpid()}).")
-            return True
-
-        except (IOError, OSError):
-            # ── Outro processo segura o lock — verifica se ainda vive ───
-            holder_pid = _read_pid(fd)
-            if holder_pid and not _pid_alive(holder_pid):
-                log.warning(
-                    f"⚠️ Lock órfão detectado (PID={holder_pid} não existe). "
-                    "Assumindo controle..."
-                )
-                # flock bloqueante: kernel entrega assim que o holder morrer
-                # (normalmente imediato pois já confirmamos que o PID morreu)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    _write_pid(fd)
-                    _lock_fd = fd
-                    log.info(f"🔒 Lock assumido após órfão (PID={os.getpid()}).")
-                    return True
-                except (IOError, OSError):
-                    pass   # corrida improvável — outro processo ganhou
-
-            log.warning(
-                f"⚠️ Lock em uso pelo PID={holder_pid} "
-                "(outro worker Gunicorn ainda vivo). "
-                "O trader iniciará automaticamente quando o deploy anterior encerrar."
-            )
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            return False
-
-    except Exception as e:
-        log.error(f"Erro inesperado em _acquire_lock: {e}")
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        return False
-
 
 def _write_pid(fd: int) -> None:
-    """Grava PID do processo atual no arquivo de lock (para diagnóstico)."""
     try:
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
@@ -285,7 +202,6 @@ def _write_pid(fd: int) -> None:
 
 
 def _read_pid(fd: int) -> Optional[int]:
-    """Lê PID gravado no arquivo de lock. Retorna None se inválido."""
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         data = os.read(fd, 32).decode().strip()
@@ -294,16 +210,128 @@ def _read_pid(fd: int) -> Optional[int]:
         return None
 
 
+def _acquire_lock() -> bool:
+    """
+    FIX-20: Aquisição de lock robusta com remoção de arquivo órfão.
+
+    Quando detecta um PID morto, REMOVE o arquivo de lock e tenta
+    abrir um fd completamente novo — solução atômica e confiável para
+    o ambiente Render onde deploys sobrepostos deixam locks órfãos.
+
+    Fluxo:
+      1. Guard de re-entrada (_lock_fd is not None → True imediato).
+      2. Abre o arquivo e tenta flock(LOCK_EX|LOCK_NB).
+      3. Se falhar → lê PID do holder:
+         a. PID vivo  → retorna False (outro worker legítimo).
+         b. PID morto → fecha fd, REMOVE o arquivo, tenta novamente
+            abrindo um fd limpo (máx 2 tentativas no total).
+      4. Grava PID do processo atual no arquivo após sucesso.
+    """
+    global _lock_fd
+
+    if _lock_fd is not None:
+        return True
+
+    for attempt in range(2):
+        fd = None
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # ── Sucesso ──────────────────────────────────────────
+                _write_pid(fd)
+                _lock_fd = fd
+                log.info(f"🔒 Lock adquirido (PID={os.getpid()}, tentativa {attempt+1}).")
+                return True
+
+            except (IOError, OSError):
+                holder_pid = _read_pid(fd)
+
+                # Fecha o fd ANTES de tentar manipular o arquivo
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+
+                if holder_pid and _pid_alive(holder_pid):
+                    log.warning(
+                        f"⚠️ Lock em uso pelo PID={holder_pid} (worker ativo). "
+                        "Aguarde o deploy anterior encerrar."
+                    )
+                    return False
+
+                # PID morto ou inválido → remove o arquivo e tenta novamente
+                log.warning(
+                    f"⚠️ Lock órfão detectado (PID={holder_pid} não existe). "
+                    f"Removendo arquivo e retentando... (tentativa {attempt+1}/2)"
+                )
+                try:
+                    os.unlink(LOCK_FILE)
+                except OSError:
+                    pass
+                # continua para a próxima iteração do loop
+
+        except Exception as e:
+            log.error(f"Erro inesperado em _acquire_lock (tentativa {attempt+1}): {e}")
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return False
+
+    log.error("❌ Não foi possível adquirir lock após 2 tentativas.")
+    return False
+
+
+def _force_break_stale_lock() -> bool:
+    """
+    Força a remoção do lock quando _acquire_lock() falhou e o PID
+    no arquivo não está mais vivo. Usado como último recurso no /start.
+    Retorna True se conseguiu remover o lock e agora está livre.
+    """
+    global _lock_fd
+    if _lock_fd is not None:
+        return True  # já temos o lock neste processo
+
+    try:
+        if not os.path.exists(LOCK_FILE):
+            return True  # arquivo nem existe, tudo livre
+
+        with open(LOCK_FILE, 'r') as f:
+            content = f.read().strip()
+        holder_pid = int(content) if content.isdigit() else None
+
+        if holder_pid and _pid_alive(holder_pid):
+            log.warning(f"⚠️ _force_break: PID={holder_pid} ainda vivo, não é possível forçar.")
+            return False
+
+        # PID morto → remove e tenta adquirir de novo
+        log.warning(f"⚠️ _force_break: removendo lock órfão (PID={holder_pid}).")
+        try:
+            os.unlink(LOCK_FILE)
+        except OSError:
+            pass
+
+        return _acquire_lock()
+
+    except Exception as e:
+        log.error(f"_force_break_stale_lock erro: {e}")
+        try:
+            os.unlink(LOCK_FILE)
+        except OSError:
+            pass
+        return _acquire_lock()
+
+
 def _release_lock() -> None:
-    """
-    Libera o lock fcntl e fecha o fd.
-    Sempre zera _lock_fd, mesmo em caso de erro, para evitar stale state.
-    """
     global _lock_fd
     if _lock_fd is None:
         return
     fd = _lock_fd
-    _lock_fd = None   # zera PRIMEIRO — garante que nunca fica em estado inválido
+    _lock_fd = None
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError as e:
@@ -313,10 +341,11 @@ def _release_lock() -> None:
         log.info("🔓 Lock liberado.")
     except OSError as e:
         log.debug(f"os.close(lock_fd) ignorado: {e}")
-
-# Nota: NÃO há _release_lock() no escopo global.
-# O fcntl libera automaticamente quando o processo termina (kernel fecha os fds).
-# Chamar _release_lock() aqui causaria race condition com _delayed_start().
+    # Remove o arquivo para não deixar PID obsoleto no disco
+    try:
+        os.unlink(LOCK_FILE)
+    except OSError:
+        pass
 
 
 class TradeHistoryManager:
@@ -467,12 +496,6 @@ class PaperTrader:
         return {"code": "0", "data": [{"ordId": trade_id}]}, qty
 
     def close_long(self, qty, exit_px=0, reason="EXIT", ts=None):
-        """Fecha posição long simulada.
-
-        - exit_px  : preço de saída (mark price no momento do disparo).
-        - PnL líquido = PnL_bruto − open_fee − close_fee  (paridade com engine.py).
-        - Retorna _fill_px no dict para que LiveTrader use o preço correto em _add_log.
-        """
         if not self.position or self.position["side"] != "long":
             return {"code": "0", "_fill_px": exit_px}
         entry_px  = self.position["avg_px"]
@@ -485,8 +508,7 @@ class PaperTrader:
         self.position = None
         ts = str(ts) if ts else brazil_iso()
         try:
-            history_mgr.close_trade(trade_id, exit_px, ts, reason,
-                                    round(pnl_net, 6))
+            history_mgr.close_trade(trade_id, exit_px, ts, reason, round(pnl_net, 6))
         except Exception as _e:
             log.warning(f"  ⚠️ close_trade (long) file error: {_e}")
         log.info(f"  📄 PAPER LONG fechado | px={exit_px:.2f} "
@@ -495,12 +517,6 @@ class PaperTrader:
         return {"code": "0", "_fill_px": exit_px}
 
     def close_short(self, qty, exit_px=0, reason="EXIT", ts=None):
-        """Fecha posição short simulada.
-
-        - exit_px  : preço de saída (mark price no momento do disparo).
-        - PnL líquido = PnL_bruto − open_fee − close_fee  (paridade com engine.py).
-        - Retorna _fill_px no dict para que LiveTrader use o preço correto em _add_log.
-        """
         if not self.position or self.position["side"] != "short":
             return {"code": "0", "_fill_px": exit_px}
         entry_px  = self.position["avg_px"]
@@ -513,8 +529,7 @@ class PaperTrader:
         self.position = None
         ts = str(ts) if ts else brazil_iso()
         try:
-            history_mgr.close_trade(trade_id, exit_px, ts, reason,
-                                    round(pnl_net, 6))
+            history_mgr.close_trade(trade_id, exit_px, ts, reason, round(pnl_net, 6))
         except Exception as _e:
             log.warning(f"  ⚠️ close_trade (short) file error: {_e}")
         log.info(f"  📄 PAPER SHORT fechado | px={exit_px:.2f} "
@@ -685,15 +700,6 @@ class Bitget:
     def _fetch_fill_price(self, order_id: str,
                           max_attempts: int = 5,
                           delay: float = 0.5) -> Optional[float]:
-        """
-        Busca o preço médio de execução REAL da ordem na Bitget.
-        Essencial para evitar que o trailing stop use preços teóricos e feche
-        o trade errado (slippage entre mark_price e priceAvg real).
-
-        Polling ativo: a Bitget pode demorar alguns ms para registrar o fill.
-        Campos tentados em ordem de prioridade: priceAvg → fillPrice.
-        Retorna None se todas as tentativas falharem (fallback: snapshot_px).
-        """
         for attempt in range(1, max_attempts + 1):
             try:
                 r = self._get("/api/v2/mix/order/detail", {
@@ -723,31 +729,12 @@ class Bitget:
         return None
 
     def close_long(self, qty, trigger_px: float = 0.0, reason: str = "EXIT"):
-        """
-        Fecha posição long na Bitget.
-
-        Fluxo de preço de execução (FIX-16):
-          1. Envia ordem market → captura orderId.
-          2. _fetch_fill_price(orderId) — preço REAL da exchange (até 4 polls × 0.25 s).
-          3. Fallback: trigger_px (mark price capturado no momento do disparo).
-
-        PnL gravado = PnL_bruto − open_fee − close_fee  (paridade com engine.py).
-        Retorna r["_fill_px"] para que LiveTrader use o preço real em _add_log.
-
-        Args:
-            qty        : quantidade em ETH (convertida para contratos internamente).
-            trigger_px : preço de mercado capturado ANTES de enviar a ordem
-                         (usado como fallback se a API de detalhe falhar).
-            reason     : motivo da saída ('TRAIL', 'SL', 'EXIT_LONG', 'REVERSAL', …).
-        """
         sz  = self._cts(qty)
         r   = self._order("sell", True, sz)
 
         if r.get("code") == "00000":
             order_id = (r.get("data") or {}).get("orderId", "")
-
-            # ── Preço Real de Execução ──────────────────────────────────────
-            fill_px: float = trigger_px   # fallback inicial
+            fill_px: float = trigger_px
             if order_id:
                 fetched = self._fetch_fill_price(order_id)
                 if fetched and fetched > 0:
@@ -759,7 +746,6 @@ class Bitget:
                             f"diff={fill_px - trigger_px:+.2f} USDT"
                         )
 
-            # ── PnL líquido com taxas (= engine.py) ────────────────────────
             qty_eth = sz * self.CT_VAL
             ts      = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
@@ -781,32 +767,17 @@ class Bitget:
                     )
                     break
 
-            r["_fill_px"] = fill_px   # expõe para LiveTrader._add_log
+            r["_fill_px"] = fill_px
 
         return r
 
     def close_short(self, qty, trigger_px: float = 0.0, reason: str = "EXIT"):
-        """
-        Fecha posição short na Bitget.
-
-        Idêntico a close_long mas para posições vendidas:
-          PnL_bruto = (entry_price − fill_px) × qty_eth.
-        Retorna r["_fill_px"] para que LiveTrader use o preço real em _add_log.
-
-        Args:
-            qty        : quantidade em ETH (convertida para contratos internamente).
-            trigger_px : preço de mercado capturado ANTES de enviar a ordem
-                         (usado como fallback se a API de detalhe falhar).
-            reason     : motivo da saída ('TRAIL', 'SL', 'EXIT_SHORT', 'REVERSAL', …).
-        """
         sz  = self._cts(qty)
         r   = self._order("buy", True, sz)
 
         if r.get("code") == "00000":
             order_id = (r.get("data") or {}).get("orderId", "")
-
-            # ── Preço Real de Execução ──────────────────────────────────────
-            fill_px: float = trigger_px   # fallback inicial
+            fill_px: float = trigger_px
             if order_id:
                 fetched = self._fetch_fill_price(order_id)
                 if fetched and fetched > 0:
@@ -818,7 +789,6 @@ class Bitget:
                             f"diff={fill_px - trigger_px:+.2f} USDT"
                         )
 
-            # ── PnL líquido com taxas (= engine.py) ────────────────────────
             qty_eth = sz * self.CT_VAL
             ts      = brazil_iso()
             for t in reversed(history_mgr.get_all_trades()):
@@ -840,7 +810,7 @@ class Bitget:
                     )
                     break
 
-            r["_fill_px"] = fill_px   # expõe para LiveTrader._add_log
+            r["_fill_px"] = fill_px
 
         return r
 
@@ -899,11 +869,9 @@ class LiveTrader:
         self._cache_px:  float = 0.0
         self._pos_lock        = threading.Lock()
         self._stop_monitor    = RealTimeStopMonitor(self)
-        self._pending_entry_check = False   # flag para monitoramento após entrada
-        self.strategy._just_filled = False  # FIX-18: usado pelo poll intrabar
+        self._pending_entry_check = False
+        self.strategy._just_filled = False
 
-        # FIX-14: Cache do candle em formação — necessário para trailing stop
-        # independente do sucesso do fetch de candle (loop desacoplado)
         self._forming_high: float = 0.0
         self._forming_low:  float = float('inf')
         self._forming_ts           = None
@@ -912,7 +880,6 @@ class LiveTrader:
         return self._paper_mode
 
     def _get_mark_price_with_retry(self, max_attempts: int = 5, delay: float = 0.5) -> Optional[float]:
-        """Tenta obter o mark price da Bitget com retries. Retorna None se falhar."""
         for attempt in range(1, max_attempts + 1):
             try:
                 r = requests.get(
@@ -932,28 +899,18 @@ class LiveTrader:
         return None
 
     def _mark_price(self) -> Optional[float]:
-        """Fonte única de verdade para preço de mercado. Sem fallback para close."""
         return self._get_mark_price_with_retry()
 
     def _mark_price_fast(self) -> Optional[float]:
-        """
-        Versão rápida para polling de trailing stop intra-barra.
-        2 tentativas × 0.2 s = max 0.4 s de bloqueio (vs 2.5 s do _mark_price completo).
-        """
         return self._get_mark_price_with_retry(max_attempts=2, delay=0.2)
 
     def close_long(self, reason: str, trigger_px: float):
         try:
-            # 1. Captura o preço REAL exato no momento do fechamento
             real_exit_px = self._mark_price()
-
             if not self._is_paper():
-                # Executa ordem a mercado na exchange
                 self.bitget.close_long(abs(self.strategy.position_size), real_exit_px, reason)
             else:
                 self._paper_close_long(real_exit_px, reason, brazil_iso())
-
-            # 2. Registra log e atualiza estado com o PREÇO REAL
             self._add_log("SELL", real_exit_px, abs(self.strategy.position_size), reason)
             self.strategy.position_size = 0
             self.strategy.position_price = 0.0
@@ -965,12 +922,10 @@ class LiveTrader:
     def close_short(self, reason: str, trigger_px: float):
         try:
             real_exit_px = self._mark_price()
-
             if not self._is_paper():
                 self.bitget.close_short(abs(self.strategy.position_size), real_exit_px, reason)
             else:
                 self._paper_close_short(real_exit_px, reason, brazil_iso())
-
             self._add_log("BUY", real_exit_px, abs(self.strategy.position_size), reason)
             self.strategy.position_size = 0
             self.strategy.position_price = 0.0
@@ -1092,23 +1047,12 @@ class LiveTrader:
             return r
         return {"code": "0", "_fill_px": price}
 
-    # ------------------------------------------------------------------
-    # Processamento centralizado de um candle fechado (reutilizado)
-    # ------------------------------------------------------------------
     def _process_closed_candle(self, closed_candle: Dict, ts_raw: int,
                                last_processed_ts: Optional[int]) -> Optional[int]:
-        """
-        Processa um candle fechado (estrategia, entradas/saídas).
-        Retorna o timestamp processado (ts_raw) se tudo ocorreu bem,
-        ou o valor anterior (last_processed_ts) em caso de falha.
-        """
         with self._pos_lock:
-            # ── PASSO 1: Atualizar estratégia com o candle fechado ─────────────
             actions = self.strategy.next(closed_candle)
             log.debug(f"  📊 strategy.next() → {len(actions)} ações")
 
-            # ── PASSO 2: Obter ordens pendentes IMEDIATAMENTE após next() ──────
-            # (FIX-15) Coletadas no mesmo ciclo, sem esperar próxima iteração.
             pending_orders = self.strategy.get_pending_orders()
             if pending_orders:
                 log.debug(f"  📋 {len(pending_orders)} ordem(ns) pendente(s)")
@@ -1116,14 +1060,6 @@ class LiveTrader:
             exits = [a for a in actions
                      if a.get('action') in ('EXIT_LONG', 'EXIT_SHORT')]
 
-            # ── PASSO 3: Snapshot único de Mark Price ─────────────────────────
-            # (FIX-15) _mark_price() chamado UMA VEZ por ciclo, imediatamente
-            # antes do envio de qualquer ordem. O mesmo valor é usado para:
-            #   • bitget/paper close_long|close_short  (exit_px real)
-            #   • bitget/paper open_long|open_short    (fill_px real)
-            #   • strategy.confirm_fill(fill_px=...)   (sincroniza trailing stop)
-            # Isso garante paridade perfeita entre o preço enviado à exchange
-            # e o preço injetado na estratégia, eliminando divergências de PnL.
             needs_price = bool(exits or pending_orders)
             snapshot_px: Optional[float] = None
             if needs_price:
@@ -1135,22 +1071,18 @@ class LiveTrader:
                         "entrada(s) canceladas neste ciclo. "
                         "Candle marcado como processado para evitar reprocessamento."
                     )
-                    return ts_raw   # candle consumido; não reprocessar
+                    return ts_raw
                 log.info(
                     f"  📍 [FIX-15] snapshot_px={snapshot_px:.2f} "
                     f"({len(exits)} saída(s) | {len(pending_orders)} entrada(s))"
                 )
 
-            # ── PASSO 4: Processar saídas com snapshot_px ─────────────────────
             for act in exits:
                 kind  = act.get('action', '')
                 a_qty = float(act.get('qty') or 0)
                 a_rsn = act.get('exit_reason', kind)
                 a_ts  = act.get('timestamp', closed_candle['timestamp'])
-
-                # snapshot_px é o trigger: mark price no momento do envio da ordem.
-                # O fill real é buscado DENTRO de close_long/close_short (FIX-16).
-                trigger_px = snapshot_px  # type: ignore[assignment]
+                trigger_px = snapshot_px
 
                 if kind == 'EXIT_LONG':
                     if self._is_paper():
@@ -1192,17 +1124,14 @@ class LiveTrader:
                              f"fill={fill_exit:.2f} | {a_rsn} "
                              f"| bal={self.strategy.balance:.2f}")
 
-            # ── PASSO 5 + 6: Executar entradas e confirmar fill ───────────────
             for order in pending_orders:
                 side  = order['side']
                 o_qty = order['qty']
                 if o_qty <= 0:
                     continue
 
-                fill_px = snapshot_px  # type: ignore[assignment]
+                fill_px = snapshot_px
 
-                # PARIDADE BACKTEST: Forçar preço de ABERTURA do novo candle no modo Paper.
-                # No Live, envia a mercado com snapshot_px e corrige pelo priceAvg depois.
                 if self._is_paper() and getattr(self, '_forming_open', 0.0) > 0:
                     fill_px = self._forming_open
                     log.info(f"  🎯 [PARIDADE BACKTEST] Usando Abertura do novo candle: {fill_px:.2f}")
@@ -1239,9 +1168,6 @@ class LiveTrader:
                         if r.get("code") != "00000":
                             log.error("  ❌ bitget.open_long falhou")
                             continue
-                        # Sincronização Crítica (FIX-16): busca o priceAvg REAL
-                        # retornado pela Bitget para evitar que o trailing stop
-                        # seja acionado por slippage entre snapshot_px e fill real.
                         oid = (r.get("data") or {}).get("orderId")
                         if oid:
                             fetched_px = self.bitget._fetch_fill_price(oid)
@@ -1250,11 +1176,8 @@ class LiveTrader:
                                 log.info(f"  🎯 [FIX-16] fill_px corrigido → {fill_px:.2f} "
                                          f"(priceAvg real, era snapshot={snapshot_px:.2f})")
 
-                    # PASSO 6: Confirmar fill na estratégia com preço REAL de execução.
-                    # fill_px = priceAvg da Bitget quando disponível (FIX-16),
-                    # ou snapshot_px como fallback seguro (FIX-15).
                     close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, closed_candle['timestamp'])
-                    self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
+                    self.strategy._just_filled = True
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
@@ -1268,7 +1191,6 @@ class LiveTrader:
                     self._last_entry_time = time.time()
                     log.info(f"  ✅ LONG confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
-                    log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
 
                 elif side == 'SELL':
                     if self._is_paper():
@@ -1302,9 +1224,6 @@ class LiveTrader:
                         if r.get("code") != "00000":
                             log.error("  ❌ bitget.open_short falhou")
                             continue
-                        # Sincronização Crítica (FIX-16): busca o priceAvg REAL
-                        # retornado pela Bitget para evitar que o trailing stop
-                        # seja acionado por slippage entre snapshot_px e fill real.
                         oid = (r.get("data") or {}).get("orderId")
                         if oid:
                             fetched_px = self.bitget._fetch_fill_price(oid)
@@ -1314,8 +1233,7 @@ class LiveTrader:
                                          f"(priceAvg real, era snapshot={snapshot_px:.2f})")
 
                     close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, closed_candle['timestamp'])
-                    self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
-                    # PASSO 6 (SELL): mesmo snapshot_px para estratégia (FIX-15)
+                    self.strategy._just_filled = True
                     if close_act:
                         self._add_log(close_act.get('action', 'REVERSAL'),
                                       fill_px, qty_f, 'REVERSAL')
@@ -1329,11 +1247,8 @@ class LiveTrader:
                     self._last_entry_time = time.time()
                     log.info(f"  ✅ SHORT confirmado | fill_px={fill_px:.2f} "
                              f"qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
-                    log.debug("  🔒 [ENTRY-PENDING] monitoramento ativo no próximo poll")
 
             return ts_raw
-
-    # ------------------------------------------------------------------
 
     def run(self, df: pd.DataFrame):
         mode_str = "📄 PAPER" if self._is_paper() else "💰 LIVE (95% saldo)"
@@ -1360,12 +1275,9 @@ class LiveTrader:
         log.info("  ✅ Pronto. Aguardando candles ao vivo...")
 
         self._running = True
-
-        # FIX-1: rastreia timestamp REAL do candle fechado (UNIX ms)
         last_processed_closed_ts: Optional[int] = None
 
-        # FIX-10: Processar IMEDIATAMENTE o último candle do warmup
-        # --------------------------------------------------------------
+        # FIX-10: Processa imediatamente o último candle do warmup
         last_candle = df.iloc[-1]
         try:
             ts_last = last_candle['timestamp']
@@ -1395,44 +1307,13 @@ class LiveTrader:
                 log.warning("  ⚠️ Processamento do candle inicial falhou, continuando normalmente")
         except Exception as e:
             log.error(f"  ❌ Erro ao processar candle inicial: {e}\n{traceback.format_exc()}")
-        # --------------------------------------------------------------
 
         loop_exit_reason = None
 
-        # ══════════════════════════════════════════════════════════════════════
-        # CLOCK-SYNC — sincronização de relógio para latência zero na entrada
-        # ══════════════════════════════════════════════════════════════════════
-        #
-        # MUDANÇAS em relação ao loop anterior:
-        #
-        # 1. SLEEP CONSTANTE: sleep_secs = 1 if has_position else 15 removido.
-        #    O bot sempre dorme SLEEP_CONSTANT (0.5 s) para garantir precisão
-        #    de milissegundos tanto com quanto sem posição aberta.
-        #
-        # 2. GATILHO POR RELÓGIO: o próximo fechamento é calculado pelo relógio
-        #    do sistema (floor/ceil sobre epoch UTC) — não pela detecção passiva
-        #    do campo [1] do endpoint REST.
-        #
-        # 3. PRÉ-FETCH DE SINAL: 1-2 s antes da virada captura o mark price e
-        #    armazena em prefetch_snapshot_px, sem chamar a estratégia ainda.
-        #
-        # 4. EXECUÇÃO IMEDIATA NA VIRADA: quando secs_since_close cai em
-        #    [0, FIRE_WINDOW_SECS], monta o candle com os dados do cache de
-        #    formação e dispara strategy.next() + ordens usando o preço
-        #    pré-capturado — zero chamadas extras a _mark_price().
-        #
-        # 5. FALLBACK REST (SEGURO): a chamada _candle_single() continua em
-        #    toda iteração para (a) manter o cache forming atualizado e
-        #    (b) processar via _process_closed_candle() qualquer candle que o
-        #    clock-sync não tenha capturado (restart, clock drift, 1.ª iteração).
-        # ══════════════════════════════════════════════════════════════════════
+        PREFETCH_SECS:    float = 1.5
+        FIRE_WINDOW_SECS: float = 3.0
+        SLEEP_CONSTANT:   float = 0.5
 
-        # Constantes de temporização
-        PREFETCH_SECS:    float = 1.5   # janela de pré-fetch antes da virada (s)
-        FIRE_WINDOW_SECS: float = 3.0   # janela de disparo após a virada (s)
-        SLEEP_CONSTANT:   float = 0.5   # sleep constante — sem mais 15 s flat
-
-        # Mapa timeframe → segundos do intervalo
         _TF_SECS_MAP: Dict[str, int] = {
             '1m':  60,    '3m':  180,   '5m':  300,   '15m': 900,
             '30m': 1800,  '1h':  3600,  '2h':  7200,  '4h':  14400,
@@ -1440,11 +1321,10 @@ class LiveTrader:
         }
         _interval_secs: int = _TF_SECS_MAP.get(TIMEFRAME.lower(), 1800)
 
-        # Estado do clock-sync (local ao loop)
         prefetch_done:        bool            = False
         prefetch_snapshot_px: Optional[float] = None
-        clock_fired_at:       Optional[float] = None   # boundary epoch já disparada
-        forming_open_cache:   float           = 0.0    # open do candle em formação
+        clock_fired_at:       Optional[float] = None
+        forming_open_cache:   float           = 0.0
 
         while self._running:
             try:
@@ -1458,7 +1338,6 @@ class LiveTrader:
                 _candles_p0 = self._candle_single()
                 if _candles_p0 is not None and len(_candles_p0) >= 2:
                     try:
-                        # CORREÇÃO CRÍTICA DOS ÍNDICES BITGET: [1] é em formação (new), [0] é fechado (old)
                         _fr                = _candles_p0[1]
                         self._forming_high = float(_fr[2])
                         self._forming_low  = float(_fr[3])
@@ -1469,7 +1348,6 @@ class LiveTrader:
                     except (ValueError, IndexError) as _e0:
                         log.warning(f"  ⚠️ [P0] Erro cache forming: {_e0}")
 
-                    # Fallback REST: processa candle fechado [0]
                     if len(_candles_p0[0]) >= 5:
                         try:
                             _prev_ts_raw_p0 = int(_candles_p0[0][0])
@@ -1502,16 +1380,12 @@ class LiveTrader:
                             log.warning(f"  ⚠️ [P0] Erro fallback REST: {_e0b}")
 
                 # ── PRIORIDADE 1: Verificação SL/trailing intrabar ──────────────
-                # Replica exatamente _check_trail do backtest:
-                #   • poll normal  → usa H/L do candle em formação (sem injeção de mark price)
-                #   • is_entry_candle=True → usa current_price pós-fill (_just_filled)
                 if getattr(self.strategy, 'position_size', 0) != 0:
                     current_px = self._mark_price_fast()
 
-                    # is_entry_candle=True apenas no primeiro poll após confirm_fill()
                     is_entry = getattr(self.strategy, '_just_filled', False)
                     if is_entry:
-                        self.strategy._just_filled = False   # consome o flag
+                        self.strategy._just_filled = False
 
                     if current_px and current_px > 0:
                         exit_act = self.strategy.update_trailing_live(
@@ -1531,15 +1405,10 @@ class LiveTrader:
                                 self.close_short(e_rsn, e_px)
 
                     time.sleep(1)
-                    continue  # candle já processado em P0; pula clock-sync
+                    continue
                 else:
                     time.sleep(1)
 
-                # ── CÁLCULO DO CICLO DO CANDLE (relógio local UTC) ───────────
-                # current_boundary: última borda que passou  (floor)
-                # next_boundary:    próxima borda a passar   (floor + interval)
-                # secs_since_close: segundos decorridos desde o último close
-                # secs_to_next:     segundos até o próximo close
                 current_boundary_epoch: float = (
                     int(now_epoch // _interval_secs) * _interval_secs
                 )
@@ -1547,10 +1416,7 @@ class LiveTrader:
                 secs_since_close:    float = now_epoch - current_boundary_epoch
                 secs_to_next:        float = next_boundary_epoch - now_epoch
 
-                # ── PRIORIDADE 2: Pré-Fetch de Sinal (Zero Latency Entry) ────
-                # Captura o mark price 1-2 s antes da virada e guarda em
-                # prefetch_snapshot_px. Na virada, esse preço é usado
-                # diretamente — nenhuma chamada extra a _mark_price().
+                # ── PRIORIDADE 2: Pré-Fetch de Sinal ────────────────────────
                 if not prefetch_done and 0 < secs_to_next <= PREFETCH_SECS:
                     px_pre = self._mark_price()
                     if px_pre and px_pre > 0:
@@ -1568,9 +1434,6 @@ class LiveTrader:
                         )
 
                 # ── PRIORIDADE 3: Execução Imediata na Virada do Candle ──────
-                # Dispara logo após a borda do relógio (dentro de FIRE_WINDOW_SECS),
-                # sem aguardar confirmação REST. Usa o preço pré-capturado no
-                # pré-fetch — latência de entrada próxima de zero.
                 already_fired_this_boundary: bool = (
                     clock_fired_at is not None
                     and abs(clock_fired_at - current_boundary_epoch) < 1.0
@@ -1580,7 +1443,7 @@ class LiveTrader:
                         and 0 <= secs_since_close <= FIRE_WINDOW_SECS):
 
                     fire_px              = prefetch_snapshot_px
-                    clock_fired_at       = current_boundary_epoch   # marca disparado
+                    clock_fired_at       = current_boundary_epoch
                     prefetch_done        = False
                     prefetch_snapshot_px = None
 
@@ -1613,8 +1476,6 @@ class LiveTrader:
                                 f"{secs_since_close:.3f}s após boundary"
                             )
 
-                            # Execução inline — usa fire_px (pré-capturado)
-                            # sem nenhuma chamada adicional a _mark_price().
                             with self._pos_lock:
                                 actions_clk = self.strategy.next(clk_candle)
                                 pending_clk = self.strategy.get_pending_orders()
@@ -1630,7 +1491,6 @@ class LiveTrader:
                                         f"{len(pending_clk)} entrada(s)"
                                     )
 
-                                # ── Saídas ────────────────────────────────────
                                 for act in exits_clk:
                                     kind  = act.get('action', '')
                                     a_qty = float(act.get('qty') or 0)
@@ -1681,7 +1541,6 @@ class LiveTrader:
                                             f"| {a_rsn} | bal={self.strategy.balance:.2f}"
                                         )
 
-                                # ── Entradas ──────────────────────────────────
                                 for order in pending_clk:
                                     side  = order['side']
                                     o_qty = order['qty']
@@ -1690,7 +1549,6 @@ class LiveTrader:
 
                                     fill_px = fire_px
 
-                                    # PARIDADE BACKTEST: Forçar preço de ABERTURA do novo candle no modo Paper
                                     if self._is_paper() and clk_open > 0:
                                         fill_px = clk_open
                                         log.info(f"  🎯 [PARIDADE BACKTEST] Usando Abertura do novo candle: {fill_px:.2f}")
@@ -1701,20 +1559,10 @@ class LiveTrader:
                                             if pos and pos['side'] == 'long':
                                                 continue
                                             if pos and pos['side'] == 'short':
-                                                log.warning(
-                                                    "  ⚠️ [CLOCK] BUY: fechando short residual"
-                                                )
-                                                self._paper_close_short(
-                                                    fill_px, 'REVERSAL', clk_candle['timestamp']
-                                                )
-                                            log.info(
-                                                f"  🟢 [CLOCK/PAPER] ENTER LONG "
-                                                f"{o_qty:.6f} ETH @ {fill_px:.2f}"
-                                            )
-                                            r, qty_f = self.paper.open_long(
-                                                o_qty, self._cache_bal, fill_px,
-                                                ts=clk_candle['timestamp']
-                                            )
+                                                log.warning("  ⚠️ [CLOCK] BUY: fechando short residual")
+                                                self._paper_close_short(fill_px, 'REVERSAL', clk_candle['timestamp'])
+                                            log.info(f"  🟢 [CLOCK/PAPER] ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f}")
+                                            r, qty_f = self.paper.open_long(o_qty, self._cache_bal, fill_px, ts=clk_candle['timestamp'])
                                             if r.get("code") != "0":
                                                 log.error("  ❌ [CLOCK] paper.open_long falhou")
                                                 continue
@@ -1723,63 +1571,33 @@ class LiveTrader:
                                             if pos and pos['side'] == 'long':
                                                 continue
                                             if pos and pos['side'] == 'short':
-                                                log.info(
-                                                    f"  ↩️ [CLOCK] REVERSAL: "
-                                                    f"fechando SHORT @ {fill_px:.2f}"
-                                                )
+                                                log.info(f"  ↩️ [CLOCK] REVERSAL: fechando SHORT @ {fill_px:.2f}")
                                                 try:
-                                                    self.bitget.close_short(
-                                                        pos['size'], fill_px, "REVERSAL"
-                                                    )
+                                                    self.bitget.close_short(pos['size'], fill_px, "REVERSAL")
                                                 except Exception as _e:
-                                                    log.error(
-                                                        f"  ❌ [CLOCK] reversal close_short: {_e}"
-                                                    )
-                                            log.info(
-                                                f"  🟢 [CLOCK/LIVE] ENTER LONG "
-                                                f"{o_qty:.6f} ETH @ {fill_px:.2f} "
-                                                f"(zero delay)"
-                                            )
-                                            r, qty_f = self.bitget.open_long(
-                                                o_qty, self._cache_bal, fill_px
-                                            )
+                                                    log.error(f"  ❌ [CLOCK] reversal close_short: {_e}")
+                                            log.info(f"  🟢 [CLOCK/LIVE] ENTER LONG {o_qty:.6f} ETH @ {fill_px:.2f} (zero delay)")
+                                            r, qty_f = self.bitget.open_long(o_qty, self._cache_bal, fill_px)
                                             if r.get("code") == "SKIP":
-                                                log.warning(
-                                                    f"  ⛔ [CLOCK] LONG ignorado — "
-                                                    f"{r.get('msg')}"
-                                                )
+                                                log.warning(f"  ⛔ [CLOCK] LONG ignorado — {r.get('msg')}")
                                                 continue
                                             if r.get("code") != "00000":
                                                 log.error("  ❌ [CLOCK] bitget.open_long falhou")
                                                 continue
 
-                                        close_act = self.strategy.confirm_fill(
-                                            'BUY', fill_px, qty_f, clk_candle['timestamp']
-                                        )
-                                        self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
+                                        close_act = self.strategy.confirm_fill('BUY', fill_px, qty_f, clk_candle['timestamp'])
+                                        self.strategy._just_filled = True
                                         if close_act:
-                                            self._add_log(
-                                                close_act.get('action', 'REVERSAL'),
-                                                fill_px, qty_f, 'REVERSAL'
-                                            )
-                                            log.info(
-                                                f"  ↩️ [CLOCK] confirm_fill reversal: "
-                                                f"{close_act.get('action')} @ {fill_px:.2f}"
-                                            )
+                                            self._add_log(close_act.get('action', 'REVERSAL'), fill_px, qty_f, 'REVERSAL')
+                                            log.info(f"  ↩️ [CLOCK] confirm_fill reversal: {close_act.get('action')} @ {fill_px:.2f}")
                                         self._add_log("ENTER_LONG", fill_px, qty_f)
-                                        self._cache_pos = {
-                                            'side': 'long', 'size': qty_f, 'avg_px': fill_px
-                                        }
+                                        self._cache_pos = {'side': 'long', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
-                                        log.info(
-                                            f"  ✅ [CLOCK] LONG confirmado | "
-                                            f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
-                                            f"bal={self.strategy.balance:.2f}"
-                                        )
+                                        log.info(f"  ✅ [CLOCK] LONG confirmado | fill_px={fill_px:.2f} qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
 
                                     elif side == 'SELL':
                                         if self._is_paper():
@@ -1787,20 +1605,10 @@ class LiveTrader:
                                             if pos and pos['side'] == 'short':
                                                 continue
                                             if pos and pos['side'] == 'long':
-                                                log.warning(
-                                                    "  ⚠️ [CLOCK] SELL: fechando long residual"
-                                                )
-                                                self._paper_close_long(
-                                                    fill_px, 'REVERSAL', clk_candle['timestamp']
-                                                )
-                                            log.info(
-                                                f"  🔴 [CLOCK/PAPER] ENTER SHORT "
-                                                f"{o_qty:.6f} ETH @ {fill_px:.2f}"
-                                            )
-                                            r, qty_f = self.paper.open_short(
-                                                o_qty, self._cache_bal, fill_px,
-                                                ts=clk_candle['timestamp']
-                                            )
+                                                log.warning("  ⚠️ [CLOCK] SELL: fechando long residual")
+                                                self._paper_close_long(fill_px, 'REVERSAL', clk_candle['timestamp'])
+                                            log.info(f"  🔴 [CLOCK/PAPER] ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f}")
+                                            r, qty_f = self.paper.open_short(o_qty, self._cache_bal, fill_px, ts=clk_candle['timestamp'])
                                             if r.get("code") != "0":
                                                 log.error("  ❌ [CLOCK] paper.open_short falhou")
                                                 continue
@@ -1809,76 +1617,40 @@ class LiveTrader:
                                             if pos and pos['side'] == 'short':
                                                 continue
                                             if pos and pos['side'] == 'long':
-                                                log.info(
-                                                    f"  ↩️ [CLOCK] REVERSAL: "
-                                                    f"fechando LONG @ {fill_px:.2f}"
-                                                )
+                                                log.info(f"  ↩️ [CLOCK] REVERSAL: fechando LONG @ {fill_px:.2f}")
                                                 try:
-                                                    self.bitget.close_long(
-                                                        pos['size'], fill_px, "REVERSAL"
-                                                    )
+                                                    self.bitget.close_long(pos['size'], fill_px, "REVERSAL")
                                                 except Exception as _e:
-                                                    log.error(
-                                                        f"  ❌ [CLOCK] reversal close_long: {_e}"
-                                                    )
-                                            log.info(
-                                                f"  🔴 [CLOCK/LIVE] ENTER SHORT "
-                                                f"{o_qty:.6f} ETH @ {fill_px:.2f} "
-                                                f"(zero delay)"
-                                            )
-                                            r, qty_f = self.bitget.open_short(
-                                                o_qty, self._cache_bal, fill_px
-                                            )
+                                                    log.error(f"  ❌ [CLOCK] reversal close_long: {_e}")
+                                            log.info(f"  🔴 [CLOCK/LIVE] ENTER SHORT {o_qty:.6f} ETH @ {fill_px:.2f} (zero delay)")
+                                            r, qty_f = self.bitget.open_short(o_qty, self._cache_bal, fill_px)
                                             if r.get("code") == "SKIP":
-                                                log.warning(
-                                                    f"  ⛔ [CLOCK] SHORT ignorado — "
-                                                    f"{r.get('msg')}"
-                                                )
+                                                log.warning(f"  ⛔ [CLOCK] SHORT ignorado — {r.get('msg')}")
                                                 continue
                                             if r.get("code") != "00000":
                                                 log.error("  ❌ [CLOCK] bitget.open_short falhou")
                                                 continue
 
-                                        close_act = self.strategy.confirm_fill(
-                                            'SELL', fill_px, qty_f, clk_candle['timestamp']
-                                        )
-                                        self.strategy._just_filled = True   # FIX-18: imediatamente após confirm_fill
+                                        close_act = self.strategy.confirm_fill('SELL', fill_px, qty_f, clk_candle['timestamp'])
+                                        self.strategy._just_filled = True
                                         if close_act:
-                                            self._add_log(
-                                                close_act.get('action', 'REVERSAL'),
-                                                fill_px, qty_f, 'REVERSAL'
-                                            )
-                                            log.info(
-                                                f"  ↩️ [CLOCK] confirm_fill reversal: "
-                                                f"{close_act.get('action')} @ {fill_px:.2f}"
-                                            )
+                                            self._add_log(close_act.get('action', 'REVERSAL'), fill_px, qty_f, 'REVERSAL')
+                                            log.info(f"  ↩️ [CLOCK] confirm_fill reversal: {close_act.get('action')} @ {fill_px:.2f}")
                                         self._add_log("ENTER_SHORT", fill_px, qty_f)
-                                        self._cache_pos = {
-                                            'side': 'short', 'size': qty_f, 'avg_px': fill_px
-                                        }
+                                        self._cache_pos = {'side': 'short', 'size': qty_f, 'avg_px': fill_px}
                                         self._cache_bal = self.strategy.balance
                                         if self._is_paper():
                                             self.paper.balance = self.strategy.balance
                                         self._pending_entry_check = True
                                         self._last_entry_time = time.time()
-                                        log.info(
-                                            f"  ✅ [CLOCK] SHORT confirmado | "
-                                            f"fill_px={fill_px:.2f} qty={qty_f:.4f} | "
-                                            f"bal={self.strategy.balance:.2f}"
-                                        )
+                                        log.info(f"  ✅ [CLOCK] SHORT confirmado | fill_px={fill_px:.2f} qty={qty_f:.4f} | bal={self.strategy.balance:.2f}")
 
                             last_processed_closed_ts = clk_ts_raw
                             self._refresh_cache()
-                            log.info(
-                                f"  ✔ [CLOCK-SYNC] Candle ts={clk_ts_raw} processado "
-                                f"e marcado"
-                            )
+                            log.info(f"  ✔ [CLOCK-SYNC] Candle ts={clk_ts_raw} processado e marcado")
 
                         else:
-                            log.debug(
-                                f"  ℹ️ [CLOCK-SYNC] ts={clk_ts_raw} já processado — "
-                                f"skipping"
-                            )
+                            log.debug(f"  ℹ️ [CLOCK-SYNC] ts={clk_ts_raw} já processado — skipping")
 
                     else:
                         log.warning(
@@ -1888,11 +1660,6 @@ class LiveTrader:
                             f"forming_ts={self._forming_ts}). "
                             f"Aguardando fallback REST."
                         )
-
-                # ── PRIORIDADE 4 (FALLBACK SEGURO): Validação e Sync REST ────
-                # Nota: o fetch e o update do cache de formação foram movidos para
-                # PRIORIDADE 0 (topo do loop) para garantir H/L frescos antes do
-                # bloco de monitoramento intrabar — candle já processado acima.
 
                 time.sleep(SLEEP_CONSTANT)
 
@@ -2586,16 +2353,18 @@ def start():
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
 
-        # Nota: a limpeza de lock órfão agora é feita dentro de _acquire_lock()
-        # via verificação de PID — não precisa de cleanup manual aqui.
+        # FIX-20: Tenta adquirir normalmente; se falhar, tenta force-break
+        # de locks órfãos antes de retornar erro ao usuário.
         if not _acquire_lock():
-            return jsonify({
-                "error": (
-                    "Outro processo Gunicorn ainda está rodando o trader. "
-                    "Aguarde alguns segundos e tente novamente — o lock será "
-                    "liberado automaticamente quando o deploy anterior encerrar."
-                )
-            }), 400
+            log.warning("⚠️ _acquire_lock falhou na primeira tentativa — tentando force-break...")
+            if not _force_break_stale_lock():
+                return jsonify({
+                    "error": (
+                        "Outro processo ainda está rodando o trader. "
+                        "Aguarde alguns segundos e tente novamente."
+                    )
+                }), 400
+            log.info("✅ Force-break bem-sucedido — prosseguindo com o start.")
 
         _starting = True
         threading.Thread(target=_thread, daemon=True).start()
@@ -2665,7 +2434,7 @@ def _delayed_start():
             log.warning("⚠️ Chaves Bitget não configuradas — use o botão Iniciar.")
             return
         if not _acquire_lock():
-            log.warning("⚠️ Lock de processo já existe. Auto-start ignorado (outro worker rodando?).")
+            log.warning("⚠️ Lock não adquirido no auto-start — outro worker pode estar ativo.")
             return
         _starting = True
         mode_str = "PAPER TRADING" if is_paper else "LIVE (Bitget)"
