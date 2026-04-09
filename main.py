@@ -177,33 +177,146 @@ def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
 
 LOCK_FILE = "bot.lock"
-_lock_fd = None
+_lock_fd: Optional[int] = None   # fd do arquivo de lock (None = sem lock)
 
-def _acquire_lock() -> bool:
-    global _lock_fd
+# ── Por que PID + fcntl juntos? ────────────────────────────────────────────
+# • fcntl.flock(LOCK_EX|LOCK_NB): atômico no kernel — impede 2 processos OS
+#   de adquirirem o lock ao mesmo tempo. Liberado automaticamente se o
+#   processo morrer (kernel fecha os fds do processo morto).
+# • PID no arquivo: permite que um processo recém-iniciado detecte se o
+#   holder anterior ainda está vivo (os.kill(pid, 0)) e, se não estiver,
+#   assuma o lock sem esperar o timeout do Gunicorn (120 s).
+# • Guard de re-entrada (_lock_fd is not None): impede que a mesma instância
+#   Python tente adquirir um segundo fd para o mesmo arquivo — no Linux,
+#   dois flock(LOCK_EX) sobre fds distintos para o mesmo arquivo, mesmo no
+#   mesmo processo, podem falhar dependendo do kernel.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _pid_alive(pid: int) -> bool:
+    """Verifica se um PID ainda existe no sistema sem enviar sinal real."""
     try:
-        _lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
-        # Tenta travar o arquivo no nível do Sistema Operacional.
-        # Se outro worker já travou, levanta erro imediatamente e aborta.
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        log.debug("Lock de processo adquirido com sucesso (fcntl).")
+        os.kill(pid, 0)   # sinal 0 = apenas verifica existência
         return True
-    except (IOError, OSError):
-        log.warning("⚠️ Lock em uso: Outro processo/worker já está rodando o bot!")
+    except (OSError, ProcessLookupError):
         return False
 
-def _release_lock():
-    global _lock_fd
-    try:
-        if _lock_fd is not None:
-            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
-            os.close(_lock_fd)
-            _lock_fd = None
-            log.info("🔓 Cadeado (lock) removido.")
-    except Exception as e:
-        log.error(f"Erro ao remover lock: {e}")
+def _acquire_lock() -> bool:
+    """
+    Adquire lock exclusivo via fcntl + PID.
 
-# O fcntl limpa automaticamente quando o worker morre — sem _release_lock() global.
+    1. Se este processo já segura o lock (_lock_fd is not None) → True imediato
+       (re-entrada segura: evita conflito de dois fds no mesmo processo).
+    2. Abre bot.lock e tenta flock(LOCK_EX | LOCK_NB).
+    3. Se falhar (outro processo segura o lock):
+       - Lê o PID gravado no arquivo.
+       - Se o processo holder estiver morto (deploy antigo do Render ainda
+         em graceful shutdown mas já encerrado), força aquisição com
+         flock(LOCK_EX) bloqueante brevemente — o kernel concede assim que
+         o holder libera ou morre.
+    4. Em caso de sucesso, grava o PID deste processo no arquivo para
+       diagnóstico por futuros _acquire_lock() de outros processos.
+    """
+    global _lock_fd
+
+    # Guard de re-entrada: já seguramos o lock neste processo
+    if _lock_fd is not None:
+        return True
+
+    fd = None
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # ── Sucesso imediato ──────────────────────────────────────────
+            _write_pid(fd)
+            _lock_fd = fd
+            log.debug(f"🔒 Lock adquirido (PID={os.getpid()}).")
+            return True
+
+        except (IOError, OSError):
+            # ── Outro processo segura o lock — verifica se ainda vive ───
+            holder_pid = _read_pid(fd)
+            if holder_pid and not _pid_alive(holder_pid):
+                log.warning(
+                    f"⚠️ Lock órfão detectado (PID={holder_pid} não existe). "
+                    "Assumindo controle..."
+                )
+                # flock bloqueante: kernel entrega assim que o holder morrer
+                # (normalmente imediato pois já confirmamos que o PID morreu)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _write_pid(fd)
+                    _lock_fd = fd
+                    log.info(f"🔒 Lock assumido após órfão (PID={os.getpid()}).")
+                    return True
+                except (IOError, OSError):
+                    pass   # corrida improvável — outro processo ganhou
+
+            log.warning(
+                f"⚠️ Lock em uso pelo PID={holder_pid} "
+                "(outro worker Gunicorn ainda vivo). "
+                "O trader iniciará automaticamente quando o deploy anterior encerrar."
+            )
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+
+    except Exception as e:
+        log.error(f"Erro inesperado em _acquire_lock: {e}")
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return False
+
+
+def _write_pid(fd: int) -> None:
+    """Grava PID do processo atual no arquivo de lock (para diagnóstico)."""
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, str(os.getpid()).encode())
+    except OSError:
+        pass
+
+
+def _read_pid(fd: int) -> Optional[int]:
+    """Lê PID gravado no arquivo de lock. Retorna None se inválido."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, 32).decode().strip()
+        return int(data) if data.isdigit() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _release_lock() -> None:
+    """
+    Libera o lock fcntl e fecha o fd.
+    Sempre zera _lock_fd, mesmo em caso de erro, para evitar stale state.
+    """
+    global _lock_fd
+    if _lock_fd is None:
+        return
+    fd = _lock_fd
+    _lock_fd = None   # zera PRIMEIRO — garante que nunca fica em estado inválido
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError as e:
+        log.debug(f"flock(LOCK_UN) ignorado: {e}")
+    try:
+        os.close(fd)
+        log.info("🔓 Lock liberado.")
+    except OSError as e:
+        log.debug(f"os.close(lock_fd) ignorado: {e}")
+
+# Nota: NÃO há _release_lock() no escopo global.
+# O fcntl libera automaticamente quando o processo termina (kernel fecha os fds).
+# Chamar _release_lock() aqui causaria race condition com _delayed_start().
 
 
 class TradeHistoryManager:
@@ -2473,12 +2586,16 @@ def start():
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
 
-        if Path(LOCK_FILE).exists() and _trader is None:
-            log.warning("Limpando lock órfão encontrado no início manual.")
-            _release_lock()
-
+        # Nota: a limpeza de lock órfão agora é feita dentro de _acquire_lock()
+        # via verificação de PID — não precisa de cleanup manual aqui.
         if not _acquire_lock():
-            return jsonify({"error": "Outro processo já está rodando o trader. Use --workers=1 no Gunicorn."}), 400
+            return jsonify({
+                "error": (
+                    "Outro processo Gunicorn ainda está rodando o trader. "
+                    "Aguarde alguns segundos e tente novamente — o lock será "
+                    "liberado automaticamente quando o deploy anterior encerrar."
+                )
+            }), 400
 
         _starting = True
         threading.Thread(target=_thread, daemon=True).start()
