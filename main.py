@@ -115,18 +115,17 @@ FIX-16 Paridade de Execução via priceAvg Real (CORREÇÃO FILL PRICE)
     e _lowest da estratégia partem do ponto exato da nota de corretagem.
   - Paper mode não é afetado (sem orderId real); lógica de fallback
     transparente garante retrocompatibilidade total.
-FIX-20 Aquisição de Lock Robusta (CORREÇÃO LOCK ÓRFÃO NO RENDER)
-  - _acquire_lock() agora remove o arquivo de lock e recria um fd limpo
-    quando detecta PID morto, em vez de tentar flock no mesmo fd antigo
-    (comportamento anterior era não-atômico e falhava no Render).
-  - Dois loops de tentativa com unlink+recreate garantem que locks
-    obsoletos de deploys anteriores não bloqueiem o /start.
-  - Endpoint /start também tenta force-break via _force_break_stale_lock()
-    antes de retornar erro ao usuário.
+FIX-21 Remoção do Lock por Arquivo (CORREÇÃO DEFINITIVA DO /start)
+  - O mecanismo de lock baseado em fcntl.flock + arquivo bot.lock foi
+    completamente removido. Ele causava bloqueio permanente no Render
+    ao deixar locks órfãos entre deploys, impedindo o /start.
+  - Com --workers=1 --threads=1 no Procfile, apenas um processo Flask
+    existe por vez — o threading.Lock() interno (_lock) + as flags
+    _trader e _starting já garantem exclusão mútua sem qualquer risco
+    de lock fantasma entre deploys.
 ══════════════════════════════════════════════════════════════════════
 """
 import os, hmac, hashlib, base64, json, time, threading, traceback, logging, requests
-import fcntl
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
@@ -179,173 +178,6 @@ def _key():      return os.environ.get("BITGET_API_KEY",    "").strip()
 def _sec():      return os.environ.get("BITGET_SECRET_KEY", "").strip()
 def _pass():     return os.environ.get("BITGET_PASSPHRASE", "").strip()
 def _creds_ok(): return bool(_key() and _sec() and _pass())
-
-LOCK_FILE = "bot.lock"
-_lock_fd: Optional[int] = None
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-def _write_pid(fd: int) -> None:
-    try:
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, str(os.getpid()).encode())
-    except OSError:
-        pass
-
-
-def _read_pid(fd: int) -> Optional[int]:
-    try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        data = os.read(fd, 32).decode().strip()
-        return int(data) if data.isdigit() else None
-    except (OSError, ValueError):
-        return None
-
-
-def _acquire_lock() -> bool:
-    """
-    FIX-20: Aquisição de lock robusta com remoção de arquivo órfão.
-
-    Quando detecta um PID morto, REMOVE o arquivo de lock e tenta
-    abrir um fd completamente novo — solução atômica e confiável para
-    o ambiente Render onde deploys sobrepostos deixam locks órfãos.
-
-    Fluxo:
-      1. Guard de re-entrada (_lock_fd is not None → True imediato).
-      2. Abre o arquivo e tenta flock(LOCK_EX|LOCK_NB).
-      3. Se falhar → lê PID do holder:
-         a. PID vivo  → retorna False (outro worker legítimo).
-         b. PID morto → fecha fd, REMOVE o arquivo, tenta novamente
-            abrindo um fd limpo (máx 2 tentativas no total).
-      4. Grava PID do processo atual no arquivo após sucesso.
-    """
-    global _lock_fd
-
-    if _lock_fd is not None:
-        return True
-
-    for attempt in range(2):
-        fd = None
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
-
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                # ── Sucesso ──────────────────────────────────────────
-                _write_pid(fd)
-                _lock_fd = fd
-                log.info(f"🔒 Lock adquirido (PID={os.getpid()}, tentativa {attempt+1}).")
-                return True
-
-            except (IOError, OSError):
-                holder_pid = _read_pid(fd)
-
-                # Fecha o fd ANTES de tentar manipular o arquivo
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                fd = None
-
-                if holder_pid and _pid_alive(holder_pid):
-                    log.warning(
-                        f"⚠️ Lock em uso pelo PID={holder_pid} (worker ativo). "
-                        "Aguarde o deploy anterior encerrar."
-                    )
-                    return False
-
-                # PID morto ou inválido → remove o arquivo e tenta novamente
-                log.warning(
-                    f"⚠️ Lock órfão detectado (PID={holder_pid} não existe). "
-                    f"Removendo arquivo e retentando... (tentativa {attempt+1}/2)"
-                )
-                try:
-                    os.unlink(LOCK_FILE)
-                except OSError:
-                    pass
-                # continua para a próxima iteração do loop
-
-        except Exception as e:
-            log.error(f"Erro inesperado em _acquire_lock (tentativa {attempt+1}): {e}")
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            return False
-
-    log.error("❌ Não foi possível adquirir lock após 2 tentativas.")
-    return False
-
-
-def _force_break_stale_lock() -> bool:
-    """
-    Força a remoção do lock quando _acquire_lock() falhou e o PID
-    no arquivo não está mais vivo. Usado como último recurso no /start.
-    Retorna True se conseguiu remover o lock e agora está livre.
-    """
-    global _lock_fd
-    if _lock_fd is not None:
-        return True  # já temos o lock neste processo
-
-    try:
-        if not os.path.exists(LOCK_FILE):
-            return True  # arquivo nem existe, tudo livre
-
-        with open(LOCK_FILE, 'r') as f:
-            content = f.read().strip()
-        holder_pid = int(content) if content.isdigit() else None
-
-        if holder_pid and _pid_alive(holder_pid):
-            log.warning(f"⚠️ _force_break: PID={holder_pid} ainda vivo, não é possível forçar.")
-            return False
-
-        # PID morto → remove e tenta adquirir de novo
-        log.warning(f"⚠️ _force_break: removendo lock órfão (PID={holder_pid}).")
-        try:
-            os.unlink(LOCK_FILE)
-        except OSError:
-            pass
-
-        return _acquire_lock()
-
-    except Exception as e:
-        log.error(f"_force_break_stale_lock erro: {e}")
-        try:
-            os.unlink(LOCK_FILE)
-        except OSError:
-            pass
-        return _acquire_lock()
-
-
-def _release_lock() -> None:
-    global _lock_fd
-    if _lock_fd is None:
-        return
-    fd = _lock_fd
-    _lock_fd = None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError as e:
-        log.debug(f"flock(LOCK_UN) ignorado: {e}")
-    try:
-        os.close(fd)
-        log.info("🔓 Lock liberado.")
-    except OSError as e:
-        log.debug(f"os.close(lock_fd) ignorado: {e}")
-    # Remove o arquivo para não deixar PID obsoleto no disco
-    try:
-        os.unlink(LOCK_FILE)
-    except OSError:
-        pass
 
 
 class TradeHistoryManager:
@@ -1750,7 +1582,7 @@ def run_backtest(symbol=SYMBOL, timeframe=TIMEFRAME, limit=500, initial_capital=
 
 app       = Flask(__name__)
 _trader:   Optional[LiveTrader] = None
-_lock     = threading.Lock()
+_lock     = threading.Lock()   # protege _trader e _starting dentro do mesmo processo
 _starting = False
 _logs: List[str] = []
 
@@ -2293,7 +2125,6 @@ def _thread():
         with _lock:
             _trader   = None
             _starting = False
-        _release_lock()
         log.info("🔄 Pronto para re-iniciar")
 
 
@@ -2352,20 +2183,6 @@ def start():
             return jsonify({"message": "Já está rodando"})
         if not get_paper_mode() and not _creds_ok():
             return jsonify({"error": "Configure as chaves Bitget antes de iniciar em modo LIVE"}), 400
-
-        # FIX-20: Tenta adquirir normalmente; se falhar, tenta force-break
-        # de locks órfãos antes de retornar erro ao usuário.
-        if not _acquire_lock():
-            log.warning("⚠️ _acquire_lock falhou na primeira tentativa — tentando force-break...")
-            if not _force_break_stale_lock():
-                return jsonify({
-                    "error": (
-                        "Outro processo ainda está rodando o trader. "
-                        "Aguarde alguns segundos e tente novamente."
-                    )
-                }), 400
-            log.info("✅ Force-break bem-sucedido — prosseguindo com o start.")
-
         _starting = True
         threading.Thread(target=_thread, daemon=True).start()
         mode_str = "paper" if get_paper_mode() else "live (95% saldo Bitget)"
@@ -2374,7 +2191,6 @@ def start():
 @app.route('/stop', methods=['POST'])
 def stop():
     if _trader: _trader.stop()
-    _release_lock()
     return jsonify({"message": "Parado"})
 
 @app.route('/ping')
@@ -2432,9 +2248,6 @@ def _delayed_start():
         is_paper = get_paper_mode()
         if not is_paper and not _creds_ok():
             log.warning("⚠️ Chaves Bitget não configuradas — use o botão Iniciar.")
-            return
-        if not _acquire_lock():
-            log.warning("⚠️ Lock não adquirido no auto-start — outro worker pode estar ativo.")
             return
         _starting = True
         mode_str = "PAPER TRADING" if is_paper else "LIVE (Bitget)"
